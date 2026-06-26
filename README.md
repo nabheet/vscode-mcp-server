@@ -63,7 +63,17 @@ All settings under `vscode-mcp-server.*`:
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
 
-Settings fall back to environment variables `MCP_PORT`, `MCP_AUTH_TOKEN`, `MCP_TLS_CERT_PATH`, `MCP_TLS_KEY_PATH`.
+Settings fall back to environment variables:
+
+| Env var | Overrides | Default |
+|---------|-----------|---------|
+| `MCP_PORT` | `port` | `9876` |
+| `MCP_AUTH_TOKEN` | `authToken` | (none) |
+| `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
+| `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
+| `MCP_SERVER_MAX_RETRIES` | port retry count | `3` |
+
+VS Code settings take priority over env vars.
 
 ## Development
 

@@ -10,12 +10,12 @@ export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
   outputChannel.appendLine('[mcp] Activating vscode-mcp-server...');
 
-  // Read config
+  // Read config (VS Code settings with env fallbacks)
   const config = vscode.workspace.getConfiguration('vscode-mcp-server');
-  const port = config.get<number>('port') || 9876;
-  const authToken = config.get<string>('authToken') || '';
-  const tlsCertPath = config.get<string>('tlsCertPath') || '';
-  const tlsKeyPath = config.get<string>('tlsKeyPath') || '';
+  const port = config.get<number>('port') || Number(process.env.MCP_PORT) || 9876;
+  const authToken = config.get<string>('authToken') || process.env.MCP_AUTH_TOKEN || '';
+  const tlsCertPath = config.get<string>('tlsCertPath') || process.env.MCP_TLS_CERT_PATH || '';
+  const tlsKeyPath = config.get<string>('tlsKeyPath') || process.env.MCP_TLS_KEY_PATH || '';
 
   // Detect remote container
   const isRemoteContainer = vscode.env.remoteName === 'dev-container'
@@ -102,7 +102,7 @@ async function startServerWithRetry(
 ): Promise<void> {
   let currentPort = basePort;
   const useTls = !!(tlsCertPath && tlsKeyPath);
-  const maxRetries = 3;
+  const maxRetries = Number(process.env.MCP_SERVER_MAX_RETRIES) || 3;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     currentPort = basePort + attempt;
