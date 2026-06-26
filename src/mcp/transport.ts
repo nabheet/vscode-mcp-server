@@ -34,6 +34,7 @@ function validateAgainstSchema(
       const prop = props[key];
       if (prop && prop.type) {
         const expected = prop.type;
+        if (expected === 'array' && Array.isArray(value)) continue;
         const actual = typeof value;
         if (expected === 'integer' && actual === 'number' && Number.isInteger(value as number)) continue;
         if (expected === 'number' && actual === 'number') continue;

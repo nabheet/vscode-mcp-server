@@ -108,7 +108,7 @@ export function registerNavigationTools(server: McpServer): void {
         if (!editor) return { content: [{ type: 'text', text: 'No active editor' }], isError: true };
 
         const start = Math.max(0, Number(args.startLine) - 1);
-        const end = Math.max(start, Number(args.endLine) - 1);
+        const end = Math.min(Math.max(start, Number(args.endLine) - 1), editor.document.lineCount - 1);
         editor.selection = new vscode.Selection(
           new vscode.Position(start, 0),
           new vscode.Position(end, editor.document.lineAt(end).text.length),

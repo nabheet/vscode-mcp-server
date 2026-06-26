@@ -75,22 +75,16 @@ export class McpServer {
     if (!this.server) return;
 
     return new Promise((resolve) => {
-      this.server!.close(() => {
-        this.server = null;
-        resolve();
-      });
-
-      const poll = setInterval(() => {
-        if (this.activeRequests === 0) {
-          clearInterval(poll);
-          this.server?.close();
-        }
-      }, 100);
+      this.server!.once('close', () => { this.server = null; resolve(); });
 
       setTimeout(() => {
-        clearInterval(poll);
-        resolve();
+        if (this.server) this.server.close();
       }, timeoutMs);
+
+      // Try immediate close — if active requests, timeout will force
+      if (this.activeRequests === 0) {
+        this.server!.close();
+      }
     });
   }
 

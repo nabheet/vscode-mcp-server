@@ -17,6 +17,14 @@ function getCursor(editor: vscode.TextEditor): vscode.Position {
   return editor.selection.active;
 }
 
+/** Normalise a definition result — supports both Location and LocationLink */
+interface NormalisedLocation { uri: vscode.Uri; range: vscode.Range }
+function normaliseLocation(loc: any): NormalisedLocation {
+  if (loc.uri && loc.range) return loc;                                 // vscode.Location
+  if (loc.targetUri && loc.targetRange) return { uri: loc.targetUri, range: loc.targetRange }; // LocationLink
+  return { uri: vscode.Uri.file(String(loc)), range: new vscode.Range(0, 0, 0, 0) };
+}
+
 export function registerLspTools(server: McpServer): void {
   server.registerTool(
     defineTool(
@@ -53,9 +61,9 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', editor!.document.uri, getCursor(editor!));
-          if (!defs || defs.length === 0) return { content: [{ type: 'text', text: 'No definition found' }], isError: false };
-          const loc = defs[0];
+          const defs = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', editor!.document.uri, getCursor(editor!));
+          if (!defs || !Array.isArray(defs) || defs.length === 0) return { content: [{ type: 'text', text: 'No definition found' }], isError: false };
+          const loc = normaliseLocation(defs[0]);
           await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(loc.uri), { selection: loc.range });
           return { content: [{ type: 'text', text: `Navigated to ${loc.uri.fsPath}:${loc.range.start.line + 1}` }], isError: false };
         } catch (e) {
@@ -77,9 +85,9 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeTypeDefinitionProvider', editor!.document.uri, getCursor(editor!));
-          if (!defs || defs.length === 0) return { content: [{ type: 'text', text: 'No type definition found' }], isError: false };
-          const loc = defs[0];
+          const defs = await vscode.commands.executeCommand('vscode.executeTypeDefinitionProvider', editor!.document.uri, getCursor(editor!));
+          if (!defs || !Array.isArray(defs) || defs.length === 0) return { content: [{ type: 'text', text: 'No type definition found' }], isError: false };
+          const loc = normaliseLocation(defs[0]);
           await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(loc.uri), { selection: loc.range });
           return { content: [{ type: 'text', text: `Navigated to ${loc.uri.fsPath}:${loc.range.start.line + 1}` }], isError: false };
         } catch (e) {
@@ -101,9 +109,9 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const impls = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeImplementationProvider', editor!.document.uri, getCursor(editor!));
-          if (!impls || impls.length === 0) return { content: [{ type: 'text', text: 'No implementation found' }], isError: false };
-          const loc = impls[0];
+          const impls = await vscode.commands.executeCommand('vscode.executeImplementationProvider', editor!.document.uri, getCursor(editor!));
+          if (!impls || !Array.isArray(impls) || impls.length === 0) return { content: [{ type: 'text', text: 'No implementation found' }], isError: false };
+          const loc = normaliseLocation(impls[0]);
           await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(loc.uri), { selection: loc.range });
           return { content: [{ type: 'text', text: `Navigated to ${loc.uri.fsPath}:${loc.range.start.line + 1}` }], isError: false };
         } catch (e) {

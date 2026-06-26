@@ -17,7 +17,7 @@ export function registerCommandsTools(server: McpServer): void {
           args: {
             type: 'array',
             description: 'Optional arguments to pass to the command',
-            items: { type: 'string' },
+            items: {},
           },
         },
         required: ['command'],

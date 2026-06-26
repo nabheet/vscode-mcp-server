@@ -104,6 +104,11 @@ export function registerWorkspaceTools(server: McpServer): void {
       async (args) => {
         const uri = resolvePath(String(args.path));
         try {
+          // Check if file already exists
+          try {
+            await vscode.workspace.fs.stat(uri);
+            return { content: [{ type: 'text', text: `File already exists: ${uri.fsPath}` }], isError: true };
+          } catch { /* stat fails → file doesn't exist, proceed */ }
           // Ensure parent directory exists
           const parent = vscode.Uri.file(path.dirname(uri.fsPath));
           try {
