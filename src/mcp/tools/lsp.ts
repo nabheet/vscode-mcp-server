@@ -188,7 +188,14 @@ export function registerLspTools(server: McpServer): void {
             }
           }
         }
-        const total = Array.isArray(diagnostics) ? diagnostics.reduce((sum: number, entry: any) => sum + (entry.diagnostics?.length ?? 1), 0) : diagnostics.length;
+        const rawDiag: any[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
+        const total = rawDiag.reduce((sum: number, entry: any) => {
+          if (entry && typeof entry === 'object' && 'diagnostics' in entry) {
+            const arr = entry.diagnostics as any[] | undefined;
+            return sum + (Array.isArray(arr) ? arr.length : 1);
+          }
+          return sum + 1;
+        }, 0);
         const tail = total > MAX_DIAG_LINES ? `\n... and ${total - MAX_DIAG_LINES} more` : '';
         return { content: [{ type: 'text', text: lines.join('\n') + tail }], isError: false };
       },

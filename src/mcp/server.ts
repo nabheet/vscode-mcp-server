@@ -5,6 +5,12 @@ import * as crypto from 'crypto';
 import { handleRequest } from './transport';
 import { ToolDefinition } from '../utils/types';
 
+interface SseSession {
+  id: string;
+  res: http.ServerResponse;
+  sendEvent: (event: string, data: string) => void;
+}
+
 export interface McpServerOptions {
   port: number;
   host: string;
@@ -16,6 +22,8 @@ export interface McpServerOptions {
   authToken?: string;
 }
 
+const SSE_KEEPALIVE_MS = 15_000;
+
 export class McpServer {
   private server: http.Server | https.Server | null = null;
   private tools: Map<string, ToolDefinition> = new Map();
@@ -24,6 +32,7 @@ export class McpServer {
   private options: McpServerOptions;
   private onListen?: (url: string) => void;
   private useTls: boolean;
+  private sessions = new Map<string, SseSession>();
 
   constructor(options: McpServerOptions) {
     this.options = options;
@@ -123,7 +132,7 @@ export class McpServer {
   private writeCorsHeaders(res: http.ServerResponse, origin?: string): void {
     const allowed = origin && this.isValidOrigin(origin) ? origin : 'http://127.0.0.1:' + this.options.port;
     res.setHeader('Access-Control-Allow-Origin', allowed);
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   }
 
@@ -156,11 +165,25 @@ export class McpServer {
 
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const origin = req.headers['origin'] as string | undefined;
+    const pathname = (req.url || '').split('?')[0];
 
     // Health check
-    if (req.method === 'GET' && req.url === '/health') {
+    if (req.method === 'GET' && pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+      return;
+    }
+
+    // ── SSE: MCP HTTP transport (GET /mcp) ───────────────────────────
+    if (req.method === 'GET' && pathname === '/mcp') {
+      this.handleSseConnection(req, res);
+      return;
+    }
+
+    // ── SSE: Message handler (POST /mcp/session/:id/message) ────────
+    const msgMatch = pathname.match(/^\/mcp\/session\/([a-f0-9-]+)\/message$/);
+    if (req.method === 'POST' && msgMatch) {
+      this.handleSseMessage(req, res, msgMatch[1]);
       return;
     }
 
@@ -177,14 +200,101 @@ export class McpServer {
       return;
     }
 
-    // Only POST /mcp
-    if (req.method !== 'POST' || req.url !== '/mcp') {
-      this.writeCorsHeaders(res, origin);
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found. Use POST /mcp' }));
+    // Direct JSON-RPC (POST /mcp) — backward compat with mcp_client.py
+    if (req.method === 'POST' && pathname === '/mcp') {
+      this.handleDirectPost(req, res, origin);
       return;
     }
 
+    // ── 404 catch-all ─────────────────────────────────────────────────
+    this.writeCorsHeaders(res, origin);
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found. Use GET /mcp (SSE) or POST /mcp (direct)' }));
+  }
+
+  /** SSE connection — open event stream and send endpoint URL. */
+  private handleSseConnection(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const sessionId = crypto.randomUUID();
+    const endpoint = `/mcp/session/${sessionId}/message`;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    const sendEvent = (event: string, data: string) => {
+      try { res.write(`event: ${event}\ndata: ${data}\n\n`); } catch { /* closed */ }
+    };
+
+    const session: SseSession = { id: sessionId, res, sendEvent };
+    this.sessions.set(sessionId, session);
+
+    // Tell client where to POST JSON-RPC messages
+    sendEvent('endpoint', endpoint);
+
+    // Keep-alive to prevent proxy timeouts
+    const keepAlive = setInterval(() => {
+      try { res.write(': keepalive\n\n'); } catch { clearInterval(keepAlive); }
+    }, SSE_KEEPALIVE_MS);
+
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      this.sessions.delete(sessionId);
+    });
+  }
+
+  /** Handle a message POSTed to an SSE session endpoint. */
+  private handleSseMessage(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Session not found' }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let bodySize = 0;
+    const MAX_BODY = 10 * 1024 * 1024;
+
+    req.on('data', (chunk: Buffer) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY) return;
+      chunks.push(chunk);
+    });
+
+    req.on('end', async () => {
+      if (bodySize > MAX_BODY) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Payload Too Large: max 10 MB' }));
+        return;
+      }
+
+      const rawBody = Buffer.concat(chunks).toString('utf-8');
+
+      // Acknowledge the POST immediately — response goes over SSE
+      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ accepted: true }));
+
+      try {
+        const response = await handleRequest(rawBody, this.tools);
+        if (response) {
+          session.sendEvent('message', JSON.stringify(response));
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        session.sendEvent('message', JSON.stringify({
+          jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error: ' + msg },
+        }));
+      }
+    });
+
+    req.on('error', () => {});
+  }
+
+  /** Direct POST /mcp — inline JSON-RPC response (backward compat). */
+  private handleDirectPost(req: http.IncomingMessage, res: http.ServerResponse, origin: string | undefined): void {
     // CORS: reject non-loopback origins
     if (!this.isValidOrigin(origin)) {
       this.writeCorsHeaders(res, origin);
@@ -212,8 +322,6 @@ export class McpServer {
       return;
     }
 
-    // ── Process request body ─────────────────────────────────────────
-
     this.activeRequests++;
     let requestHandled = false;
     const activeRequestDone = () => {
@@ -228,8 +336,6 @@ export class McpServer {
 
     req.on('data', (chunk: Buffer) => {
       bodySize += chunk.length;
-      // Don't pause — keep flowing to allow 'end' to fire.
-      // Just stop buffering once we exceed the limit.
       if (bodySize > MAX_BODY) return;
       chunks.push(chunk);
     });
