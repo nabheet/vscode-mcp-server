@@ -98,6 +98,109 @@ VS Code Extension (onStartupFinished)
 | `rename_symbol` | lsp | Rename symbol across workspace |
 | `get_completions` | lsp | Get completion items at cursor |
 
+## Connecting from other AI tools
+
+### opencode
+
+Add to your `opencode.global.jsonc` or `opencode.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "vscode-mcp": {
+      "type": "remote",
+      "url": "http://127.0.0.1:9876/mcp"
+    }
+  }
+}
+```
+
+### Claude Desktop / Claude Code
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "vscode-mcp": {
+      "type": "remote",
+      "url": "http://127.0.0.1:9876/mcp"
+    }
+  }
+}
+```
+
+Or via stdio if you prefer a managed subprocess:
+
+```json
+{
+  "mcpServers": {
+    "vscode-mcp": {
+      "command": "node",
+      "args": ["path/to/vscode-mcp-server/out/cli.js"]
+    }
+  }
+}
+```
+
+### Cursor
+
+In Cursor Settings → Features → MCP Servers → Add new MCP server:
+
+```
+Name: vscode-mcp
+Type: remote
+URL: http://127.0.0.1:9876/mcp
+```
+
+### Windsurf / Continue.dev / Any MCP-compatible tool
+
+Add a `type: "remote"` MCP server pointing to:
+
+```
+http://127.0.0.1:9876/mcp
+```
+
+The server uses **SSE transport** (the standard MCP HTTP transport). If the tool only supports stdio, you can use an SSE-to-stdio bridge like `mcp-remote` or write a thin wrapper.
+
+### Connecting programmatically
+
+```python
+# Example: using the MCP Python SDK
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+async with sse_client("http://127.0.0.1:9876/mcp") as transport:
+    async with ClientSession(transport) as session:
+        result = await session.list_tools()
+        for tool in result.tools:
+            print(f"{tool.name}: {tool.description}")
+```
+
+```typescript
+// Example: using the MCP TypeScript SDK
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+
+const transport = new SSEClientTransport(new URL("http://127.0.0.1:9876/mcp"));
+const client = new Client({ name: "my-agent", version: "1.0.0" });
+await client.connect(transport);
+const tools = await client.listTools();
+```
+
+### Example: tool list (37 tools)
+
+When connected, `tools/list` returns schemas for all tools. Key categories:
+
+| Category | Tools |
+|----------|-------|
+| **Editor** | `open_file`, `open_file_at_line`, `open_file_at_position`, `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`, `close_all_editors` |
+| **Workspace** | `read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `get_workspace_folders` |
+| **Debug** | `start_debugging`, `stop_debugging`, `step_over`, `step_into`, `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`, `list_breakpoints`, `get_debug_variables`, `get_stack_trace`, `evaluate_in_debug_console` |
+| **Terminal** | `execute_in_terminal`, `get_terminal_output` |
+| **LSP** | `find_references`, `go_to_definition`, `go_to_type_definition`, `go_to_implementation`, `get_hover`, `get_diagnostics`, `get_document_symbols`, `get_workspace_symbols`, `get_call_hierarchy`, `rename_symbol`, `get_completions`, `get_code_actions` |
+| **Commands** | `execute_command`, `list_commands` |
+
 ## MCP Protocol
 
 ### Transport
