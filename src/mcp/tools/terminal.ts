@@ -35,15 +35,24 @@ function ensureOutputCapture(context: vscode.ExtensionContext): void {
     const termName = event.terminal.name;
     if (!managedTerminals.has(termName)) return;
 
-    try {
+    const OUTPUT_CAPTURE_TIMEOUT = 30_000; // 30s max per execution
+
+    const capture = (async () => {
       for await (const data of event.execution.read()) {
         const existing = terminalBuffers.get(termName) || '';
         const updated = existing + data;
         // Keep last ~100 KB
         terminalBuffers.set(termName, updated.length > 100_000 ? updated.slice(-100_000) : updated);
       }
+    })();
+
+    try {
+      await Promise.race([
+        capture,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), OUTPUT_CAPTURE_TIMEOUT)),
+      ]);
     } catch {
-      // Execution ended or stream error — ignore
+      // Timeout or execution error — stop capturing but keep accumulated output
     }
   });
   context.subscriptions.push(disposable);

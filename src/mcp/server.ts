@@ -28,6 +28,9 @@ export class McpServer {
   constructor(options: McpServerOptions) {
     this.options = options;
     this.useTls = !!(options.tlsCertPath && options.tlsKeyPath);
+    if (options.authToken && !this.useTls) {
+      console.warn('[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.');
+    }
   }
 
   registerTool(def: ToolDefinition): void {

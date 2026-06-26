@@ -131,20 +131,22 @@ export function registerWorkspaceTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'delete_file',
-      'Delete a file.',
+      'Delete a file or directory.',
       {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           useTrash: { type: 'boolean', description: 'Move to trash instead of permanent delete (default: true)' },
+          recursive: { type: 'boolean', description: 'Recursively delete directories (default: false)' },
         },
         required: ['path'],
       },
       async (args) => {
         const uri = resolvePath(String(args.path));
         const useTrash = args.useTrash !== false;
+        const recursive = args.recursive === true;
         try {
-          await vscode.workspace.fs.delete(uri, { recursive: false, useTrash });
+          await vscode.workspace.fs.delete(uri, { recursive, useTrash });
           return { content: [{ type: 'text', text: `Deleted ${uri.fsPath}${useTrash ? ' (moved to trash)' : ''}` }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Failed to delete: ${err instanceof Error ? err.message : String(err)}` }], isError: true };

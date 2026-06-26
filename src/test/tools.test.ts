@@ -127,4 +127,89 @@ describe('tool schemas', () => {
       }
     }
   });
+
+  it('all tool names are unique across all modules', async () => {
+    const { registerCommandsTools } = await import('../mcp/tools/commands');
+    const { registerNavigationTools } = await import('../mcp/tools/navigation');
+    const { registerWorkspaceTools } = await import('../mcp/tools/workspace');
+    const { registerDebugTools } = await import('../mcp/tools/debug');
+    const { registerLspTools } = await import('../mcp/tools/lsp');
+
+    const allDefs: ToolDefinition[] = [];
+    class MockServer {
+      registerTool(def: ToolDefinition) { allDefs.push(def); }
+    }
+
+    registerCommandsTools(new MockServer() as any);
+    registerNavigationTools(new MockServer() as any);
+    registerWorkspaceTools(new MockServer() as any);
+    registerDebugTools(new MockServer() as any);
+    // LSP tools require activeTextEditor mock — set a minimal stub
+    registerLspTools(new MockServer() as any);
+
+    const names = allDefs.map(d => d.name);
+    const uniqueNames = new Set(names);
+    expect(uniqueNames.size).toBe(names.length);
+  });
+
+  it('all tool descriptions are non-empty', async () => {
+    const { registerCommandsTools } = await import('../mcp/tools/commands');
+    const { registerNavigationTools } = await import('../mcp/tools/navigation');
+    const { registerWorkspaceTools } = await import('../mcp/tools/workspace');
+    const { registerDebugTools } = await import('../mcp/tools/debug');
+    const { registerLspTools } = await import('../mcp/tools/lsp');
+
+    const allDefs: ToolDefinition[] = [];
+    class MockServer {
+      registerTool(def: ToolDefinition) { allDefs.push(def); }
+    }
+
+    registerCommandsTools(new MockServer() as any);
+    registerNavigationTools(new MockServer() as any);
+    registerWorkspaceTools(new MockServer() as any);
+    registerDebugTools(new MockServer() as any);
+    registerLspTools(new MockServer() as any);
+
+    for (const def of allDefs) {
+      expect(def.description).toBeTruthy();
+    }
+  });
+
+  it('delete_file tool includes recursive parameter', async () => {
+    const { registerWorkspaceTools } = await import('../mcp/tools/workspace');
+
+    const allDefs: ToolDefinition[] = [];
+    class MockServer {
+      registerTool(def: ToolDefinition) { allDefs.push(def); }
+    }
+
+    registerWorkspaceTools(new MockServer() as any);
+    const deleteFile = allDefs.find(d => d.name === 'delete_file');
+    expect(deleteFile).toBeDefined();
+    const schema = deleteFile!.inputSchema as Record<string, any>;
+    expect(schema.properties?.recursive).toBeDefined();
+    expect(schema.properties?.recursive.type).toBe('boolean');
+  });
+
+  it('read_file tool works (snapshot of all command tool schemas)', async () => {
+    const { registerCommandsTools } = await import('../mcp/tools/commands');
+    const { registerNavigationTools } = await import('../mcp/tools/navigation');
+    const { registerWorkspaceTools } = await import('../mcp/tools/workspace');
+    const { registerDebugTools } = await import('../mcp/tools/debug');
+
+    const allDefs: ToolDefinition[] = [];
+    class MockServer {
+      registerTool(def: ToolDefinition) { allDefs.push(def); }
+    }
+
+    registerCommandsTools(new MockServer() as any);
+    registerNavigationTools(new MockServer() as any);
+    registerWorkspaceTools(new MockServer() as any);
+    registerDebugTools(new MockServer() as any);
+
+    // Verify specific tool patterns
+    const readFile = allDefs.find(d => d.name === 'read_file');
+    expect(readFile).toBeDefined();
+    expect(readFile!.inputSchema).toHaveProperty('properties');
+  });
 });

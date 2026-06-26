@@ -213,4 +213,100 @@ describe('handleRequest', () => {
     const res = await handleRequest('{"jsonrpc":"2.0","id":null,"method":"tools/list"}', tools);
     expect(res.id).toBeNull();
   });
+
+  // ── Payload Edge Cases ──────────────────────────────────────────────
+
+  it('handles deeply nested JSON without stack overflow', async () => {
+    const deep = { jsonrpc: '2.0', id: 1, method: 'tools/list' };
+    let current: any = deep;
+    for (let i = 0; i < 500; i++) {
+      current.nested = {};
+      current = current.nested;
+    }
+    const body = JSON.stringify(deep);
+    // Should not throw stack overflow
+    const res = await handleRequest(body, tools);
+    // Since the depth is in the object structure, the JSON parser handles it fine
+    expect(res).toBeDefined();
+  });
+
+  it('handles null byte in request body gracefully', async () => {
+    const body = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\0extra';
+    // JSON.parse handles trailing null bytes differently per engine
+    const res = await handleRequest(body, tools);
+    // Should either parse or return an error — should not crash
+    expect(res).toBeDefined();
+  });
+
+  it('handles extremely long method name gracefully', async () => {
+    const body = JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'x'.repeat(10000),
+    });
+    const res = await handleRequest(body, tools);
+    expect(res.error?.code).toBe(-32601); // MethodNotFound
+  });
+
+  it('handles unicode and special chars in arguments', async () => {
+    const handler = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const localTools = setupTools([makeTool('echo', { type: 'object', properties: { msg: { type: 'string' } }, required: ['msg'] }, handler)]);
+    const res = await handleRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'echo', arguments: { msg: '🔥 unicode ✓ & "quotes"' } },
+    }), localTools);
+    expect(handler).toHaveBeenCalledWith({ msg: '🔥 unicode ✓ & "quotes"' });
+    expect((res.result as any).isError).toBeFalsy();
+  });
+
+  it('handles empty arguments object', async () => {
+    const handler = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const localTools = setupTools([makeTool('noop', { type: 'object', properties: {}, required: [] }, handler)]);
+    const res = await handleRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'noop', arguments: {} },
+    }), localTools);
+    expect(handler).toHaveBeenCalledWith({});
+    expect((res.result as any).isError).toBeFalsy();
+  });
+
+  it('handles null arguments gracefully', async () => {
+    const handler = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const localTools = setupTools([makeTool('noop', { type: 'object', properties: {} }, handler)]);
+    const res = await handleRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'noop', arguments: null },
+    }), localTools);
+    // Should default null args to {} and succeed
+    expect((res.result as any).isError).toBeFalsy();
+  });
+
+  // ── Array Type Validation ───────────────────────────────────────────
+
+  it('accepts array values for array type property', async () => {
+    const handler = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const localTools = setupTools([makeTool('list', {
+      type: 'object',
+      properties: { items: { type: 'array' } },
+      required: ['items'],
+    }, handler)]);
+    const res = await handleRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'list', arguments: { items: [1, 2, 3] } },
+    }), localTools);
+    expect(handler).toHaveBeenCalledWith({ items: [1, 2, 3] });
+    expect((res.result as any).isError).toBeFalsy();
+  });
+
+  it('rejects non-array for array type property', async () => {
+    const handler = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const localTools = setupTools([makeTool('list', {
+      type: 'object',
+      properties: { items: { type: 'array' } },
+      required: ['items'],
+    }, handler)]);
+    const res = await handleRequest(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'list', arguments: { items: 'not-an-array' } },
+    }), localTools);
+    expect((res.result as any).isError).toBe(true);
+  });
 });

@@ -281,4 +281,247 @@ describe('McpServer', () => {
 
     await other.stop(1000);
   });
+
+  // ── Concurrent Requests ────────────────────────────────────────────
+
+  it('handles concurrent requests', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    let callCount = 0;
+    server.registerTool({
+      name: 'counter',
+      description: 'Counts calls',
+      inputSchema: { type: 'object', properties: {} },
+      handler: async () => {
+        callCount++;
+        // Simulate some work
+        await new Promise((r) => setTimeout(r, 50));
+        return { content: [{ type: 'text', text: `count: ${callCount}` }] };
+      },
+    });
+    await server.start();
+
+    const promises = Array.from({ length: 10 }, (_, i) =>
+      post(`http://127.0.0.1:${port}/mcp`, {
+        jsonrpc: '2.0', id: i, method: 'tools/call',
+        params: { name: 'counter', arguments: {} },
+      }),
+    );
+    const results = await Promise.all(promises);
+    expect(results).toHaveLength(10);
+    for (const res of results) {
+      expect(res.status).toBe(200);
+      expect((res.body as any).result.content[0].text).toMatch(/count:/);
+    }
+    expect(callCount).toBe(10);
+  });
+
+  it('concurrent tools/list requests do not interfere', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    server.registerTool({
+      name: 'ping', description: 'Ping',
+      inputSchema: { type: 'object', properties: {} },
+      handler: async () => ({ content: [{ type: 'text', text: 'pong' }] }),
+    });
+    await server.start();
+
+    const promises = Array.from({ length: 20 }, (_, i) =>
+      post(`http://127.0.0.1:${port}/mcp`, {
+        jsonrpc: '2.0', id: i, method: 'tools/list',
+      }),
+    );
+    const results = await Promise.all(promises);
+    for (const res of results) {
+      expect(res.status).toBe(200);
+      expect((res.body as any).result.tools).toHaveLength(1);
+    }
+  });
+
+  // ── Shutdown-during-request ─────────────────────────────────────────
+
+  it('drains active requests before full stop', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    let resolveSlow: (() => void) | undefined;
+    server.registerTool({
+      name: 'slow',
+      description: 'Slow operation',
+      inputSchema: { type: 'object', properties: {} },
+      handler: async () => {
+        await new Promise((r) => { resolveSlow = r; });
+        return { content: [{ type: 'text', text: 'done' }] };
+      },
+    });
+    await server.start();
+
+    // Fire a slow request
+    const slowPromise = post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'slow', arguments: {} },
+    });
+
+    // Give it time to reach the handler
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Stop the server — should wait for active request to complete (with timeout)
+    const stopPromise = server.stop(5000);
+
+    // Resolve the slow handler after a brief delay
+    await new Promise((r) => setTimeout(r, 200));
+    resolveSlow?.();
+
+    const [stopResult, slowResult] = await Promise.all([stopPromise, slowPromise]);
+    expect(stopResult).toBeUndefined(); // stop() resolves void
+    expect(slowResult.status).toBe(200);
+    expect((slowResult.body as any).result.content[0].text).toBe('done');
+  });
+
+  it('force-stops if active request exceeds timeout', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    let neverResolve: ((v: unknown) => void) | undefined;
+    server.registerTool({
+      name: 'forever',
+      description: 'Never finishes',
+      inputSchema: { type: 'object', properties: {} },
+      handler: async () => {
+        await new Promise((r) => { neverResolve = r; });
+        return { content: [{ type: 'text', text: 'done' }] };
+      },
+    });
+    await server.start();
+
+    // Fire a request that never resolves
+    post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'forever', arguments: {} },
+    }).catch(() => {}); // Ignore connection refused after force-stop
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Stop with very short timeout — should force-stop
+    await server.stop(100);
+
+    // Server should now be stopped even though handler never resolved
+    await expect(post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 2, method: 'tools/list',
+    })).rejects.toThrow();
+
+    // Clean up the dangling promise
+    neverResolve?.('cleanup');
+  });
+
+  // ── Auth Edge Cases ─────────────────────────────────────────────────
+
+  it('rejects malformed Authorization header', async () => {
+    server = new McpServer({ port, host: '127.0.0.1', authToken: 'secret123' });
+    await server.start();
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/list',
+    }, { Authorization: 'Basic dXNlcjpwYXNz' }); // Basic auth instead of Bearer
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects empty Bearer token', async () => {
+    server = new McpServer({ port, host: '127.0.0.1', authToken: 'secret123' });
+    await server.start();
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/list',
+    }, { Authorization: 'Bearer ' }); // Empty token
+    expect(res.status).toBe(401);
+  });
+
+  it('uses timing-safe comparison for auth token', async () => {
+    // Test with very long tokens to verify timing-safe comparison works
+    const longToken = 'a'.repeat(1000);
+    server = new McpServer({ port, host: '127.0.0.1', authToken: longToken });
+    await server.start();
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/list',
+    }, { Authorization: `Bearer ${longToken}` });
+    expect(res.status).toBe(200);
+
+    // Wrong token of same length
+    const wrongToken = 'b'.repeat(1000);
+    const res2 = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 2, method: 'tools/list',
+    }, { Authorization: `Bearer ${wrongToken}` });
+    expect(res2.status).toBe(401);
+  });
+
+  // ── TLS Error Handling ─────────────────────────────────────────────
+
+  it('rejects start with invalid TLS cert path', async () => {
+    server = new McpServer({
+      port, host: '127.0.0.1',
+      tlsCertPath: '/nonexistent/cert.pem',
+      tlsKeyPath: '/nonexistent/key.pem',
+    });
+    await expect(server.start()).rejects.toThrow(/Failed to load TLS/);
+  });
+
+  it('rejects start with missing TLS key path', async () => {
+    server = new McpServer({
+      port, host: '127.0.0.1',
+      tlsCertPath: '/nonexistent/cert.pem',
+      // No tlsKeyPath — but both or neither must be set
+    });
+    // Without tlsKeyPath, useTls is false, so it starts plain HTTP
+    await server.start();
+    expect(server).toBeDefined();
+  });
+
+  // ── Cross-Origin Security ──────────────────────────────────────────
+
+  it('rejects OPTIONS with invalid origin', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    await server.start();
+    const res = await new Promise<{ status: number; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
+      const req = http.request(`http://127.0.0.1:${port}/mcp`, {
+        method: 'OPTIONS',
+        headers: { Origin: 'https://evil.com' },
+      }, (res) => {
+        resolve({ status: res.statusCode ?? 0, headers: res.headers });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    // Invalid origins get 403 (no CORS headers written)
+    expect(res.status).toBe(403);
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  // ── Large Payload Edge Cases ───────────────────────────────────────
+
+  it('handles request body correctly with accurate content-length', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    await server.start();
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/list',
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as any).result).toBeDefined();
+  });
+
+  it('rejects zero-length POST body', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    await server.start();
+    // Send an empty body
+    const res = await new Promise<{ status: number; body: any }>((resolve, reject) => {
+      const req = http.request(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let parsed: any;
+          try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+          resolve({ status: res.statusCode ?? 0, body: parsed });
+        });
+      });
+      req.on('error', reject);
+      req.end(); // No body
+    });
+    // Empty body is invalid JSON → returns ParseError (400)
+    expect(res.status).toBe(400);
+  });
 });

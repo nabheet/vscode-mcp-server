@@ -3,13 +3,12 @@ import { McpServer } from '../server';
 import { defineTool } from './index';
 
 /** Get active text editor or return a CallToolResult error */
-function requireEditor(): { editor: vscode.TextEditor; err: null } | { editor: null; err: ReturnType<typeof defineTool>['handler'] extends (...args: any[]) => infer R ? Awaited<R> : never } {
+function requireEditor(): { editor: vscode.TextEditor; err: null } | { editor: null; err: { content: { type: 'text'; text: string }[]; isError: true } } {
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
-    const err = { content: [{ type: 'text' as const, text: 'No active text editor' }], isError: true };
-    return { editor: null, err: err as any };
+    return { editor: null, err: { content: [{ type: 'text', text: 'No active text editor' }], isError: true } };
   }
-  return { editor, err: null } as any;
+  return { editor, err: null };
 }
 
 /** Get cursor position from active editor */
@@ -171,18 +170,27 @@ export function registerLspTools(server: McpServer): void {
         }
 
         const lines: string[] = [];
+        const MAX_DIAG_LINES = 200;
         const entries = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
         for (const diag of entries) {
           if ('uri' in diag && 'diagnostics' in diag) {
             for (const d of (diag as any).diagnostics) {
-              lines.push(`${(diag as any).uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`);
+              const line = `${(diag as any).uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
+              if (lines.length < MAX_DIAG_LINES) {
+                lines.push(line);
+              }
             }
           } else {
             const d = diag as vscode.Diagnostic;
-            lines.push(`${targetUri?.fsPath || '?'}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`);
+            const line = `${targetUri?.fsPath || '?'}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
+            if (lines.length < MAX_DIAG_LINES) {
+              lines.push(line);
+            }
           }
         }
-        return { content: [{ type: 'text', text: lines.join('\n') || 'No diagnostics' }], isError: false };
+        const total = Array.isArray(diagnostics) ? diagnostics.reduce((sum: number, entry: any) => sum + (entry.diagnostics?.length ?? 1), 0) : diagnostics.length;
+        const tail = total > MAX_DIAG_LINES ? `\n... and ${total - MAX_DIAG_LINES} more` : '';
+        return { content: [{ type: 'text', text: lines.join('\n') + tail }], isError: false };
       },
     ),
   );

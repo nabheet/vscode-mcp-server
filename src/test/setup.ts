@@ -26,6 +26,10 @@ const mockWindow = {
   }),
   showInformationMessage: vi.fn(),
   showErrorMessage: vi.fn(),
+  activeTextEditor: undefined as any,
+  onDidChangeActiveTextEditor: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+  onDidChangeTextEditorSelection: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+  onDidOpenTextDocument: vi.fn().mockReturnValue({ dispose: vi.fn() }),
 };
 
 const mockEnv = {
