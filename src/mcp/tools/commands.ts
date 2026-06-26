@@ -25,6 +25,7 @@ export function registerCommandsTools(server: McpServer): void {
       async (args) => {
         const command = String(args.command);
         const cmdArgs = Array.isArray(args.args) ? args.args : [];
+        console.warn('[vscode-mcp-server] execute_command: ' + command + ' args=' + JSON.stringify(cmdArgs));
         try {
           const result = await vscode.commands.executeCommand(command, ...cmdArgs);
           const text = result === undefined

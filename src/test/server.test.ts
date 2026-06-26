@@ -122,7 +122,7 @@ describe('McpServer', () => {
       req.end();
     });
     expect(res.status).toBe(204);
-    expect(res.headers['access-control-allow-origin']).toBe('*');
+    expect(res.headers['access-control-allow-origin']).toBe(`http://127.0.0.1:${port}`);
   });
 
   // ── tools/list ──────────────────────────────────────────────────────
@@ -246,23 +246,28 @@ describe('McpServer', () => {
     server = new McpServer({ port, host: '127.0.0.1' });
     await server.start();
 
-    // Send a payload larger than 10MB. Server calls req.destroy().
-    // The connection terminates with an error (ECONNRESET/EPIPE) or
-    // may return 413 if the response is written before destruction.
-    let terminated = false;
-    await new Promise<void>((resolve) => {
+    // Send a payload larger than 10MB. Server pauses the stream and
+    // responds with HTTP 413 once the end of data is received.
+    const res = await new Promise<{ status: number; body: any }>((resolve, reject) => {
       const req = http.request(`http://127.0.0.1:${port}/mcp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       }, (res) => {
-        res.resume();
-        res.on('end', () => { terminated = true; resolve(); });
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let parsed: any;
+          try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+          resolve({ status: res.statusCode ?? 0, body: parsed });
+        });
       });
-      req.on('error', () => { terminated = true; resolve(); });
+      req.on('error', reject);
       req.write('x'.repeat(11 * 1024 * 1024));
       req.end();
     });
-    expect(terminated).toBe(true);
+    expect(res.status).toBe(413);
+    expect(res.body.error).toMatch(/payload too large/i);
   });
 
   // ── EADDRINUSE ──────────────────────────────────────────────────────

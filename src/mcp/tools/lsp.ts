@@ -20,9 +20,9 @@ function getCursor(editor: vscode.TextEditor): vscode.Position {
 /** Normalise a definition result — supports both Location and LocationLink */
 interface NormalisedLocation { uri: vscode.Uri; range: vscode.Range }
 function normaliseLocation(loc: any): NormalisedLocation {
-  if (loc.uri && loc.range) return loc;                                 // vscode.Location
+  if (loc.uri && loc.range && loc.range.start) return loc;              // vscode.Location
   if (loc.targetUri && loc.targetRange) return { uri: loc.targetUri, range: loc.targetRange }; // LocationLink
-  return { uri: vscode.Uri.file(String(loc)), range: new vscode.Range(0, 0, 0, 0) };
+  throw new Error('Unexpected location format from language server: ' + JSON.stringify(loc).slice(0, 200));
 }
 
 export function registerLspTools(server: McpServer): void {

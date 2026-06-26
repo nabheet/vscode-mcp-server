@@ -80,8 +80,13 @@ export function registerWorkspaceTools(server: McpServer): void {
       },
       async (args) => {
         const uri = resolvePath(String(args.path));
+        const content = String(args.content);
+        const MAX_WRITE_SIZE = 1 * 1024 * 1024; // 1 MB
+        if (content.length > MAX_WRITE_SIZE) {
+          return { content: [{ type: 'text', text: `Content too large: ${content.length} bytes (max ${MAX_WRITE_SIZE})` }], isError: true };
+        }
         try {
-          await vscode.workspace.fs.writeFile(uri, Buffer.from(String(args.content), 'utf-8'));
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
           return { content: [{ type: 'text', text: `Written ${uri.fsPath}` }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Failed to write: ${err instanceof Error ? err.message : String(err)}` }], isError: true };

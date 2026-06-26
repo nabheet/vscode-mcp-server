@@ -45,10 +45,9 @@ describe('resolvePath', () => {
     expect(result.fsPath).toBe('/workspace/relative/path.ts');
   });
 
-  it('handles parent-relative paths', () => {
+  it('rejects parent-relative paths outside workspace', () => {
     (vscode.workspace as any).workspaceFolders = [{ uri: { fsPath: '/workspace/sub' } }];
-    const result = resolvePath('../sibling.ts');
-    expect(result.fsPath).toBe('/workspace/sibling.ts');
+    expect(() => resolvePath('../sibling.ts')).toThrow(/outside the workspace/i);
   });
 
   it('returns Uri with file scheme', () => {

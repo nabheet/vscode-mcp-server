@@ -13,11 +13,24 @@ const terminalBuffers = new Map<string, string>();
  */
 const managedTerminals = new Set<string>();
 
+let outputCaptureRegistered = false;
+
 /**
  * Register one global listener for all terminal shell executions.
- * Filters to only terminals we manage. Returns the Disposable for cleanup.
+ * Filters to only terminals we manage. Idempotent — safe to call multiple times.
  */
 function ensureOutputCapture(context: vscode.ExtensionContext): void {
+  if (outputCaptureRegistered) return;
+  outputCaptureRegistered = true;
+
+  // Clean up terminal tracking when a terminal is closed
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((terminal) => {
+      managedTerminals.delete(terminal.name);
+      terminalBuffers.delete(terminal.name);
+    })
+  );
+
   const disposable = vscode.window.onDidStartTerminalShellExecution(async (event) => {
     const termName = event.terminal.name;
     if (!managedTerminals.has(termName)) return;

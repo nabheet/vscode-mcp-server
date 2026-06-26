@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { handleRequest } from './transport';
 import { ToolDefinition } from '../utils/types';
 
@@ -44,6 +45,7 @@ export class McpServer {
           const tlsOpts: https.ServerOptions = {
             cert: fs.readFileSync(this.options.tlsCertPath!, 'utf-8'),
             key: fs.readFileSync(this.options.tlsKeyPath!, 'utf-8'),
+            minVersion: 'TLSv1.2',
           };
           this.server = https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
         } catch (err) {
@@ -74,26 +76,99 @@ export class McpServer {
     this.shuttingDown = true;
     if (!this.server) return;
 
+    // server.close() stops accepting new connections and waits for existing
+    // ones to finish naturally. We add a timeout fallback to force-close.
     return new Promise((resolve) => {
-      this.server!.once('close', () => { this.server = null; resolve(); });
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        this.server = null;
+        resolve();
+      };
 
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.server) this.server.close();
+        finish();
       }, timeoutMs);
 
-      // Try immediate close — if active requests, timeout will force
-      if (this.activeRequests === 0) {
-        this.server!.close();
-      }
+      this.server!.once('close', () => {
+        clearTimeout(timer);
+        finish();
+      });
+
+      this.server!.close();
     });
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────
+
+  /** Get the expected origin for CORS (loopback only). */
+  private getOrigin(): string {
+    const scheme = this.useTls ? 'https' : 'http';
+    return scheme + '://127.0.0.1:' + this.options.port;
+  }
+
+  /** Check if a request origin is allowed. Only loopback origins are valid. */
+  private isValidOrigin(reqOrigin: string | undefined): boolean {
+    if (!reqOrigin) return true; // No Origin header — non-browser client
+    const allowed = this.getOrigin();
+    return reqOrigin === allowed || reqOrigin === 'http://127.0.0.1:' + this.options.port;
+  }
+
+  /** Write CORS headers restricted to loopback origin. */
+  private writeCorsHeaders(res: http.ServerResponse, origin?: string): void {
+    const allowed = origin && this.isValidOrigin(origin) ? origin : 'http://127.0.0.1:' + this.options.port;
+    res.setHeader('Access-Control-Allow-Origin', allowed);
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+
+  /** Verify bearer token using timing-safe comparison. */
+  private authFailed(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+    if (!this.options.authToken) return false;
+    const auth = req.headers['authorization'] || '';
+    const origin = req.headers['origin'] as string | undefined;
+    if (!auth.startsWith('Bearer ')) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
+      return true;
+    }
+    const token = auth.slice(7);
+    const valid = this.options.authToken;
+    const bufToken = Buffer.from(token);
+    const bufValid = Buffer.from(valid);
+    const match = bufToken.length === bufValid.length && crypto.timingSafeEqual(bufToken, bufValid);
+    if (!match) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
+      return true;
+    }
+    return false;
   }
 
   // ── Request Handler ────────────────────────────────────────────────
 
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // CORS preflight
+    const origin = req.headers['origin'] as string | undefined;
+
+    // Health check
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+      return;
+    }
+
+    // CORS preflight — validate origin
     if (req.method === 'OPTIONS') {
-      this.writeCorsHeaders(res);
+      if (!this.isValidOrigin(origin)) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      this.writeCorsHeaders(res, origin);
       res.writeHead(204);
       res.end();
       return;
@@ -101,40 +176,48 @@ export class McpServer {
 
     // Only POST /mcp
     if (req.method !== 'POST' || req.url !== '/mcp') {
-      this.writeCorsHeaders(res);
+      this.writeCorsHeaders(res, origin);
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found. Use POST /mcp' }));
+      return;
+    }
+
+    // CORS: reject non-loopback origins
+    if (!this.isValidOrigin(origin)) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Forbidden: CORS requests from this origin are not allowed' }));
       return;
     }
 
     // Content-Type check
     const ctype = req.headers['content-type'] || '';
     if (!ctype.includes('application/json')) {
-      this.writeCorsHeaders(res);
+      this.writeCorsHeaders(res, origin);
       res.writeHead(415, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unsupported Media Type: expected application/json' }));
       return;
     }
 
-    // Auth check (bearer token)
-    if (this.options.authToken) {
-      const auth = req.headers['authorization'] || '';
-      if (!auth.startsWith('Bearer ') || auth.slice(7) !== this.options.authToken) {
-        this.writeCorsHeaders(res);
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
-        return;
-      }
-    }
+    // Auth check (bearer token) — timing-safe
+    if (this.authFailed(req, res)) return;
 
     if (this.shuttingDown) {
-      this.writeCorsHeaders(res);
+      this.writeCorsHeaders(res, origin);
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Server shutting down' }));
       return;
     }
 
+    // ── Process request body ─────────────────────────────────────────
+
     this.activeRequests++;
+    let requestHandled = false;
+    const activeRequestDone = () => {
+      if (requestHandled) return;
+      requestHandled = true;
+      this.activeRequests--;
+    };
 
     const chunks: Buffer[] = [];
     let bodySize = 0;
@@ -142,16 +225,18 @@ export class McpServer {
 
     req.on('data', (chunk: Buffer) => {
       bodySize += chunk.length;
-      if (bodySize > MAX_BODY) { req.destroy(); return; }
+      // Don't pause — keep flowing to allow 'end' to fire.
+      // Just stop buffering once we exceed the limit.
+      if (bodySize > MAX_BODY) return;
       chunks.push(chunk);
     });
 
     req.on('end', async () => {
       if (bodySize > MAX_BODY) {
-        this.writeCorsHeaders(res);
+        this.writeCorsHeaders(res, origin);
         res.writeHead(413, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Payload Too Large: max 10 MB' }));
-        this.activeRequests--;
+        activeRequestDone();
         return;
       }
 
@@ -160,7 +245,7 @@ export class McpServer {
       try {
         const response = await handleRequest(rawBody, this.tools);
         const body = JSON.stringify(response);
-        this.writeCorsHeaders(res);
+        this.writeCorsHeaders(res, origin);
 
         let status = 200;
         if (response.error) {
@@ -174,21 +259,15 @@ export class McpServer {
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(body);
       } catch (err) {
-        this.writeCorsHeaders(res);
+        this.writeCorsHeaders(res, origin);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         const msg = err instanceof Error ? err.message : String(err);
         res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error: ' + msg } }));
       } finally {
-        this.activeRequests--;
+        activeRequestDone();
       }
     });
 
-    req.on('error', () => { /* connection destroyed, e.g. oversized payload */ this.activeRequests--; });
-  }
-
-  private writeCorsHeaders(res: http.ServerResponse): void {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    req.on('error', () => { activeRequestDone(); });
   }
 }

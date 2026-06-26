@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { McpServer } from '../server';
 import { defineTool } from './index';
+import { resolvePath } from '../../utils/path';
 
 export function registerDebugTools(server: McpServer): void {
   server.registerTool(
@@ -47,8 +48,12 @@ export function registerDebugTools(server: McpServer): void {
         properties: {},
       },
       async () => {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+          return { content: [{ type: 'text', text: 'No active debug session to stop' }], isError: true };
+        }
         try {
-          await vscode.debug.stopDebugging(vscode.debug.activeDebugSession || undefined);
+          await vscode.debug.stopDebugging(session);
           return { content: [{ type: 'text', text: 'Debug session stopped' }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
@@ -131,7 +136,7 @@ export function registerDebugTools(server: McpServer): void {
         const toRemove = vscode.debug.breakpoints.filter((bp) => {
           if (bp instanceof vscode.SourceBreakpoint) {
             const loc = bp.location;
-            return loc.uri.fsPath === uri.fsPath && loc.range.start.line === line;
+            return loc.uri.toString() === uri.toString() && loc.range.start.line === line;
           }
           return false;
         });
@@ -241,5 +246,3 @@ export function registerDebugTools(server: McpServer): void {
     ),
   );
 }
-
-import { resolvePath } from '../../utils/path';
