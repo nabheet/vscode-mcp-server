@@ -188,7 +188,10 @@ export function registerDebugTools(server: McpServer): void {
           if (!threads?.threads?.length) return { content: [{ type: 'text', text: 'No threads available' }], isError: true };
           const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
           if (!stack?.stackFrames?.length) return { content: [{ type: 'text', text: 'No stack frames (is debugger paused?)' }], isError: true };
-          const vars = await session.customRequest('variables', { variablesReference: stack.stackFrames[0].id });
+          const scopes = await session.customRequest('scopes', { frameId: stack.stackFrames[0].id });
+          const varsRef = scopes?.scopes?.[0]?.variablesReference;
+          if (!varsRef) return { content: [{ type: 'text', text: 'No variables in scope' }], isError: true };
+          const vars = await session.customRequest('variables', { variablesReference: varsRef });
           return { content: [{ type: 'text', text: JSON.stringify(vars?.variables || [], null, 2) }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Failed to get variables: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
@@ -237,7 +240,22 @@ export function registerDebugTools(server: McpServer): void {
         const session = vscode.debug.activeDebugSession;
         if (!session) return { content: [{ type: 'text', text: 'No active debug session' }], isError: true };
         try {
-          const result = await session.customRequest('evaluate', { expression: String(args.expression), context: 'repl' });
+          // Resolve top stack frame for frame-scoped evaluation (locals)
+          let frameId: number | undefined;
+          try {
+            const threads = await session.customRequest('threads');
+            if (threads?.threads?.length) {
+              const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+              frameId = stack?.stackFrames?.[0]?.id;
+            }
+          } catch {
+            // Not paused — fall through to global-scope eval
+          }
+          const result = await session.customRequest('evaluate', {
+            expression: String(args.expression),
+            context: 'repl',
+            ...(frameId !== undefined ? { frameId } : {}),
+          });
           return { content: [{ type: 'text', text: result?.result || String(result) }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Evaluate error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
