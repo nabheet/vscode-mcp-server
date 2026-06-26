@@ -97,6 +97,48 @@ describe('handleRequest', () => {
     expect(res.result).toBeDefined();
   });
 
+  // ── MCP lifecycle: initialize ────────────────────────────────────────
+
+  it('responds to initialize with protocol version and capabilities', async () => {
+    const res = await handleRequest('{"jsonrpc":"2.0","id":1,"method":"initialize"}', tools);
+    expect(res.id).toBe(1);
+    expect(res.result).toBeDefined();
+    const r = res.result as any;
+    expect(r.protocolVersion).toBe('2024-11-05');
+    expect(r.capabilities).toEqual({ tools: {} });
+    expect(r.serverInfo).toBeDefined();
+    expect(r.serverInfo.name).toBe('vscode-mcp-server');
+    expect(r.serverInfo.version).toBeDefined();
+  });
+
+  it('initialize preserves request id', async () => {
+    const res = await handleRequest('{"jsonrpc":"2.0","id":"init-1","method":"initialize"}', tools);
+    expect(res.id).toBe('init-1');
+    expect(res.result).toBeDefined();
+  });
+
+  it('initialize returns only result, no error', async () => {
+    const res = await handleRequest('{"jsonrpc":"2.0","id":1,"method":"initialize"}', tools);
+    expect(res.result).toBeDefined();
+    expect(res.error).toBeUndefined();
+  });
+
+  // ── MCP lifecycle: notifications/initialized ─────────────────────────
+
+  it('responds to notifications/initialized with empty result', async () => {
+    const res = await handleRequest('{"jsonrpc":"2.0","id":1,"method":"notifications/initialized"}', tools);
+    expect(res.id).toBe(1);
+    expect(res.result).toEqual({});
+    expect(res.error).toBeUndefined();
+  });
+
+  it('notifications/initialized works without id', async () => {
+    const res = await handleRequest('{"jsonrpc":"2.0","method":"notifications/initialized"}', tools);
+    // Notification — no response expected, but handler returns result
+    expect(res.id).toBeNull();
+    expect(res.result).toBeDefined();
+  });
+
   // ── tools/call — params validation ─────────────────────────────────
 
   it('requires object params', async () => {
