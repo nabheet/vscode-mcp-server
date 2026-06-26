@@ -188,6 +188,106 @@ await client.connect(transport);
 const tools = await client.listTools();
 ```
 
+### With TLS and authentication
+
+Enable TLS and/or auth via VS Code settings or environment variables, then update your client URL and headers accordingly.
+
+**Server-side setup:**
+
+| Method | Setting |
+|--------|---------|
+| VS Code settings | `vscode-mcp-server.tlsCertPath`, `vscode-mcp-server.tlsKeyPath`, `vscode-mcp-server.authToken` |
+| Env vars | `MCP_TLS_CERT_PATH`, `MCP_TLS_KEY_PATH`, `MCP_AUTH_TOKEN` |
+
+#### opencode
+
+```jsonc
+{
+  "mcpServers": {
+    "vscode-mcp": {
+      "type": "remote",
+      "url": "https://127.0.0.1:9876/mcp",   // https, not http
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+#### Claude Desktop / Claude Code
+
+```json
+{
+  "mcpServers": {
+    "vscode-mcp": {
+      "type": "remote",
+      "url": "https://127.0.0.1:9876/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+#### Cursor
+
+In Cursor Settings → Features → MCP Servers:
+
+```
+Name: vscode-mcp
+Type: remote
+URL: https://127.0.0.1:9876/mcp
+Headers: { "Authorization": "Bearer <your-token>" }
+```
+
+#### Programmatic (Python with TLS + auth)
+
+```python
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+async with sse_client(
+    "https://127.0.0.1:9876/mcp",
+    headers={"Authorization": "Bearer <your-token>"},
+) as transport:
+    async with ClientSession(transport) as session:
+        result = await session.list_tools()
+```
+
+#### Programmatic (TypeScript with TLS + auth)
+
+```typescript
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+
+const transport = new SSEClientTransport(
+  new URL("https://127.0.0.1:9876/mcp"),
+  { headers: { Authorization: "Bearer <your-token>" } }
+);
+const client = new Client({ name: "my-agent", version: "1.0.0" });
+await client.connect(transport);
+```
+
+#### curl (for testing)
+
+```bash
+# With TLS
+curl -sk https://127.0.0.1:9876/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <your-token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# With TLS + auth, direct POST
+curl -sk -X POST https://127.0.0.1:9876/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <your-token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+> ⚠️ **Security note**: When auth token is set without TLS, the server logs a warning. Bearer tokens over plain HTTP can be intercepted on the local network. Use TLS for any non-loopback access.
+
 ### Example: tool list (37 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
