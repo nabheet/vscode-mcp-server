@@ -1,15 +1,42 @@
 {
   "name": "vscode-mcp-server",
   "displayName": "VS Code MCP Server",
-  "description": "Exposes VS Code capabilities via an HTTP MCP server for AI tooling",
-  "version": "0.1.0",
+  "description": "Exposes VS Code capabilities via an HTTP MCP (Model Context Protocol) server for AI tooling — debug, edit, terminal, LSP, workspace, and command execution over SSE.",
+  "version": "0.2.0",
   "publisher": "nabheet",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nabheet/vscode-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nabheet/vscode-mcp-server/issues"
+  },
+  "homepage": "https://github.com/nabheet/vscode-mcp-server#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
+  "icon": "icon.png",
   "categories": [
-    "Other"
+    "Other",
+    "Debuggers",
+    "Programming Languages",
+    "Notebooks"
   ],
+  "keywords": [
+    "mcp",
+    "model context protocol",
+    "ai",
+    "agent",
+    "debug",
+    "debugger",
+    "lsp",
+    "remote"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onStartupFinished"
   ],
