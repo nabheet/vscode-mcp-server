@@ -44,7 +44,9 @@ export interface CallToolResult {
 // ── MCP Method Names ─────────────────────────────────────────────────
 export const MCP_TOOLS_LIST = 'tools/list' as const;
 export const MCP_TOOLS_CALL = 'tools/call' as const;
-export type McpMethod = typeof MCP_TOOLS_LIST | typeof MCP_TOOLS_CALL;
+export const MCP_INITIALIZE = 'initialize' as const;
+export const MCP_NOTIFICATION_INITIALIZED = 'notifications/initialized' as const;
+export type McpMethod = typeof MCP_TOOLS_LIST | typeof MCP_TOOLS_CALL | typeof MCP_INITIALIZE;
 
 // ── Error Codes (JSON-RPC 2.0 standard + MCP range) ─────────────────
 export const ErrorCode = {

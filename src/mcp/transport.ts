@@ -1,3 +1,5 @@
+import * as pkg from '../../package.json';
+
 import {
   JsonRpcRequest,
   JsonRpcResponse,
@@ -5,6 +7,8 @@ import {
   ErrorCode,
   MCP_TOOLS_LIST,
   MCP_TOOLS_CALL,
+  MCP_INITIALIZE,
+  MCP_NOTIFICATION_INITIALIZED,
   ToolCallParams,
   ToolDefinition,
   ToolListItem,
@@ -157,6 +161,15 @@ export async function handleRequest(
   const { id, method } = req;
 
   switch (method) {
+    case MCP_INITIALIZE:
+      return makeResult(id, {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: pkg.name, version: pkg.version },
+      });
+    case MCP_NOTIFICATION_INITIALIZED:
+      // Notification — no response expected
+      return makeResult(id, {});
     case MCP_TOOLS_LIST:
       return makeResult(id, handleListTools(tools));
     case MCP_TOOLS_CALL:
