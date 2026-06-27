@@ -7,10 +7,7 @@ Exposes VS Code capabilities via an HTTP [MCP (Model Context Protocol)](https://
 
 ## Quick Start
 
-1. **Install the extension** in VS Code:
-   ```bash
-   code --install-extension vscode-mcp-server-0.2.0.vsix
-   ```
+1. **Install the extension** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-mcp-server) or install a `.vsix` from the [latest release](https://github.com/nabheet/vscode-mcp-server/releases).
 
 2. **Reload VS Code** — the extension starts automatically on startup, listening on `http://127.0.0.1:9876`.
 
