@@ -18,8 +18,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -38,47 +36,39 @@ jobs:
         id: type
         run: echo "pre=${{ github.ref_type == 'tag' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
 
-      - name: Bump patch version (stable only)
-        if: steps.type.outputs.pre == 'false'
-        run: npm version patch --no-git-tag-version
-
-      - name: Get version
-        id: version
-        run: echo "v=$(node -p 'require(\"./package.json\").version')" >> $GITHUB_OUTPUT
-
       - name: Verify PAT
         timeout-minutes: 1
         run: npx @vscode/vsce verify-pat nabheet
 
-      - name: Package VSIX
-        run: npx @vscode/vsce package
-
-      - name: Publish
-        timeout-minutes: 2
+      - name: Publish stable (with retry)
+        if: steps.type.outputs.pre == 'false'
+        timeout-minutes: 5
         run: |
-          if [ "${{ steps.type.outputs.pre }}" = "true" ]; then
-            npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --pre-release --no-git-tag-version
-          else
-            npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --no-git-tag-version
-          fi
+          for i in $(seq 1 3); do
+            npx @vscode/vsce publish patch --no-git-tag-version && break
+            echo "Publish failed, retrying ($i/3)..."
+            sleep 3
+          done
 
-      - name: Commit bump + create tag (stable only)
+      - name: Publish pre-release
+        if: steps.type.outputs.pre == 'true'
+        timeout-minutes: 2
+        run: npx @vscode/vsce publish patch --pre-release --no-git-tag-version
+
+      - name: Get published version
+        id: published
+        run: echo "v=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
+
+      - name: Create tag (stable only)
         if: steps.type.outputs.pre == 'false'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json
-          VERSION="${{ steps.version.outputs.v }}"
-          git commit -m "bump: v$VERSION"
-          git tag "v$VERSION"
-          git push origin main --tags
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git tag v${{ steps.published.outputs.v }}
+          git push origin v${{ steps.published.outputs.v }}
 
       - name: Create GitHub Release (stable only)
         if: steps.type.outputs.pre == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.v }}
+          tag_name: v${{ steps.published.outputs.v }}
           generate_release_notes: true
           files: "*.vsix"
