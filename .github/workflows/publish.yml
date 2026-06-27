@@ -2,17 +2,19 @@ name: Publish to Marketplace
 
 on:
   push:
+    branches: [main]
     tags:
-      - v*
+      - v*-pre*
 
 permissions:
   contents: write
 
+env:
+  VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
     steps:
       - uses: actions/checkout@v4
@@ -26,49 +28,57 @@ jobs:
       - run: npm ci
         timeout-minutes: 2
 
-      - name: Verify PAT
-        timeout-minutes: 1
-        run: npx @vscode/vsce verify-pat nabheet
-
       - run: npm run compile
         timeout-minutes: 2
 
       - run: npm test
         timeout-minutes: 2
 
-      - name: Package VSIX
+      - name: Is pre-release
+        id: type
+        run: echo "pre=${{ github.ref_type == 'tag' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
+
+      - name: Bump patch version (stable only)
+        if: steps.type.outputs.pre == 'false'
+        run: npm version patch --no-git-tag-version
+
+      - name: Get version
+        id: version
+        run: echo "v=$(node -p 'require(\"./package.json\").version')" >> $GITHUB_OUTPUT
+
+      - name: Verify PAT
         timeout-minutes: 1
+        run: npx @vscode/vsce verify-pat nabheet
+
+      - name: Package VSIX
         run: npx @vscode/vsce package
 
-      - name: Determine release type
-        id: release-type
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          if echo "$TAG" | grep -qE '\-pre'; then
-            echo "pre-release=true" >> $GITHUB_OUTPUT
-            echo "message=Pre-release $TAG" >> $GITHUB_OUTPUT
-          else
-            # Stable release — enforce tag is on main
-            if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
-              echo "❌ Stable release tags must be on main branch"
-              exit 1
-            fi
-            echo "pre-release=false" >> $GITHUB_OUTPUT
-            echo "message=Release $TAG" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Publish to VS Code Marketplace
+      - name: Publish
         timeout-minutes: 2
         run: |
-          if [ "${{ steps.release-type.outputs.pre-release }}" = "true" ]; then
-            npx @vscode/vsce publish --pre-release
+          if [ "${{ steps.type.outputs.pre }}" = "true" ]; then
+            npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --pre-release --no-git-tag-version
           else
-            npx @vscode/vsce publish
+            npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --no-git-tag-version
           fi
 
-      - name: Create GitHub Release
-        if: steps.release-type.outputs.pre-release == 'false'
+      - name: Commit bump + create tag (stable only)
+        if: steps.type.outputs.pre == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          VERSION="${{ steps.version.outputs.v }}"
+          git commit -m "bump: v$VERSION"
+          git tag "v$VERSION"
+          git push origin main --tags
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release (stable only)
+        if: steps.type.outputs.pre == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.v }}
           generate_release_notes: true
           files: "*.vsix"
