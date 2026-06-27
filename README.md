@@ -1,12 +1,16 @@
 # VS Code MCP Server
 
+[![CI](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/nabheet/vscode-mcp-server/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Exposes VS Code capabilities via an HTTP [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server for AI tooling.
 
 ## Quick Start
 
 1. **Install the extension** in VS Code:
    ```bash
-   code --install-extension vscode-mcp-server-0.1.0.vsix
+   code --install-extension vscode-mcp-server-0.2.0.vsix
    ```
 
 2. **Reload VS Code** — the extension starts automatically on startup, listening on `http://127.0.0.1:9876`.
