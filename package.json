@@ -1,7 +1,7 @@
 {
   "name": "vscode-ide-mcp",
-  "displayName": "VS Code IDE MCP",
-  "description": "Exposes VS Code capabilities via an HTTP MCP (Model Context Protocol) server for AI tooling — debug, edit, terminal, LSP, workspace, and command execution over SSE.",
+  "displayName": "MCP Server for VS Code",
+  "description": "MCP server that lets AI agents (opencode, Claude, Cursor) debug, edit, and control VS Code directly. Debugger, terminal, LSP, file ops, and 40+ tools over SSE.",
   "version": "0.3.4",
   "publisher": "nabheet",
   "license": "MIT",
@@ -18,20 +18,24 @@
   },
   "icon": "icon.png",
   "categories": [
-    "Other",
+    "Machine Learning",
     "Debuggers",
-    "Programming Languages",
-    "Notebooks"
+    "Programming Languages"
   ],
   "keywords": [
     "mcp",
     "model context protocol",
     "ai",
     "agent",
+    "coding assistant",
+    "vscode",
     "debug",
     "debugger",
     "lsp",
-    "remote"
+    "remote",
+    "automation",
+    "tool server",
+    "terminal"
   ],
   "galleryBanner": {
     "color": "#1e1e1e",
