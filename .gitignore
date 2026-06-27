@@ -4,3 +4,4 @@ dist/
 .vscode-test/
 out/
 *.tsbuildinfo
+REVIEW_OUTPUT.md
