@@ -38,13 +38,27 @@ jobs:
         id: type
         run: echo "pre=${{ github.ref_type == 'tag' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
 
-      - name: Bump patch version (stable only)
+      - name: Determine next version (stable only)
         if: steps.type.outputs.pre == 'false'
-        run: npm version patch --no-git-tag-version
-
-      - name: Get version
         id: version
+        run: |
+          LATEST=$(git tag --list 'v*' --sort=-v:refname | grep -v '\-pre' | head -1)
+          if [[ -z "$LATEST" ]]; then
+            CURRENT=$(node -p 'require("./package.json").version')
+          else
+            CURRENT="${LATEST#v}"
+          fi
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+          echo "v=${major}.${minor}.$((patch + 1))" >> $GITHUB_OUTPUT
+
+      - name: Get version from package.json (pre-release only)
+        if: steps.type.outputs.pre == 'true'
+        id: version-pre
         run: echo "v=$(node -p 'require(\"./package.json\").version')" >> $GITHUB_OUTPUT
+
+      - name: Set version in package.json (stable only)
+        if: steps.type.outputs.pre == 'false'
+        run: npm version ${{ steps.version.outputs.v }} --no-git-tag-version
 
       - name: Verify PAT
         timeout-minutes: 1
@@ -57,23 +71,16 @@ jobs:
         timeout-minutes: 2
         run: |
           if [ "${{ steps.type.outputs.pre }}" = "true" ]; then
-            npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --pre-release --no-git-tag-version
+            npx @vscode/vsce publish "${{ steps.version-pre.outputs.v }}" --pre-release --no-git-tag-version
           else
             npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --no-git-tag-version
           fi
 
-      - name: Commit bump + create tag (stable only)
+      - name: Create tag (stable only)
         if: steps.type.outputs.pre == 'false'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json
-          VERSION="${{ steps.version.outputs.v }}"
-          git commit -m "bump: v$VERSION"
-          git tag "v$VERSION"
-          git push origin main --tags
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git tag "v${{ steps.version.outputs.v }}"
+          git push origin "v${{ steps.version.outputs.v }}"
 
       - name: Create GitHub Release (stable only)
         if: steps.type.outputs.pre == 'false'
