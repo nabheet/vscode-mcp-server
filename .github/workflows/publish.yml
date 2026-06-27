@@ -38,7 +38,7 @@ jobs:
         id: type
         run: echo "pre=${{ github.ref_type == 'tag' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
 
-      - name: Determine next version (stable only)
+      - name: Get next version (stable)
         if: steps.type.outputs.pre == 'false'
         id: version
         run: |
@@ -51,12 +51,7 @@ jobs:
           IFS='.' read -r major minor patch <<< "$CURRENT"
           echo "v=${major}.${minor}.$((patch + 1))" >> $GITHUB_OUTPUT
 
-      - name: Get version from package.json (pre-release only)
-        if: steps.type.outputs.pre == 'true'
-        id: version-pre
-        run: echo "v=$(node -p 'require(\"./package.json\").version')" >> $GITHUB_OUTPUT
-
-      - name: Set version in package.json (stable only)
+      - name: Set version in package.json (stable)
         if: steps.type.outputs.pre == 'false'
         run: npm version ${{ steps.version.outputs.v }} --no-git-tag-version
 
@@ -67,22 +62,17 @@ jobs:
       - name: Package VSIX
         run: npx @vscode/vsce package
 
-      - name: Publish
-        timeout-minutes: 2
-        run: |
-          if [ "${{ steps.type.outputs.pre }}" = "true" ]; then
-            npx @vscode/vsce publish "${{ steps.version-pre.outputs.v }}" --pre-release --no-git-tag-version
-          else
-            npx @vscode/vsce publish "${{ steps.version.outputs.v }}" --no-git-tag-version
-          fi
-
-      - name: Create tag (stable only)
+      - name: Publish stable
         if: steps.type.outputs.pre == 'false'
-        run: |
-          git tag "v${{ steps.version.outputs.v }}"
-          git push origin "v${{ steps.version.outputs.v }}"
+        timeout-minutes: 3
+        run: npx @vscode/vsce publish ${{ steps.version.outputs.v }} --no-git-tag-version
 
-      - name: Create GitHub Release (stable only)
+      - name: Publish pre-release
+        if: steps.type.outputs.pre == 'true'
+        timeout-minutes: 2
+        run: npx @vscode/vsce publish "$(node -p 'require(\"./package.json\").version')" --pre-release --no-git-tag-version
+
+      - name: Create tag + GitHub Release (stable only)
         if: steps.type.outputs.pre == 'false'
         uses: softprops/action-gh-release@v2
         with:
