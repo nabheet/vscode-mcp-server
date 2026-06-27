@@ -407,4 +407,3 @@ npx @vscode/vsce package
 - Terminal tools create integrated terminals in VS Code; output capture has a 30-second timeout to prevent resource leaks
 - LSP tools query the active language server; diagnostics are capped at 200 lines with `... and N more` suffix
 - `sourceMap: true` is enabled — breakpoints work in the debugger when developing the extension itself
-- opencode config split: project-level `opencode.json` (no MCP), global `opencode.global.jsonc` (all MCP servers including `vscode-mcp`)
