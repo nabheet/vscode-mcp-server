@@ -17,15 +17,24 @@ jobs:
           node-version: 24
 
       - run: npm ci
+        timeout-minutes: 2
+
+      - name: Verify PAT
+        timeout-minutes: 1
+        run: npx @vscode/vsce verify-pat nabheet -p "${{ secrets.VSCE_PAT }}"
 
       - run: npm run compile
+        timeout-minutes: 2
 
       - run: npm test
+        timeout-minutes: 2
 
       - name: Package VSIX
+        timeout-minutes: 1
         run: npx @vscode/vsce package
 
       - name: Publish to VS Code Marketplace
+        timeout-minutes: 2
         run: npx @vscode/vsce publish -p "${{ secrets.VSCE_PAT }}"
 
       - name: Create GitHub Release
