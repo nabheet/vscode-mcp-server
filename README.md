@@ -396,8 +396,8 @@ npm test           # 75 tests across 3 suites (server, transport, tools)
 ### Package for distribution
 
 ```bash
-npx vsce package
-# Produces vscode-mcp-server-0.1.0.vsix
+npx @vscode/vsce package
+# Produces vscode-mcp-server-*.vsix
 ```
 
 ## Notes
