@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      - run: npm run compile
+
+      - run: npm test
+
+      - name: Package VSIX
+        run: npx @vscode/vsce package --out vscode-ide-mcp-ci.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: vscode-ide-mcp-ci.vsix

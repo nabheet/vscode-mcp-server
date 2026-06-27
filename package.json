@@ -1,0 +1,85 @@
+{
+  "name": "vscode-ide-mcp",
+  "displayName": "VS Code IDE MCP",
+  "description": "Exposes VS Code capabilities via an HTTP MCP (Model Context Protocol) server for AI tooling — debug, edit, terminal, LSP, workspace, and command execution over SSE.",
+  "version": "0.3.0",
+  "publisher": "nabheet",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nabheet/vscode-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nabheet/vscode-mcp-server/issues"
+  },
+  "homepage": "https://github.com/nabheet/vscode-mcp-server#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "icon": "icon.png",
+  "categories": [
+    "Other",
+    "Debuggers",
+    "Programming Languages",
+    "Notebooks"
+  ],
+  "keywords": [
+    "mcp",
+    "model context protocol",
+    "ai",
+    "agent",
+    "debug",
+    "debugger",
+    "lsp",
+    "remote"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "VS Code MCP Server",
+      "properties": {
+        "vscode-mcp-server.port": {
+          "type": "number",
+          "default": 9876,
+          "description": "Port for the MCP HTTP server"
+        },
+        "vscode-mcp-server.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token. Clients must send Authorization: Bearer <token>. Empty string = no auth."
+        },
+        "vscode-mcp-server.tlsCertPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to TLS certificate PEM file. Requires tlsKeyPath. Enables HTTPS."
+        },
+        "vscode-mcp-server.tlsKeyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to TLS private key PEM file. Requires tlsCertPath. Enables HTTPS."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.3.0",
+    "vitest": "^4.1.9"
+  }
+}
