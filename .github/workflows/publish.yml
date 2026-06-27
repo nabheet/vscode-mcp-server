@@ -5,12 +5,17 @@ on:
     tags:
       - v*
 
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -33,11 +38,34 @@ jobs:
         timeout-minutes: 1
         run: npx @vscode/vsce package
 
+      - name: Determine release type
+        id: release-type
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if echo "$TAG" | grep -qE '\-pre'; then
+            echo "pre-release=true" >> $GITHUB_OUTPUT
+            echo "message=Pre-release $TAG" >> $GITHUB_OUTPUT
+          else
+            # Stable release — enforce tag is on main
+            if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+              echo "❌ Stable release tags must be on main branch"
+              exit 1
+            fi
+            echo "pre-release=false" >> $GITHUB_OUTPUT
+            echo "message=Release $TAG" >> $GITHUB_OUTPUT
+          fi
+
       - name: Publish to VS Code Marketplace
         timeout-minutes: 2
-        run: npx @vscode/vsce publish -p "${{ secrets.VSCE_PAT }}"
+        run: |
+          if [ "${{ steps.release-type.outputs.pre-release }}" = "true" ]; then
+            npx @vscode/vsce publish --pre-release -p "${{ secrets.VSCE_PAT }}"
+          else
+            npx @vscode/vsce publish -p "${{ secrets.VSCE_PAT }}"
+          fi
 
       - name: Create GitHub Release
+        if: steps.release-type.outputs.pre-release == 'false'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
