@@ -3,7 +3,7 @@
 [![CI](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Exposes VS Code capabilities via an HTTP [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server for AI tooling.
+Let AI agents read, write, debug, and execute commands in VS Code — just like a human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server exposes 40+ VS Code tools (debugger, terminal, LSP, file ops, commands) over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ## Quick Start
 
