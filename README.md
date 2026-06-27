@@ -1,7 +1,6 @@
 # VS Code MCP Server
 
 [![CI](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/nabheet/vscode-mcp-server/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Exposes VS Code capabilities via an HTTP [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server for AI tooling.
