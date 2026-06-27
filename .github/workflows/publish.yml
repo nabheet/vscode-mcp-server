@@ -11,6 +11,8 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +28,7 @@ jobs:
 
       - name: Verify PAT
         timeout-minutes: 1
-        run: npx @vscode/vsce verify-pat nabheet -p "${{ secrets.VSCE_PAT }}"
+        run: npx @vscode/vsce verify-pat nabheet
 
       - run: npm run compile
         timeout-minutes: 2
@@ -59,9 +61,9 @@ jobs:
         timeout-minutes: 2
         run: |
           if [ "${{ steps.release-type.outputs.pre-release }}" = "true" ]; then
-            npx @vscode/vsce publish --pre-release -p "${{ secrets.VSCE_PAT }}"
+            npx @vscode/vsce publish --pre-release
           else
-            npx @vscode/vsce publish -p "${{ secrets.VSCE_PAT }}"
+            npx @vscode/vsce publish
           fi
 
       - name: Create GitHub Release
