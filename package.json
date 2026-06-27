@@ -1,6 +1,6 @@
 {
-  "name": "vscode-mcp-server",
-  "displayName": "VS Code MCP Server",
+  "name": "vscode-ide-mcp",
+  "displayName": "VS Code IDE MCP",
   "description": "Exposes VS Code capabilities via an HTTP MCP (Model Context Protocol) server for AI tooling — debug, edit, terminal, LSP, workspace, and command execution over SSE.",
   "version": "0.2.0",
   "publisher": "nabheet",

@@ -107,7 +107,7 @@ describe('handleRequest', () => {
     expect(r.protocolVersion).toBe('2024-11-05');
     expect(r.capabilities).toEqual({ tools: {} });
     expect(r.serverInfo).toBeDefined();
-    expect(r.serverInfo.name).toBe('vscode-mcp-server');
+    expect(r.serverInfo.name).toBe('vscode-ide-mcp');
     expect(r.serverInfo.version).toBeDefined();
   });
 
