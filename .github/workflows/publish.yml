@@ -53,12 +53,11 @@ jobs:
       - name: Publish pre-release
         if: steps.type.outputs.pre == 'true'
         timeout-minutes: 2
-        run: npx @vscode/vsce publish "$(node -p 'require(\"./package.json\").version')" --pre-release --no-git-tag-version
+        run: npx @vscode/vsce publish patch --pre-release --no-git-tag-version
 
-      - name: Get published version (stable only)
-        if: steps.type.outputs.pre == 'false'
+      - name: Get published version
         id: published
-        run: echo "v=$(node -p 'require(\"./package.json\").version')" >> $GITHUB_OUTPUT
+        run: echo "v=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
 
       - name: Create tag (stable only)
         if: steps.type.outputs.pre == 'false'
