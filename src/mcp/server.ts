@@ -115,22 +115,32 @@ export class McpServer {
 
   // ── Helpers ────────────────────────────────────────────────────────
 
-  /** Get the expected origin for CORS (loopback only). */
-  private getOrigin(): string {
+  /** Get the base URL for the server (scheme + host + port). */
+  private getServerBase(): string {
     const scheme = this.useTls ? 'https' : 'http';
-    return scheme + '://127.0.0.1:' + this.options.port;
+    return scheme + '://' + this.options.host + ':' + this.options.port;
   }
 
   /** Check if a request origin is allowed. Only loopback origins are valid. */
   private isValidOrigin(reqOrigin: string | undefined): boolean {
     if (!reqOrigin) return true; // No Origin header — non-browser client
-    const allowed = this.getOrigin();
-    return reqOrigin === allowed || reqOrigin === 'http://127.0.0.1:' + this.options.port;
+    // Allow configured host and common loopback aliases
+    const allowed = [
+      `http://127.0.0.1:${this.options.port}`,
+      `http://localhost:${this.options.port}`,
+      `http://0.0.0.0:${this.options.port}`,
+    ];
+    // Also allow the scheme-specific version if the configured host differs
+    if (!allowed.includes(this.getServerBase())) {
+      allowed.push(this.getServerBase());
+    }
+    return allowed.includes(reqOrigin);
   }
 
   /** Write CORS headers restricted to loopback origin. */
   private writeCorsHeaders(res: http.ServerResponse, origin?: string): void {
-    const allowed = origin && this.isValidOrigin(origin) ? origin : 'http://127.0.0.1:' + this.options.port;
+    const fallback = `http://127.0.0.1:${this.options.port}`;
+    const allowed = origin && this.isValidOrigin(origin) ? origin : fallback;
     res.setHeader('Access-Control-Allow-Origin', allowed);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -214,6 +224,9 @@ export class McpServer {
 
   /** SSE connection — open event stream and send endpoint URL. */
   private handleSseConnection(req: http.IncomingMessage, res: http.ServerResponse): void {
+    // Check auth for SSE too (security — previously only checked on direct POST)
+    if (this.authFailed(req, res)) return;
+
     const sessionId = crypto.randomUUID();
     const endpoint = `/mcp/session/${sessionId}/message`;
 
