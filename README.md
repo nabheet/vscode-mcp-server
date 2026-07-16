@@ -117,6 +117,8 @@ Add to your `opencode.global.jsonc` or `opencode.json`:
 
 ### Claude Desktop / Claude Code
 
+**Claude Code** uses the [Streamable HTTP transport](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/) (MCP 2025-03-26). The server supports this via direct `POST /mcp` — no SSE preamble needed.
+
 Add to `claude_desktop_config.json`:
 
 ```json
@@ -129,6 +131,8 @@ Add to `claude_desktop_config.json`:
   }
 }
 ```
+
+> **Troubleshooting**: If Claude Code fails to connect, check that it's not sending an incompatible `Origin` header. The server accepts `http://127.0.0.1:<port>`, `http://localhost:<port>`, and `http://0.0.0.0:<port>`. See [Origin header troubleshooting](#origin-header-troubleshooting) below.
 
 Or via stdio if you prefer a managed subprocess:
 
@@ -288,6 +292,40 @@ curl -sk -X POST https://127.0.0.1:9876/mcp \
 
 > ⚠️ **Security note**: When auth token is set without TLS, the server logs a warning. Bearer tokens over plain HTTP can be intercepted on the local network. Use TLS for any non-loopback access.
 
+## Troubleshooting
+
+### Origin header troubleshooting
+
+Some MCP clients (including recent Claude Code versions) send an `Origin` HTTP header when connecting via Streamable HTTP (`POST /mcp`). If the origin doesn't match an allowed loopback address, the server rejects the request with `403 Forbidden`.
+
+**Allowed origins** (configurable via the server's `host` setting):
+
+| Origin | Default? |
+|--------|----------|
+| `http://127.0.0.1:<port>` | ✅ Always accepted |
+| `http://localhost:<port>` | ✅ Always accepted |
+| `http://0.0.0.0:<port>` | ✅ Always accepted |
+| `http://<configured-host>:<port>` | ✅ Only if host differs from above |
+| No `Origin` header (non-browser client) | ✅ Always accepted |
+| Any other origin | ❌ Rejected |
+
+**To diagnose**: check the server logs for 403 responses when your client tries to connect:
+
+```bash
+# Verify the server is running
+curl -s -X POST http://127.0.0.1:9876/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+If `curl` works but your client doesn't, the client is likely sending an `Origin` header that doesn't match. Check your client's MCP transport configuration — some allow setting custom headers.
+
+### SSE transport deprecation
+
+The old MCP SSE transport (`GET /mcp` → SSE stream → `endpoint` event → `POST /mcp/session/:id/message`) is **deprecated** as of the MCP 2025-03-26 specification. The new standard is **Streamable HTTP** transport (`POST /mcp` with direct JSON-RPC response).
+
+This server supports **both** transports transparently — no configuration change needed. Just use `POST /mcp` as the endpoint and the server handles everything synchronously.
+
 ### Example: tool list (37 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
@@ -305,11 +343,13 @@ When connected, `tools/list` returns schemas for all tools. Key categories:
 
 ### Transport
 
-Supports two transport modes:
+Supports three transport modes:
 
-**1. SSE (recommended)** — `GET /mcp` opens an SSE stream, server sends an `endpoint` event with a session-specific POST URL. Client sends JSON-RPC messages to `POST /mcp/session/:id/message`, responses arrive via SSE `message` events.
+**1. Streamable HTTP (recommended, MCP 2025-03-26)** — `POST /mcp` with JSON-RPC body. Synchronous request/response. This is the new standard transport used by Claude Code and recent MCP SDK clients. No session setup or SSE handshake needed.
 
-**2. Direct POST (backward compat)** — `POST /mcp` with JSON-RPC body. Synchronous request/response.
+**2. SSE (legacy)** — `GET /mcp` opens an SSE stream, server sends an `endpoint` event with a session-specific POST URL. Client sends JSON-RPC messages to `POST /mcp/session/:id/message`, responses arrive via SSE `message` events. Deprecated in favor of Streamable HTTP but still supported.
+
+**3. Direct POST (backward compat)** — `POST /mcp` with JSON-RPC body. Synchronous request/response. This is identical to Streamable HTTP at the wire level.
 
 ### Lifecycle
 
