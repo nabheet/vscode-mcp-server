@@ -56,14 +56,20 @@ function mcpRequest(port: number, method: string, params?: any): Promise<any> {
   });
 }
 
-async function waitForServer(port: number, timeoutMs = 60000): Promise<void> {
+async function waitForServer(port: number, timeoutMs = 120000): Promise<void> {
   const start = Date.now();
+  let lastLog = 0;
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await mcpRequest(port, 'tools/list');
       if (res?.result) return;
     } catch {
       // Server not ready yet
+    }
+    const elapsed = Date.now() - start;
+    if (elapsed - lastLog >= 10000) {
+      lastLog = elapsed;
+      console.log(`⌛ Waiting for MCP server... ${(elapsed / 1000).toFixed(0)}s`);
     }
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -217,9 +223,9 @@ describe('multi-root workspace (E2E)', () => {
     if (vsCodeProc.stdout) vsCodeProc.stdout.pipe(logStream);
     if (vsCodeProc.stderr) vsCodeProc.stderr.pipe(logStream);
 
-    // Wait for MCP server to be ready (up to 60s)
-    await waitForServer(port, 60000);
-  }, 120000);
+    // Wait for MCP server to be ready (up to 120s — CI runners are slow)
+    await waitForServer(port, 120000);
+  }, 180000);
 
   afterAll(async () => {
     if (vsCodeProc && !vsCodeProc.killed) {
