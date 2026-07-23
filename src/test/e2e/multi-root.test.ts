@@ -537,6 +537,37 @@ describe('multi-root workspace (E2E)', () => {
     expect(res.result.isError).toBe(true);
   });
 
+  // ── open_file_at_position with workspaceFolder ───────────────────────
+
+  it('open_file_at_position with workspaceFolder opens at correct position', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file_at_position',
+      arguments: { path: 'src/index.ts', line: 1, column: 1, workspaceFolder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('line 1, column 1');
+  });
+
+  it('open_file_at_position without workspaceFolder uses first folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file_at_position',
+      arguments: { path: 'src/index.ts', line: 1, column: 1 },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Opened');
+  });
+
+  it('open_file_at_position with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file_at_position',
+      arguments: { path: 'src/index.ts', line: 1, column: 1, workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
+  });
+
   // ── add_breakpoint / remove_breakpoint with workspaceFolder ──────────
 
   it('add_breakpoint with workspaceFolder sets breakpoint in correct folder', async () => {
