@@ -375,32 +375,39 @@ describe('multi-root workspace (E2E)', () => {
     if (!ENABLED) return;
     const res = await mcpRequest(port, 'tools/call', {
       name: 'create_file',
-      arguments: { path: 'src/created.ts', workspaceFolder: 'backend' },
+      arguments: { path: 'src/created-by-folder.ts', workspaceFolder: 'backend' },
     });
     expect(res.result.isError).toBe(false);
 
     // Verify by reading it back
     const readRes = await mcpRequest(port, 'tools/call', {
       name: 'read_file',
-      arguments: { path: 'src/created.ts', workspaceFolder: 'backend' },
+      arguments: { path: 'src/created-by-folder.ts', workspaceFolder: 'backend' },
     });
     expect(readRes.result.isError).toBe(false);
   });
 
   it('create_file without workspaceFolder creates in first folder', async () => {
     if (!ENABLED) return;
+    const fname = 'src/created-by-default.ts';
     const res = await mcpRequest(port, 'tools/call', {
       name: 'create_file',
-      arguments: { path: 'src/created.ts' },
+      arguments: { path: fname },
     });
     expect(res.result.isError).toBe(false);
 
-    // Verify it's in frontend (first folder), not backend
+    // Verify it exists in frontend (first folder)
+    const readFrontend = await mcpRequest(port, 'tools/call', {
+      name: 'read_file',
+      arguments: { path: fname, workspaceFolder: 'frontend' },
+    });
+    expect(readFrontend.result.isError).toBe(false);
+
+    // Verify it does NOT exist in backend
     const readBackend = await mcpRequest(port, 'tools/call', {
       name: 'read_file',
-      arguments: { path: 'src/created.ts', workspaceFolder: 'backend' },
+      arguments: { path: fname, workspaceFolder: 'backend' },
     });
-    // backend should NOT have it
     expect(readBackend.result.isError).toBe(true);
   });
 
@@ -417,22 +424,23 @@ describe('multi-root workspace (E2E)', () => {
 
   it('delete_file with workspaceFolder deletes from correct folder', async () => {
     if (!ENABLED) return;
+    const fname = 'src/todelete-by-folder.ts';
     // Create a file to delete
     await mcpRequest(port, 'tools/call', {
       name: 'create_file',
-      arguments: { path: 'src/todelete.ts', workspaceFolder: 'backend' },
+      arguments: { path: fname, workspaceFolder: 'backend' },
     });
 
     const res = await mcpRequest(port, 'tools/call', {
       name: 'delete_file',
-      arguments: { path: 'src/todelete.ts', workspaceFolder: 'backend' },
+      arguments: { path: fname, workspaceFolder: 'backend' },
     });
     expect(res.result.isError).toBe(false);
 
     // Verify it's gone
     const readRes = await mcpRequest(port, 'tools/call', {
       name: 'read_file',
-      arguments: { path: 'src/todelete.ts', workspaceFolder: 'backend' },
+      arguments: { path: fname, workspaceFolder: 'backend' },
     });
     expect(readRes.result.isError).toBe(true);
   });
