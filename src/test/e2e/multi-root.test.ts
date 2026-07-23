@@ -206,6 +206,12 @@ describe('multi-root workspace (E2E)', () => {
       workspaceFile,
     ];
 
+    // @vscode/test-electron normally adds --no-sandbox on Linux; when we
+    // use the CLI path directly we must add it ourselves.
+    if (process.platform === 'linux') {
+      launchArgs.push('--no-sandbox');
+    }
+
     const logPath = path.join(tmpDir, 'vscode.log');
     const spawnOpts: SpawnOptions = {
       env: {
