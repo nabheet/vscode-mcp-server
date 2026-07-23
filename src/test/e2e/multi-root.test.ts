@@ -471,6 +471,127 @@ describe('multi-root workspace (E2E)', () => {
     expect(res.result.isError).toBe(true);
   });
 
+  // ── open_file with workspaceFolder ───────────────────────────────────
+
+  it('open_file with workspaceFolder opens from correct folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file',
+      arguments: { path: 'src/index.ts', workspaceFolder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Opened');
+    expect((res.result.content[0].text as string)).toContain('index.ts');
+  });
+
+  it('open_file without workspaceFolder uses first folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file',
+      arguments: { path: 'src/index.ts' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Opened');
+    expect((res.result.content[0].text as string)).toContain('index.ts');
+  });
+
+  it('open_file with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file',
+      arguments: { path: 'src/index.ts', workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
+  });
+
+  // ── open_file_at_line with workspaceFolder ───────────────────────────
+
+  it('open_file_at_line with workspaceFolder opens at correct line', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file_at_line',
+      arguments: { path: 'src/index.ts', line: 1, workspaceFolder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('line 1');
+  });
+
+  // ── reveal_in_explorer with workspaceFolder ──────────────────────────
+
+  it('reveal_in_explorer with workspaceFolder succeeds', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'reveal_in_explorer',
+      arguments: { path: 'src/index.ts', workspaceFolder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Revealed');
+  });
+
+  it('reveal_in_explorer with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'reveal_in_explorer',
+      arguments: { path: 'src/index.ts', workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
+  });
+
+  // ── add_breakpoint / remove_breakpoint with workspaceFolder ──────────
+
+  it('add_breakpoint with workspaceFolder sets breakpoint in correct folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'add_breakpoint',
+      arguments: { path: 'src/index.ts', line: 1, workspaceFolder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Breakpoint added');
+
+    // Verify it was actually set
+    const listRes = await mcpRequest(port, 'tools/call', {
+      name: 'list_breakpoints',
+      arguments: {},
+    });
+    expect(listRes.result.isError).toBe(false);
+    expect((listRes.result.content[0].text as string)).toContain('src/index.ts');
+  });
+
+  it('add_breakpoint without workspaceFolder sets breakpoint in first folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'add_breakpoint',
+      arguments: { path: 'src/index.ts', line: 2 },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Breakpoint added');
+  });
+
+  it('add_breakpoint with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'add_breakpoint',
+      arguments: { path: 'src/index.ts', line: 1, workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
+  });
+
+  it('remove_breakpoint with workspaceFolder removes breakpoint', async () => {
+    if (!ENABLED) return;
+    // Add a breakpoint first
+    await mcpRequest(port, 'tools/call', {
+      name: 'add_breakpoint',
+      arguments: { path: 'src/index.ts', line: 3, workspaceFolder: 'backend' },
+    });
+
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'remove_breakpoint',
+      arguments: { path: 'src/index.ts', line: 3, workspaceFolder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Breakpoint removed');
+  });
+
   // ── Error cases ──────────────────────────────────────────────────────
 
   it('list_files with nonexistent workspaceFolder returns error', async () => {
