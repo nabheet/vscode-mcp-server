@@ -220,8 +220,19 @@ describe('multi-root workspace (E2E)', () => {
 
     // Log VS Code output for debugging failures
     const logStream = fs.createWriteStream(logPath);
-    if (vsCodeProc.stdout) vsCodeProc.stdout.pipe(logStream);
-    if (vsCodeProc.stderr) vsCodeProc.stderr.pipe(logStream);
+    if (vsCodeProc.stdout) {
+      vsCodeProc.stdout.pipe(logStream);
+      // Also forward to console so CI logs capture startup errors
+      vsCodeProc.stdout.on('data', (chunk: Buffer) => {
+        process.stdout.write(`[vscode:stdout] ${chunk.toString()}`);
+      });
+    }
+    if (vsCodeProc.stderr) {
+      vsCodeProc.stderr.pipe(logStream);
+      vsCodeProc.stderr.on('data', (chunk: Buffer) => {
+        process.stderr.write(`[vscode:stderr] ${chunk.toString()}`);
+      });
+    }
 
     // Wait for MCP server to be ready (up to 120s — CI runners are slow)
     await waitForServer(port, 120000);
