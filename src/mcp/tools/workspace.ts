@@ -14,6 +14,7 @@ export function registerWorkspaceTools(server: McpServer): void {
         properties: {
           pattern: { type: 'string', description: 'Glob pattern (default: "**/*")' },
           path: { type: 'string', description: 'Root directory relative to workspace (default: workspace root)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces)' },
         },
       },
       async (args) => {
@@ -22,11 +23,25 @@ export function registerWorkspaceTools(server: McpServer): void {
           return { content: [{ type: 'text', text: 'No workspace folder open' }], isError: true };
         }
 
-        const pattern = String(args.pattern || '**/*');
-        const rootUri = args.path
-          ? vscode.Uri.file(path.join(folders[0].uri.fsPath, String(args.path)))
-          : folders[0].uri;
+        // Resolve target folder
+        let rootUri: vscode.Uri;
+        if (args.workspaceFolder) {
+          const folder = folders.find(f => f.name === args.workspaceFolder);
+          if (!folder) {
+            const names = folders.map(f => f.name).join(', ');
+            return { content: [{ type: 'text', text: `Workspace folder '${args.workspaceFolder}' not found. Available: ${names}` }], isError: true };
+          }
+          rootUri = folder.uri;
+        } else {
+          rootUri = folders[0].uri;
+        }
 
+        // Apply sub-path if given
+        if (args.path) {
+          rootUri = vscode.Uri.file(path.join(rootUri.fsPath, String(args.path)));
+        }
+
+        const pattern = String(args.pattern || '**/*');
         try {
           const files = await vscode.workspace.findFiles(
             new vscode.RelativePattern(rootUri, pattern),
@@ -50,11 +65,12 @@ export function registerWorkspaceTools(server: McpServer): void {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         try {
           const bytes = await vscode.workspace.fs.readFile(uri);
           const text = Buffer.from(bytes).toString('utf-8');
@@ -75,11 +91,12 @@ export function registerWorkspaceTools(server: McpServer): void {
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           content: { type: 'string', description: 'File content' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'content'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         const content = String(args.content);
         const MAX_WRITE_SIZE = 1 * 1024 * 1024; // 1 MB
         if (content.length > MAX_WRITE_SIZE) {
@@ -103,11 +120,12 @@ export function registerWorkspaceTools(server: McpServer): void {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         try {
           // Check if file already exists
           try {
@@ -138,11 +156,12 @@ export function registerWorkspaceTools(server: McpServer): void {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           useTrash: { type: 'boolean', description: 'Move to trash instead of permanent delete (default: true)' },
           recursive: { type: 'boolean', description: 'Recursively delete directories (default: false)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         const useTrash = args.useTrash !== false;
         const recursive = args.recursive === true;
         try {

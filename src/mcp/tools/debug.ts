@@ -102,12 +102,13 @@ export function registerDebugTools(server: McpServer): void {
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           condition: { type: 'string', description: 'Optional breakpoint condition expression (e.g. "x > 5")' },
           hitCondition: { type: 'string', description: 'Optional hit count condition (e.g. "5" for every 5th hit)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'line'],
       },
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         const cond = args.condition ? String(args.condition) : undefined;
         const hitCond = args.hitCondition ? String(args.hitCondition) : undefined;
         const loc = new vscode.Location(uri, new vscode.Position(line, 0));
@@ -127,12 +128,13 @@ export function registerDebugTools(server: McpServer): void {
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'line'],
       },
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         const toRemove = vscode.debug.breakpoints.filter((bp) => {
           if (bp instanceof vscode.SourceBreakpoint) {
             const loc = bp.location;
