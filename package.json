@@ -78,8 +78,8 @@
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "RUN_E2E=1 vitest run --config vitest.e2e.config.ts",
-    "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.ts"
+    "test:e2e": "RUN_E2E=1 bash -c 'trap \"pkill -9 -f extensionDevelopmentPath 2>/dev/null; pkill -9 -f \\.vscode-test 2>/dev/null\" EXIT INT TERM; vitest run --config vitest.e2e.config.ts'",
+    "test:e2e:watch": "RUN_E2E=1 bash -c 'trap \"pkill -9 -f extensionDevelopmentPath 2>/dev/null; pkill -9 -f \\.vscode-test 2>/dev/null\" EXIT INT TERM; vitest --config vitest.e2e.config.ts'"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
