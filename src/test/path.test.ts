@@ -54,4 +54,94 @@ describe('resolvePath', () => {
     const result = resolvePath('/foo/bar.ts');
     expect(result.scheme).toBe('file');
   });
+
+  // ── Multi-root workspace tests ──────────────────────────────────────
+
+  it('resolves relative path against named workspace folder', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    const result = resolvePath('src/main.ts', 'backend');
+    expect(result.fsPath).toBe('/workspace/backend/src/main.ts');
+  });
+
+  it('resolves relative path against non-first workspace folder', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'a', uri: { fsPath: '/workspace/a' } },
+      { name: 'b', uri: { fsPath: '/workspace/b' } },
+    ];
+    const result = resolvePath('lib/util.ts', 'b');
+    expect(result.fsPath).toBe('/workspace/b/lib/util.ts');
+  });
+
+  it('throws when named workspace folder does not exist', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+    ];
+    expect(() => resolvePath('src/main.ts', 'nonexistent')).toThrow(/not found/i);
+  });
+
+  it('throws when folder name given but no workspace folders open', () => {
+    (vscode.workspace as any).workspaceFolders = undefined;
+    expect(() => resolvePath('src/main.ts', 'frontend')).toThrow(/no workspace folders are open/i);
+  });
+
+  it('uses first folder when folderName omitted in multi-root workspace', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    const result = resolvePath('src/main.ts');
+    expect(result.fsPath).toBe('/workspace/frontend/src/main.ts');
+  });
+
+  it('still enforces workspace boundary with named folder', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    expect(() => resolvePath('../outside.ts', 'frontend')).toThrow(/outside the workspace/i);
+  });
+
+  it('accepts absolute path with named folder (folder is ignored but boundary checked)', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+    ];
+    const result = resolvePath('/workspace/frontend/src/main.ts', 'frontend');
+    expect(result.fsPath).toBe('/workspace/frontend/src/main.ts');
+  });
+
+  it('rejects absolute path outside workspace even with named folder', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+    ];
+    expect(() => resolvePath('/etc/passwd', 'frontend')).toThrow(/outside the workspace/i);
+  });
+
+  // ── Folder name edge cases ───────────────────────────────────────────
+
+  it('handles empty string folderName (falls back to first folder)', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    const result = resolvePath('src/main.ts', '');
+    expect(result.fsPath).toBe('/workspace/frontend/src/main.ts');
+  });
+
+  it('rejects folderName with prefix match (requires exact match)', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    expect(() => resolvePath('src/main.ts', 'back')).toThrow(/not found/i);
+  });
+
+  it('rejects folderName with extra whitespace', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+    ];
+    expect(() => resolvePath('src/main.ts', ' frontend')).toThrow(/not found/i);
+  });
 });

@@ -30,3 +30,37 @@ jobs:
         with:
           name: vsix
           path: vscode-ide-mcp-ci.vsix
+
+  test-e2e:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      - run: npm run compile
+
+      # Cache VS Code binary downloaded by @vscode/test-electron
+      - name: Cache VS Code
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vscode-test-electron
+          key: ${{ runner.os }}-vscode-test-electron-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vscode-test-electron-
+
+      # xvfb provides a virtual display for VS Code's GUI on headless CI runners
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      # Run E2E tests. The test auto-detects @vscode/test-electron for the VS Code
+      # binary and wraps with xvfb-run on headless Linux.
+      - name: Run E2E tests
+        run: xvfb-run --auto-servernum npm run test:e2e
+        timeout-minutes: 10

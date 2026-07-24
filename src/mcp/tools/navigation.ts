@@ -18,11 +18,12 @@ export function registerNavigationTools(server: McpServer): void {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         try {
           const editor = await openEditor(uri);
           return { content: [{ type: 'text', text: `Opened ${uri.fsPath} at line ${editor.selection.active.line + 1}` }], isError: false };
@@ -42,11 +43,12 @@ export function registerNavigationTools(server: McpServer): void {
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'line'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         const line = Math.max(0, Number(args.line) - 1); // convert to 0-indexed
         try {
           const editor = await openEditor(uri);
@@ -71,11 +73,12 @@ export function registerNavigationTools(server: McpServer): void {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           column: { type: 'integer', description: 'Column number (1-indexed)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'line', 'column'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         const line = Math.max(0, Number(args.line) - 1);
         const col = Math.max(0, Number(args.column) - 1);
         try {
@@ -127,11 +130,12 @@ export function registerNavigationTools(server: McpServer): void {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path'],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path));
+        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
         try {
           await vscode.commands.executeCommand('revealInExplorer', uri);
           return { content: [{ type: 'text', text: `Revealed ${uri.fsPath} in explorer` }], isError: false };

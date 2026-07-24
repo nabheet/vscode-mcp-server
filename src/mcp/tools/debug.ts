@@ -102,18 +102,23 @@ export function registerDebugTools(server: McpServer): void {
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           condition: { type: 'string', description: 'Optional breakpoint condition expression (e.g. "x > 5")' },
           hitCondition: { type: 'string', description: 'Optional hit count condition (e.g. "5" for every 5th hit)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'line'],
       },
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
-        const uri = resolvePath(String(args.path));
-        const cond = args.condition ? String(args.condition) : undefined;
-        const hitCond = args.hitCondition ? String(args.hitCondition) : undefined;
-        const loc = new vscode.Location(uri, new vscode.Position(line, 0));
-        const bp = new vscode.SourceBreakpoint(loc, true, cond, hitCond);
-        vscode.debug.addBreakpoints([bp]);
-        return { content: [{ type: 'text', text: `Breakpoint added at ${uri.fsPath}:${args.line}` }], isError: false };
+        try {
+          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+          const cond = args.condition ? String(args.condition) : undefined;
+          const hitCond = args.hitCondition ? String(args.hitCondition) : undefined;
+          const loc = new vscode.Location(uri, new vscode.Position(line, 0));
+          const bp = new vscode.SourceBreakpoint(loc, true, cond, hitCond);
+          vscode.debug.addBreakpoints([bp]);
+          return { content: [{ type: 'text', text: `Breakpoint added at ${uri.fsPath}:${args.line}` }], isError: false };
+        } catch (err) {
+          return { content: [{ type: 'text', text: `Failed to add breakpoint: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+        }
       },
     ),
   );
@@ -127,24 +132,29 @@ export function registerDebugTools(server: McpServer): void {
         properties: {
           path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
         required: ['path', 'line'],
       },
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
-        const uri = resolvePath(String(args.path));
-        const toRemove = vscode.debug.breakpoints.filter((bp) => {
-          if (bp instanceof vscode.SourceBreakpoint) {
-            const loc = bp.location;
-            return loc.uri.toString() === uri.toString() && loc.range.start.line === line;
+        try {
+          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+          const toRemove = vscode.debug.breakpoints.filter((bp) => {
+            if (bp instanceof vscode.SourceBreakpoint) {
+              const loc = bp.location;
+              return loc.uri.toString() === uri.toString() && loc.range.start.line === line;
+            }
+            return false;
+          });
+          if (toRemove.length === 0) {
+            return { content: [{ type: 'text', text: `No breakpoint at ${uri.fsPath}:${args.line}` }], isError: true };
           }
-          return false;
-        });
-        if (toRemove.length === 0) {
-          return { content: [{ type: 'text', text: `No breakpoint at ${uri.fsPath}:${args.line}` }], isError: true };
+          vscode.debug.removeBreakpoints(toRemove);
+          return { content: [{ type: 'text', text: `Breakpoint removed at ${uri.fsPath}:${args.line}` }], isError: false };
+        } catch (err) {
+          return { content: [{ type: 'text', text: `Failed to remove breakpoint: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }
-        vscode.debug.removeBreakpoints(toRemove);
-        return { content: [{ type: 'text', text: `Breakpoint removed at ${uri.fsPath}:${args.line}` }], isError: false };
       },
     ),
   );
