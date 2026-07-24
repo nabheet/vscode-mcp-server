@@ -326,7 +326,7 @@ The old MCP SSE transport (`GET /mcp` → SSE stream → `endpoint` event → `P
 
 This server supports **both** transports transparently — no configuration change needed. Just use `POST /mcp` as the endpoint and the server handles everything synchronously.
 
-### Example: tool list (37 tools)
+### Example: tool list (42 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
@@ -442,7 +442,7 @@ npx @vscode/vsce package
 
 ## Notes
 
-- Workspace file operations are relative to the first workspace root folder
+- Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
 - Debug tools require an active debug configuration (`launch.json`) in the workspace
 - Terminal tools create integrated terminals in VS Code; output capture has a 30-second timeout to prevent resource leaks
 - LSP tools query the active language server; diagnostics are capped at 200 lines with `... and N more` suffix
