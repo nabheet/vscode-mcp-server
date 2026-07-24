@@ -118,4 +118,30 @@ describe('resolvePath', () => {
     ];
     expect(() => resolvePath('/etc/passwd', 'frontend')).toThrow(/outside the workspace/i);
   });
+
+  // ── Folder name edge cases ───────────────────────────────────────────
+
+  it('handles empty string folderName (falls back to first folder)', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    const result = resolvePath('src/main.ts', '');
+    expect(result.fsPath).toBe('/workspace/frontend/src/main.ts');
+  });
+
+  it('rejects folderName with prefix match (requires exact match)', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+      { name: 'backend', uri: { fsPath: '/workspace/backend' } },
+    ];
+    expect(() => resolvePath('src/main.ts', 'back')).toThrow(/not found/i);
+  });
+
+  it('rejects folderName with extra whitespace', () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: { fsPath: '/workspace/frontend' } },
+    ];
+    expect(() => resolvePath('src/main.ts', ' frontend')).toThrow(/not found/i);
+  });
 });

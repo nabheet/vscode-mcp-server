@@ -356,6 +356,41 @@ describe('multi-root workspace (E2E)', () => {
     expect(readRes.result.content[0].text).toBe('// written from E2E test\n');
   });
 
+  it('write_file without workspaceFolder writes to first folder', async () => {
+    if (!ENABLED) return;
+    const fname = 'src/frontend-only.ts';
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'write_file',
+      arguments: { path: fname, content: '// frontend only\n' },
+    });
+    expect(res.result.isError).toBe(false);
+
+    // Verify it's in frontend (first folder)
+    const readFrontend = await mcpRequest(port, 'tools/call', {
+      name: 'read_file',
+      arguments: { path: fname, workspaceFolder: 'frontend' },
+    });
+    expect(readFrontend.result.isError).toBe(false);
+    expect(readFrontend.result.content[0].text).toBe('// frontend only\n');
+
+    // Verify NOT in backend
+    const readBackend = await mcpRequest(port, 'tools/call', {
+      name: 'read_file',
+      arguments: { path: fname, workspaceFolder: 'backend' },
+    });
+    expect(readBackend.result.isError).toBe(true);
+  });
+
+  it('write_file with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'write_file',
+      arguments: { path: 'src/any.ts', content: 'x', workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
+    expect((res.result.content[0].text as string).toLowerCase()).toMatch(/not found/);
+  });
+
   // ── list_files with workspaceFolder ──────────────────────────────────
 
   it('list_files with workspaceFolder scopes to that folder', async () => {
@@ -471,6 +506,29 @@ describe('multi-root workspace (E2E)', () => {
     expect(res.result.isError).toBe(true);
   });
 
+  it('delete_file without workspaceFolder deletes from first folder', async () => {
+    if (!ENABLED) return;
+    const fname = 'src/todelete-from-frontend.ts';
+    // Create a file in frontend (first folder)
+    await mcpRequest(port, 'tools/call', {
+      name: 'create_file',
+      arguments: { path: fname },
+    });
+
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'delete_file',
+      arguments: { path: fname },
+    });
+    expect(res.result.isError).toBe(false);
+
+    // Verify it's gone from frontend
+    const readRes = await mcpRequest(port, 'tools/call', {
+      name: 'read_file',
+      arguments: { path: fname, workspaceFolder: 'frontend' },
+    });
+    expect(readRes.result.isError).toBe(true);
+  });
+
   // ── open_file with workspaceFolder ───────────────────────────────────
 
   it('open_file with workspaceFolder opens from correct folder', async () => {
@@ -516,6 +574,25 @@ describe('multi-root workspace (E2E)', () => {
     expect((res.result.content[0].text as string)).toContain('line 1');
   });
 
+  it('open_file_at_line without workspaceFolder opens from first folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file_at_line',
+      arguments: { path: 'src/index.ts', line: 2 },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('line 2');
+  });
+
+  it('open_file_at_line with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'open_file_at_line',
+      arguments: { path: 'src/index.ts', line: 1, workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
+  });
+
   // ── reveal_in_explorer with workspaceFolder ──────────────────────────
 
   it('reveal_in_explorer with workspaceFolder succeeds', async () => {
@@ -535,6 +612,16 @@ describe('multi-root workspace (E2E)', () => {
       arguments: { path: 'src/index.ts', workspaceFolder: 'bogus' },
     });
     expect(res.result.isError).toBe(true);
+  });
+
+  it('reveal_in_explorer without workspaceFolder reveals from first folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'reveal_in_explorer',
+      arguments: { path: 'src/index.ts' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Revealed');
   });
 
   // ── open_file_at_position with workspaceFolder ───────────────────────
@@ -621,6 +708,31 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(res.result.isError).toBe(false);
     expect((res.result.content[0].text as string)).toContain('Breakpoint removed');
+  });
+
+  it('remove_breakpoint without workspaceFolder removes from first folder', async () => {
+    if (!ENABLED) return;
+    // Add a breakpoint in frontend (first folder)
+    await mcpRequest(port, 'tools/call', {
+      name: 'add_breakpoint',
+      arguments: { path: 'src/index.ts', line: 1 },
+    });
+
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'remove_breakpoint',
+      arguments: { path: 'src/index.ts', line: 1 },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Breakpoint removed');
+  });
+
+  it('remove_breakpoint with nonexistent workspaceFolder returns error', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'remove_breakpoint',
+      arguments: { path: 'src/index.ts', line: 1, workspaceFolder: 'bogus' },
+    });
+    expect(res.result.isError).toBe(true);
   });
 
   // ── Error cases ──────────────────────────────────────────────────────
