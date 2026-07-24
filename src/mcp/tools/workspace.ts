@@ -14,7 +14,7 @@ export function registerWorkspaceTools(server: McpServer): void {
         properties: {
           pattern: { type: 'string', description: 'Glob pattern (default: "**/*")' },
           path: { type: 'string', description: 'Root directory relative to workspace (default: workspace root)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces)' },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
       },
       async (args) => {
@@ -29,7 +29,7 @@ export function registerWorkspaceTools(server: McpServer): void {
           const folder = folders.find(f => f.name === args.workspaceFolder);
           if (!folder) {
             const names = folders.map(f => f.name).join(', ');
-            return { content: [{ type: 'text', text: `Workspace folder '${args.workspaceFolder}' not found. Available: ${names}` }], isError: true };
+            return { content: [{ type: 'text', text: `Workspace folder '${args.workspaceFolder}' not found. Available folders: ${names}` }], isError: true };
           }
           rootUri = folder.uri;
         } else {

@@ -273,7 +273,7 @@ describe('multi-root workspace (E2E)', () => {
           if (i < 4) await new Promise((r) => setTimeout(r, 500));
         }
       }
-      if (lastErr) throw lastErr;
+      if (lastErr) console.warn('⚠  Failed to clean up temp dir:', lastErr);
     }
   }, 15000);
 
