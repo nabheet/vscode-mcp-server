@@ -72,7 +72,7 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
-| `start_debugging` | debug | Start a debug session from a launch config |
+| `start_debugging` | debug | Start a debug session from a launch config (`launch.json` or workspace file) |
 | `stop_debugging` | debug | Stop the active debug session |
 | `step_over` | debug | Step over current line |
 | `step_into` | debug | Step into function |
@@ -415,6 +415,14 @@ Without a paused debug session, it falls back to global-scope evaluation.
 5. Inspect: `get_stack_trace()`, `get_debug_variables()`, `evaluate_in_debug_console("my_var")`
 6. Continue: `continue()`
 7. Stop: `stop_debugging()`
+
+### Launch Config Locations
+`start_debugging` finds a config by name in two places, preferring folder-level configs:
+
+1. A folder's `.vscode/launch.json` — pass `folder` to target a specific workspace folder (defaults to the first)
+2. The workspace file (`*.code-workspace`) `launch` section — available in multi-root workspaces opened via a `.code-workspace` file
+
+For workspace-file configs, the extension reads the config from the workspace file and starts it directly, which also works around a VS Code quirk where name-based lookup with an undefined folder fails.
 
 ## Development
 
