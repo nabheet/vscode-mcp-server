@@ -45,10 +45,15 @@ jobs:
         timeout-minutes: 5
         run: |
           for i in $(seq 1 3); do
-            npx @vscode/vsce publish patch --no-git-tag-version && break
+            if npx @vscode/vsce publish patch --no-git-tag-version; then
+              echo "Published successfully"
+              exit 0
+            fi
             echo "Publish failed, retrying ($i/3)..."
             sleep 3
           done
+          echo "Publish failed after 3 attempts" >&2
+          exit 1
 
       - name: Publish pre-release
         if: steps.type.outputs.pre == 'true'
