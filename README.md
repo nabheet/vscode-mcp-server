@@ -72,7 +72,7 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
-| `start_debugging` | debug | Start a debug session from a launch config |
+| `start_debugging` | debug | Start a debug session from a launch config (`launch.json` or workspace file) |
 | `stop_debugging` | debug | Stop the active debug session |
 | `step_over` | debug | Step over current line |
 | `step_into` | debug | Step into function |
@@ -416,6 +416,14 @@ Without a paused debug session, it falls back to global-scope evaluation.
 6. Continue: `continue()`
 7. Stop: `stop_debugging()`
 
+### Launch Config Locations
+`start_debugging` finds a config by name in two places, preferring folder-level configs:
+
+1. A folder's `.vscode/launch.json` — pass `folder` to target a specific workspace folder (defaults to the first)
+2. The workspace file (`*.code-workspace`) `launch` section — available in multi-root workspaces opened via a `.code-workspace` file
+
+For workspace-file configs, the extension reads the config from the workspace file and starts it directly, which also works around a VS Code quirk where name-based lookup with an undefined folder fails.
+
 ## Development
 
 ```bash
@@ -443,7 +451,7 @@ npx @vscode/vsce package
 ## Notes
 
 - Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
-- Debug tools require an active debug configuration (`launch.json`) in the workspace
+- Debug tools require an active debug configuration — either in a folder's `.vscode/launch.json` or in the workspace file (`*.code-workspace`). `start_debugging` checks both, preferring folder-level configs
 - Terminal tools create integrated terminals in VS Code; output capture has a 30-second timeout to prevent resource leaks
 - LSP tools query the active language server; diagnostics are capped at 200 lines with `... and N more` suffix
 - `sourceMap: true` is enabled — breakpoints work in the debugger when developing the extension itself

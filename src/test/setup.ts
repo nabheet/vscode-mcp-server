@@ -11,6 +11,8 @@ const mockUri = {
 
 const mockWorkspace = {
   workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
+  workspaceFile: undefined as { uri: { scheme: string; fsPath: string } } | undefined,
+  fs: { readFile: vi.fn() },
   getConfiguration: () => ({
     get: <T>(_: string, defaultValue?: T) => defaultValue,
   }),
