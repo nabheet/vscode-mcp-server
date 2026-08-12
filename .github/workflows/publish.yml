@@ -81,12 +81,24 @@ jobs:
       # Keep package.json version in sync with the marketplace. vsce bumps it
       # locally before publishing but never commits it, so without this the
       # repo copy goes stale and the NEXT release re-attempts the same version.
-      # [skip ci] prevents this push from re-triggering CI/publish.
-      - name: Commit version bump back to main (stable only)
+      # main is branch-protected (PRs only), so sync back via an auto-PR.
+      # [skip ci] in the PR title makes the squash-merge commit skip CI/publish,
+      # avoiding a re-trigger loop. CI still runs on the PR itself.
+      - name: Sync version back via auto-PR (stable only)
         if: steps.type.outputs.pre == 'false'
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="ci/bump-v${{ steps.published.outputs.v }}"
           git add package.json
-          git commit -m "chore: bump version to v${{ steps.published.outputs.v }} [skip ci]"
-          git push origin HEAD:main
+          git commit -m "chore: bump version to v${{ steps.published.outputs.v }}"
+          git push origin "HEAD:$BRANCH"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore: bump version to v${{ steps.published.outputs.v }} [skip ci]" \
+            --body "Automated version sync after marketplace publish to v${{ steps.published.outputs.v }}."
+          gh pr merge "$BRANCH" --squash --delete-branch --wait
