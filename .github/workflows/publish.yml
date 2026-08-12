@@ -97,9 +97,19 @@ jobs:
           git add package.json
           git commit -m "chore: bump version to v${{ steps.published.outputs.v }}"
           git push origin "HEAD:$BRANCH"
-          gh pr create \
+          PR_URL="$(gh pr create \
             --base main \
             --head "$BRANCH" \
             --title "chore: bump version to v${{ steps.published.outputs.v }} [skip ci]" \
-            --body "Automated version sync after marketplace publish to v${{ steps.published.outputs.v }}."
-          gh pr merge "$BRANCH" --squash --delete-branch --wait
+            --body "Automated version sync after marketplace publish to v${{ steps.published.outputs.v }}.")"
+          gh pr merge "$PR_URL" --squash --delete-branch
+          # --wait is not supported by gh on the runner; poll instead.
+          for i in $(seq 1 30); do
+            if ! gh pr view "$PR_URL" --json state --jq .state >/dev/null 2>&1; then
+              echo "PR merged and branch deleted"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "PR merge did not complete in time" >&2
+          exit 1
