@@ -5,3 +5,5 @@ dist/
 out/
 *.tsbuildinfo
 REVIEW_OUTPUT.md
+.DS_Store
+**/.DS_Store

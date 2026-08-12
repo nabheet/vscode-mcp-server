@@ -443,7 +443,7 @@ npx @vscode/vsce package
 ## Notes
 
 - Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
-- Debug tools require an active debug configuration (`launch.json`) in the workspace
+- Debug tools require an active debug configuration — either in a folder's `.vscode/launch.json` or in the workspace file (`*.code-workspace`). `start_debugging` checks both, preferring folder-level configs
 - Terminal tools create integrated terminals in VS Code; output capture has a 30-second timeout to prevent resource leaks
 - LSP tools query the active language server; diagnostics are capped at 200 lines with `... and N more` suffix
 - `sourceMap: true` is enabled — breakpoints work in the debugger when developing the extension itself

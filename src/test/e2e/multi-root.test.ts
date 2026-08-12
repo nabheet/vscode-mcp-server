@@ -163,10 +163,31 @@ describe('multi-root workspace (E2E)', () => {
             { name: 'frontend', path: folderA },
             { name: 'backend', path: folderB },
           ],
+          // Launch config defined at workspace-file level (not in a folder's
+          // .vscode/launch.json) — requires start_debugging to resolve with
+          // folder === undefined.
+          launch: {
+            version: '0.2.0',
+            configurations: [
+              {
+                name: 'WorkspaceFile Debug',
+                type: 'node',
+                request: 'launch',
+                program: path.join(folderB, 'app.js'),
+              },
+            ],
+          },
         },
         null,
         2,
       ),
+    );
+
+    // Debug target for the workspace-file launch config (plain JS so the
+    // built-in Node debug adapter can run it)
+    fs.writeFileSync(
+      path.join(folderB, 'app.js'),
+      '// e2e debug target\nsetTimeout(() => {}, 2000);\n',
     );
 
     // Set port via VS Code settings (env vars don't reliably propagate
@@ -733,6 +754,18 @@ describe('multi-root workspace (E2E)', () => {
       arguments: { path: 'src/index.ts', line: 1, workspaceFolder: 'bogus' },
     });
     expect(res.result.isError).toBe(true);
+  });
+
+  // ── start_debugging with workspace-file launch config ───────────────
+
+  it('start_debugging launches a config defined in the workspace file', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'WorkspaceFile Debug' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
   });
 
   // ── Error cases ──────────────────────────────────────────────────────

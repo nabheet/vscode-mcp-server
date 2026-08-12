@@ -3,15 +3,38 @@ import { McpServer } from '../server';
 import { defineTool } from './index';
 import { resolvePath } from '../../utils/path';
 
+/**
+ * Read a launch configuration by name from the workspace file (*.code-workspace)
+ * `launch` section. The debug service does not expose workspace-file launch configs
+ * via name lookup in VS Code 1.133 (getLaunch(undefined) -> undefined throws
+ * "'launch.json' does not exist for passed workspace folder."), so we read the file
+ * and pass the config object directly — the object path skips name resolution.
+ */
+async function readWorkspaceFileLaunchConfig(configName: string): Promise<vscode.DebugConfiguration | undefined> {
+  // workspaceFile is a Uri on older API levels, a TextDocument on newer ones — handle both
+  const wsFile = vscode.workspace.workspaceFile as unknown as { uri?: vscode.Uri } | vscode.Uri | undefined;
+  const uri: vscode.Uri | undefined = wsFile && 'uri' in wsFile ? wsFile.uri : (wsFile as vscode.Uri | undefined);
+  if (!uri || uri.scheme !== 'file') return undefined;
+  try {
+    const buf = await vscode.workspace.fs.readFile(uri);
+    const json = JSON.parse(Buffer.from(buf).toString('utf8')) as {
+      launch?: { configurations?: vscode.DebugConfiguration[] };
+    };
+    return json.launch?.configurations?.find((c) => c.name === configName);
+  } catch {
+    return undefined;
+  }
+}
+
 export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'start_debugging',
-      'Start a debug session using a launch config name.',
+      'Start a debug session using a launch config name. Works with configs from .vscode/launch.json and the workspace file (*.code-workspace).',
       {
         type: 'object',
         properties: {
-          configName: { type: 'string', description: 'Launch configuration name from launch.json' },
+          configName: { type: 'string', description: 'Launch configuration name from launch.json or the workspace file' },
           folder: { type: 'string', description: 'Workspace folder name (optional)' },
         },
         required: ['configName'],
@@ -22,12 +45,47 @@ export function registerDebugTools(server: McpServer): void {
           ? folders?.find((f) => f.name === args.folder)
           : folders?.[0];
 
-        if (!folder) {
-          return { content: [{ type: 'text', text: 'No workspace folder found' }], isError: true };
+        if (args.folder && !folder) {
+          return { content: [{ type: 'text', text: `Workspace folder '${args.folder}' not found` }], isError: true };
         }
 
         try {
-          const success = await vscode.debug.startDebugging(folder, String(args.configName));
+          // Launch configs can live in a folder's .vscode/launch.json (requires the
+          // folder scope) or in the workspace file (*.code-workspace) `launch` section.
+          // Resolution attempts, in order:
+          //  1) folder + name      -> folder's .vscode/launch.json
+          //  2) undefined + name   -> workspace-level name lookup (works on some versions)
+          //  3) undefined + object -> workspace-file config passed directly (bypasses the
+          //                           broken name resolution; works in VS Code 1.133)
+          //  4) folder + object    -> same config, scoped to a folder as a safety net
+          let success = false;
+          if (folder) {
+            try {
+              success = await vscode.debug.startDebugging(folder, String(args.configName));
+            } catch {
+              // Config not in this folder's launch.json — try the next attempt
+            }
+          }
+          if (!success) {
+            try {
+              success = await vscode.debug.startDebugging(undefined, String(args.configName));
+            } catch {
+              // Workspace-level name lookup failed — fall through to the file read
+            }
+          }
+          if (!success) {
+            const wsConfig = await readWorkspaceFileLaunchConfig(String(args.configName));
+            if (wsConfig) {
+              try {
+                success = await vscode.debug.startDebugging(undefined, wsConfig);
+              } catch {
+                // try folder-scoped below
+              }
+              if (!success && folder) {
+                success = await vscode.debug.startDebugging(folder, wsConfig);
+              }
+            }
+          }
           return {
             content: [{ type: 'text', text: success ? `Started debugging '${args.configName}'` : `Failed to start '${args.configName}'` }],
             isError: !success,

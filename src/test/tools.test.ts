@@ -224,6 +224,8 @@ describe('handler behavior', () => {
   beforeEach(async () => {
     // Reset mocks shared across tests
     (vscode.workspace as any).workspaceFolders = undefined;
+    (vscode.workspace as any).workspaceFile = undefined;
+    (vscode.workspace as any).fs.readFile = vi.fn();
     (vscode as any).debug.activeDebugSession = undefined;
     (vscode as any).debug.breakpoints = [];
     vi.clearAllMocks();
@@ -390,10 +392,146 @@ describe('handler behavior', () => {
     expect(res.content[0].text).toMatch(/failed|not found/i);
   });
 
-  it('start_debugging returns error with no workspace folder', async () => {
+  it('start_debugging starts a folder-scoped config from launch.json', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    (vscode.debug.startDebugging as any).mockResolvedValueOnce(true);
+
     const h = handlers.get('start_debugging')!;
     const res = await h({ configName: 'Launch' });
+
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(1);
+    expect(vscode.debug.startDebugging).toHaveBeenCalledWith({ name: 'root', uri: { fsPath: '/workspace' } }, 'Launch');
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
+  });
+
+  it('start_debugging falls back to workspace-level config from the workspace file', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    // Folder-scoped lookup misses, workspace-level lookup succeeds
+    (vscode.debug.startDebugging as any).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Launch' });
+
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(2);
+    expect(vscode.debug.startDebugging).toHaveBeenLastCalledWith(undefined, 'Launch');
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
+  });
+
+  it('start_debugging falls back to workspace-level when folder-scoped lookup throws', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    // VS Code throws when the config isn't in the folder's launch.json
+    (vscode.debug.startDebugging as any)
+      .mockImplementationOnce(() => {
+        throw new Error("Configuration 'Launch' is missing in 'launch.json'.");
+      })
+      .mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Launch' });
+
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(2);
+    expect(vscode.debug.startDebugging).toHaveBeenLastCalledWith(undefined, 'Launch');
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
+  });
+
+  it('start_debugging reports failure when config not found anywhere', async () => {
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Launch' });
+
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toMatch(/no workspace folder/i);
+    expect(res.content[0].text).toMatch(/failed to start/i);
+  });
+
+  it('start_debugging returns error with unknown workspace folder', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Launch', folder: 'bogus' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/not found/i);
+    expect(vscode.debug.startDebugging).not.toHaveBeenCalled();
+  });
+
+  it('start_debugging reads the workspace file config and passes it as an object when name lookups fail', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/tmp/test.code-workspace' } };
+    (vscode.workspace as any).fs.readFile = vi.fn().mockResolvedValue(
+      Buffer.from(
+        JSON.stringify({
+          folders: [{ name: 'root', path: '/workspace' }],
+          launch: {
+            version: '0.2.0',
+            configurations: [
+              { name: 'Ws', type: 'node', request: 'launch', program: '/workspace/app.js' },
+            ],
+          },
+        }),
+      ),
+    );
+    // Folder+name miss, undefined+name miss, undefined+object succeeds
+    (vscode.debug.startDebugging as any)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Ws' });
+
+    expect((vscode.workspace as any).fs.readFile).toHaveBeenCalledWith(
+      expect.objectContaining({ fsPath: '/tmp/test.code-workspace' }),
+    );
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(3);
+    expect(vscode.debug.startDebugging).toHaveBeenLastCalledWith(
+      undefined,
+      expect.objectContaining({ name: 'Ws', type: 'node', request: 'launch' }),
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
+  });
+
+  it('start_debugging falls back to a folder-scoped object launch when undefined-scoped object fails', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/tmp/test.code-workspace' } };
+    (vscode.workspace as any).fs.readFile = vi.fn().mockResolvedValue(
+      Buffer.from(
+        JSON.stringify({
+          folders: [{ name: 'root', path: '/workspace' }],
+          launch: {
+            version: '0.2.0',
+            configurations: [{ name: 'Ws', type: 'node', request: 'launch', program: '/workspace/app.js' }],
+          },
+        }),
+      ),
+    );
+    // Folder+name miss, undefined+name miss, undefined+object fails, folder+object succeeds
+    (vscode.debug.startDebugging as any)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Ws' });
+
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(4);
+    expect(vscode.debug.startDebugging).toHaveBeenLastCalledWith(
+      { name: 'root', uri: { fsPath: '/workspace' } },
+      expect.objectContaining({ name: 'Ws', type: 'node', request: 'launch' }),
+    );
+    expect(res.isError).toBe(false);
   });
 });
