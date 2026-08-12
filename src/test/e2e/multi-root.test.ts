@@ -187,7 +187,7 @@ describe('multi-root workspace (E2E)', () => {
     // built-in Node debug adapter can run it)
     fs.writeFileSync(
       path.join(folderB, 'app.js'),
-      '// e2e debug target\nsetTimeout(() => {}, 2000);\n',
+      '// e2e debug target\nsetTimeout(() => {}, 5000);\n',
     );
 
     // Set port via VS Code settings (env vars don't reliably propagate
@@ -766,6 +766,16 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(res.result.isError).toBe(false);
     expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    // Prove a real debug session is active (not just a resolved promise):
+    // stop_debugging errors with "No active debug session to stop" when nothing
+    // actually started.
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
   });
 
   // ── Error cases ──────────────────────────────────────────────────────
