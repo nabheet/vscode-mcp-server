@@ -9,7 +9,8 @@ Squash-merge any PR to `main`. The workflow:
 1. Runs `vsce publish patch --no-git-tag-version` — vsce bumps the patch
    version in `package.json` locally and publishes the VSIX to the
    [Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp).
-   A failed publish is retried up to 3 times.
+   A failed publish is retried up to 3 times. PR pre-releases live on the
+   separate `0.9.x` line, so this stable patch bump never collides with them.
 2. Reads the published version from `package.json`.
 3. Tags the commit `vX.Y.Z` and pushes the tag.
 4. Creates a GitHub Release with auto-generated notes (VSIX attached).
@@ -23,20 +24,20 @@ Squash-merge any PR to `main`. The workflow:
 `main` is branch-protected (PRs only), so the version sync-back uses the PR
 path. The `vX.Y.Z` tag is the canonical record of the published version.
 
-## Pre-release (on demand from any branch)
+## Pre-release (automatic per PR)
 
-Push a `v*-pre*` tag from any branch to test a version before merging:
+Every push to an open pull request publishes a unique pre-release to the
+Marketplace pre-release channel:
 
-```bash
-# bump the version in package.json manually first
-# then create and push the tag
-git tag v0.4.0-pre.1
-git push origin v0.4.0-pre.1
-```
-
-The workflow publishes the current `package.json` version with the
-`--pre-release` flag to the Marketplace pre-release channel. The version must
-not already exist on the Marketplace — bump before tagging if needed.
+- Runs after `build` and `test-e2e` pass, on same-repo, non-draft,
+  non-dependabot PRs. Version sync-back branches (`ci/bump-v*`) are skipped.
+- Versions use the `0.9.<workflow-run>` line: the Marketplace only accepts
+  plain `major.minor.patch` (no semver pre-release tags) and pre-release
+  versions must differ from stable. `0.9.x` is always above the stable
+  `0.3.x` line, so it never collides with stable releases and the newest
+  push wins the channel.
+- Re-running a workflow re-publishes the same version (deduplicated, safe).
+- The published version is commented on the PR.
 
 Pre-release publishes do NOT create tags, GitHub releases, or the version
 sync-back PR.

@@ -456,12 +456,13 @@ Publishing is fully automated from GitHub Actions — no local login needed.
 [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp):
 `vsce publish patch` bumps `package.json`, publishes, tags `vX.Y.Z`, creates a
 GitHub release (VSIX attached), then syncs the bumped version back to `main`
-via an auto-PR (titled with `[skip ci]` so the squash merge does not
-re-trigger publishing).
+via an auto-PR (`chore: bump version to vX.Y.Z`; a job-level guard matching
+the sync-back commit message prevents it from re-triggering publishing).
 
-**Pre-release** — push a `v*-pre*` tag from any branch to publish the current
-`package.json` version to the Marketplace pre-release channel
-(`--pre-release`). Bump `package.json` manually before tagging.
+**Pre-release** — every push to an open PR publishes a unique pre-release
+(`0.9.<workflow-run>`) to the Marketplace pre-release channel. This dedicated
+line is always above the stable `0.3.x` line, so it never collides with
+stable releases; the published version is commented on the PR.
 
 See `RELEASE.md` for details.
 
