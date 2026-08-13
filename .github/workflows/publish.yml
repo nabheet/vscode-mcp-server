@@ -5,10 +5,11 @@ on:
     branches: [main]
     tags:
       - v*-pre*
+  workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 env:
   VSCE_PAT: ${{ secrets.VSCE_PAT }}
@@ -16,6 +17,9 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +27,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
 
       - run: npm ci
         timeout-minutes: 2
