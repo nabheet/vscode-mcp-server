@@ -14,9 +14,11 @@ Squash-merge any PR to `main`. The workflow:
 3. Tags the commit `vX.Y.Z` and pushes the tag.
 4. Creates a GitHub Release with auto-generated notes (VSIX attached).
 5. Syncs the bumped `package.json` back to `main` via an auto-PR titled
-   `chore: bump version to vX.Y.Z [skip ci]`. The `[skip ci]` in the squash
-   merge commit stops CI/publish from re-triggering (no loop); CI still runs
-   on the PR itself.
+   `chore: bump version to vX.Y.Z`. The publish workflow has a job-level
+   guard that skips when the push is such a version sync-back (commit message
+   starts with `chore: bump version to v`), so the sync-back does not
+   re-trigger publishing (no loop). CI runs on the PR, and the workflow
+   enables auto-merge so it lands as soon as checks pass.
 
 `main` is branch-protected (PRs only), so the version sync-back uses the PR
 path. The `vX.Y.Z` tag is the canonical record of the published version.
