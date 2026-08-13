@@ -7,6 +7,12 @@ import { vi } from 'vitest';
 const mockUri = {
   file: (path: string) => ({ fsPath: path, scheme: 'file', path, toString: () => path }),
   parse: (uri: string) => ({ fsPath: uri.replace('file://', ''), scheme: 'file', path: uri, toString: () => uri }),
+  joinPath: (uri: { fsPath?: string; scheme?: string; path?: string }, ...paths: string[]) => ({
+    fsPath: [uri.fsPath, ...paths].join('/'),
+    scheme: uri.scheme ?? 'file',
+    path: [uri.path ?? uri.fsPath, ...paths].join('/'),
+    toString: () => [uri.fsPath, ...paths].join('/'),
+  }),
 };
 
 const mockWorkspace = {
