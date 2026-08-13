@@ -58,7 +58,7 @@ jobs:
 
       # Cache VS Code binary downloaded by @vscode/test-electron
       - name: Cache VS Code
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vscode-test-electron
           key: ${{ runner.os }}-vscode-test-electron-${{ hashFiles('package-lock.json') }}
