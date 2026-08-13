@@ -534,4 +534,120 @@ describe('handler behavior', () => {
     );
     expect(res.isError).toBe(false);
   });
+
+  it('start_debugging reads a JSONC workspace file with comments and trailing commas', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/tmp/test.code-workspace' } };
+    (vscode.workspace as any).fs.readFile = vi.fn().mockResolvedValue(
+      Buffer.from(`{
+        // Workspace files are JSONC: comments and trailing commas are legal
+        "folders": [{ "name": "root", "path": "/workspace" }],
+        "launch": {
+          "version": "0.2.0", /* block comment */
+          "configurations": [
+            { "name": "Ws", "type": "node", "request": "launch", "program": "https://example.com/x" },
+          ],
+        },
+      }`),
+    );
+    // Folder+name miss, undefined+name miss, undefined+object succeeds
+    (vscode.debug.startDebugging as any)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Ws' });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
+    expect(vscode.debug.startDebugging).toHaveBeenLastCalledWith(
+      undefined,
+      expect.objectContaining({ name: 'Ws', type: 'node', request: 'launch', program: 'https://example.com/x' }),
+    );
+  });
+
+  it('start_debugging expands a compound config from the workspace file', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/tmp/test.code-workspace' } };
+    (vscode.workspace as any).fs.readFile = vi.fn().mockResolvedValue(
+      Buffer.from(
+        JSON.stringify({
+          folders: [{ name: 'root', path: '/workspace' }],
+          launch: {
+            version: '0.2.0',
+            configurations: [
+              { name: 'Frontend', type: 'node', request: 'launch', program: '/workspace/fe.js' },
+              { name: 'Backend', type: 'node', request: 'launch', program: '/workspace/be.js' },
+            ],
+            compounds: [
+              { name: 'Full Stack', configurations: ['Frontend', 'Backend'], stopAll: true },
+            ],
+          },
+        }),
+      ),
+    );
+    // Folder+name miss, undefined+name miss, then both compound members start
+    (vscode.debug.startDebugging as any)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Full Stack' });
+
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(4);
+    expect(vscode.debug.startDebugging).toHaveBeenNthCalledWith(
+      3,
+      undefined,
+      expect.objectContaining({ name: 'Frontend', type: 'node', request: 'launch' }),
+    );
+    expect(vscode.debug.startDebugging).toHaveBeenNthCalledWith(
+      4,
+      undefined,
+      expect.objectContaining({ name: 'Backend', type: 'node', request: 'launch' }),
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
+  });
+
+  it('start_debugging reports compound failure when a constituent config is missing', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/tmp/test.code-workspace' } };
+    (vscode.workspace as any).fs.readFile = vi.fn().mockResolvedValue(
+      Buffer.from(
+        JSON.stringify({
+          folders: [{ name: 'root', path: '/workspace' }],
+          launch: {
+            version: '0.2.0',
+            configurations: [
+              { name: 'Frontend', type: 'node', request: 'launch', program: '/workspace/fe.js' },
+            ],
+            compounds: [
+              { name: 'Full Stack', configurations: ['Frontend', 'Ghost'] },
+            ],
+          },
+        }),
+      ),
+    );
+    // Folder+name miss, undefined+name miss, only 'Frontend' starts
+    (vscode.debug.startDebugging as any)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Full Stack' });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/failed to start/i);
+    expect(res.content[0].text).toContain('Ghost');
+  });
 });
