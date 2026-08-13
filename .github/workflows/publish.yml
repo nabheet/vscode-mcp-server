@@ -5,17 +5,25 @@ on:
     branches: [main]
     tags:
       - v*-pre*
+  workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 env:
   VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
 jobs:
   publish:
+    # Do not re-publish when this push is the version sync-back squash merge:
+    # its commit message starts with "chore: bump version to v". Pre-release
+    # tag pushes always run. workflow_dispatch always runs (head_commit null).
+    if: "${{ github.ref_type == 'tag' || !startsWith(github.event.head_commit.message, 'chore: bump version to v') }}"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +31,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
 
       - run: npm ci
         timeout-minutes: 2
@@ -83,11 +92,13 @@ jobs:
       # locally before publishing but never commits it, so without this the
       # repo copy goes stale and the NEXT release re-attempts the same version.
       # main is branch-protected (PRs only), so sync back via an auto-PR.
-      # [skip ci] in the PR title makes the squash-merge commit skip CI/publish,
-      # avoiding a re-trigger loop. CI still runs on the PR itself.
+      # The PR title intentionally has NO [skip ci]: branch protection requires
+      # CI on the PR, and [skip ci] skips it, making the PR unmergeable. Loop
+      # prevention is handled by the job-level guard above, which matches the
+      # squash-merge commit message "chore: bump version to vX.Y.Z (#N)".
       - name: Sync version back via auto-PR (stable only)
         if: steps.type.outputs.pre == 'false'
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -100,16 +111,19 @@ jobs:
           PR_URL="$(gh pr create \
             --base main \
             --head "$BRANCH" \
-            --title "chore: bump version to v${{ steps.published.outputs.v }} [skip ci]" \
+            --title "chore: bump version to v${{ steps.published.outputs.v }}" \
             --body "Automated version sync after marketplace publish to v${{ steps.published.outputs.v }}.")"
-          gh pr merge "$PR_URL" --squash --delete-branch
+          # --auto: merge once the required CI checks pass. Without it the
+          # merge fails immediately because checks are still pending.
+          gh pr merge "$PR_URL" --squash --delete-branch --auto
           # --wait is not supported by gh on the runner; poll instead.
-          for i in $(seq 1 30); do
-            if ! gh pr view "$PR_URL" --json state --jq .state >/dev/null 2>&1; then
-              echo "PR merged and branch deleted"
+          for i in $(seq 1 100); do
+            state="$(gh pr view "$PR_URL" --json state --jq .state)"
+            if [ "$state" = "MERGED" ]; then
+              echo "PR merged"
               exit 0
             fi
-            sleep 5
+            sleep 10
           done
           echo "PR merge did not complete in time" >&2
           exit 1

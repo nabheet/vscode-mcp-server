@@ -75,6 +75,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "typecheck": "tsc --noEmit",
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",

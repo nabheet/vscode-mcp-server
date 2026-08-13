@@ -448,6 +448,23 @@ npx @vscode/vsce package
 # Produces vscode-mcp-server-*.vsix
 ```
 
+## Releases
+
+Publishing is fully automated from GitHub Actions — no local login needed.
+
+**Stable** — every merge to `main` auto-publishes the next patch to the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp):
+`vsce publish patch` bumps `package.json`, publishes, tags `vX.Y.Z`, creates a
+GitHub release (VSIX attached), then syncs the bumped version back to `main`
+via an auto-PR (titled with `[skip ci]` so the squash merge does not
+re-trigger publishing).
+
+**Pre-release** — push a `v*-pre*` tag from any branch to publish the current
+`package.json` version to the Marketplace pre-release channel
+(`--pre-release`). Bump `package.json` manually before tagging.
+
+See `RELEASE.md` for details.
+
 ## Notes
 
 - Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
