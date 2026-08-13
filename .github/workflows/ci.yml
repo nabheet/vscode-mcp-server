@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -72,3 +73,72 @@ jobs:
       - name: Run E2E tests
         run: xvfb-run --auto-servernum npm run test:e2e
         timeout-minutes: 10
+
+  # Per-PR pre-release: every PR push publishes a unique pre-release version
+  # to the Marketplace pre-release channel. Marketplace only accepts plain
+  # major.minor.patch (no semver pre-release tags), so PR builds use a
+  # dedicated odd-minor line (0.9.<run_number>) that is always above the
+  # stable 0.3.x line and never collides with it. Only same-repo, non-draft,
+  # non-dependabot PRs. --skip-duplicate makes re-runs safe.
+  publish-pre-release:
+    runs-on: ubuntu-latest
+    needs: [build, test-e2e]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.event.pull_request.head.ref, 'ci/bump-v')
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run compile
+
+      - name: Compute pre-release version
+        id: version
+        run: |
+          # Marketplace accepts ONLY major.minor.patch (no semver pre-release
+          # tags) and requires pre-release versions to differ from stable.
+          # Stable line is 0.3.x (patch bumps in publish.yml), so PR builds
+          # live on a dedicated odd-minor line 0.9.x — always above stable,
+          # never colliding, and matching the odd/even recommendation.
+          # run_number increases per workflow run, so every push gets a unique
+          # version and the newest build always wins the pre-release channel.
+          echo "version=0.9.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify PAT
+        run: npx @vscode/vsce verify-pat nabheet
+
+      - name: Publish pre-release
+        run: >-
+          npx @vscode/vsce publish "${{ steps.version.outputs.version }}"
+          --pre-release --no-git-tag-version --no-update-package-json
+          --skip-duplicate
+
+      - name: Comment version on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `Pre-release published: \`${{ steps.version.outputs.version }}\` — installable from the Marketplace pre-release channel.`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
+            });
+            const marker = comments.find(c => c.user.login === 'github-actions[bot]' && c.body.startsWith('Pre-release published:'));
+            if (marker) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: marker.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            }
