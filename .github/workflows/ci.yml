@@ -222,10 +222,19 @@ jobs:
       # CI on the PR, and [skip ci] skips it, making the PR unmergeable. Loop
       # prevention is handled by the job-level guard above, which matches the
       # squash-merge commit message "chore: bump version to vX.Y.Z (#N)".
+      #
+      # IMPORTANT: this step must push with a PERSONAL ACCESS TOKEN, not
+      # GITHUB_TOKEN. Pushes made with GITHUB_TOKEN are attributed to
+      # github-actions[bot], and GitHub holds CI runs on PRs whose head was
+      # pushed by a bot for maintainer approval ("awaiting approval"). The
+      # required checks then never run, branch protection blocks the merge,
+      # and the sync PR hangs until a human approves the run. Pushing with a
+      # PAT (owner: nabheet) attributes the run to a real user, so CI runs
+      # immediately and the auto-merge queue completes on its own.
       - name: Sync version back via auto-PR
         timeout-minutes: 20
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_SYNC_PAT }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
