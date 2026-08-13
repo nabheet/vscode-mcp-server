@@ -44,6 +44,31 @@ async function readWorkspaceFileLaunchSection(): Promise<WorkspaceLaunchSection 
   }
 }
 
+/**
+ * Read the `launch` section from a folder's .vscode/launch.json. Returns
+ * undefined when the folder has no launch.json or it cannot be parsed — the
+ * folder then simply does not contribute any folder-scoped configs.
+ */
+async function readFolderLaunchSection(folder: vscode.WorkspaceFolder): Promise<WorkspaceLaunchSection | undefined> {
+  try {
+    const uri = vscode.Uri.joinPath(folder.uri, '.vscode', 'launch.json');
+    const buf = await vscode.workspace.fs.readFile(uri);
+    const json = parseJsonc<{ launch?: WorkspaceLaunchSection }>(Buffer.from(buf).toString('utf8'));
+    return json.launch;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when the section declares `name` as a config or a compound. */
+function hasLaunchEntry(section: WorkspaceLaunchSection | undefined, name: string): boolean {
+  if (!section) return false;
+  return (
+    (section.configurations ?? []).some((c) => c.name === name) ||
+    (section.compounds ?? []).some((c) => c.name === name)
+  );
+}
+
 export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
@@ -70,42 +95,46 @@ export function registerDebugTools(server: McpServer): void {
         const configName = String(args.configName);
 
         try {
-          // Launch configs can live in a folder's .vscode/launch.json (requires the
-          // folder scope) or in the workspace file (*.code-workspace) `launch` section.
-          // Resolution attempts, in order:
-          //  1) folder + name      -> folder's .vscode/launch.json (incl. compounds)
-          //  2) undefined + name   -> workspace-level name lookup (works on some versions)
-          //  3) workspace file     -> read the launch section and pass config object(s)
-          //                           directly (bypasses the broken name resolution;
-          //                           works in VS Code 1.133)
+          // Launch configs can live in a folder's .vscode/launch.json (folder
+          // scope) or in the workspace file (*.code-workspace) `launch` section.
+          // We read both sources FIRST and only call startDebugging for scopes
+          // that actually declare the config: a doomed call makes VS Code fire
+          // error toasts ("launch.json does not exist for passed workspace
+          // folder", "Configuration X is missing in launch.json") even when a
+          // later attempt would succeed.
+          const [folderSection, wsSection] = await Promise.all([
+            folder ? readFolderLaunchSection(folder) : Promise.resolve(undefined),
+            readWorkspaceFileLaunchSection(),
+          ]);
+
           let success = false;
-          if (folder) {
+          let detail = '';
+
+          // 1) Folder scope — only when the folder's launch.json declares it.
+          //    VS Code resolves folder-level configs and compounds natively.
+          if (!success && folder && folderSection && hasLaunchEntry(folderSection, configName)) {
             try {
               success = await vscode.debug.startDebugging(folder, configName);
             } catch {
-              // Config not in this folder's launch.json — try the next attempt
-            }
-          }
-          if (!success) {
-            try {
-              success = await vscode.debug.startDebugging(undefined, configName);
-            } catch {
-              // Workspace-level name lookup failed — fall through to the file read
+              success = false;
             }
           }
 
-          let detail = '';
-          if (!success) {
-            const launch = await readWorkspaceFileLaunchSection();
-            const configs = launch?.configurations ?? [];
-            const compounds = launch?.compounds ?? [];
+          // 2) Workspace-file scope — only when the workspace file declares it.
+          //    VS Code 1.133+ cannot resolve workspace-file configs by name
+          //    (startDebugging(undefined, name) throws), so we read the file
+          //    and pass the config objects directly — the object path skips
+          //    name resolution.
+          if (!success && wsSection && hasLaunchEntry(wsSection, configName)) {
+            const configs = wsSection.configurations ?? [];
+            const compounds = wsSection.compounds ?? [];
             const configByName = new Map(configs.map((c) => [c.name, c]));
 
             const compound = compounds.find((c) => c.name === configName);
             if (compound) {
-              // Compound: start every constituent config in sequence. Compounds are
-              // named launch entries, not DebugConfiguration objects, so they cannot
-              // be passed to startDebugging directly — expand them here.
+              // Compound: start every constituent config in sequence. Compounds
+              // are named launch entries, not DebugConfiguration objects, so
+              // they cannot be passed to startDebugging directly — expand here.
               const started: string[] = [];
               const failed: string[] = [];
               for (const subName of compound.configurations) {
@@ -138,17 +167,33 @@ export function registerDebugTools(server: McpServer): void {
                 try {
                   success = await vscode.debug.startDebugging(undefined, wsConfig);
                 } catch {
-                  // try folder-scoped below
+                  success = false;
                 }
                 if (!success && folder) {
-                  success = await vscode.debug.startDebugging(folder, wsConfig);
+                  try {
+                    success = await vscode.debug.startDebugging(folder, wsConfig);
+                  } catch {
+                    success = false;
+                  }
                 }
               }
             }
           }
+
+          if (!success) {
+            const sources = [
+              folderSection ? `launch.json in folder '${folder!.name}'` : null,
+              wsSection ? 'the workspace file' : null,
+            ].filter(Boolean);
+            const where = sources.length > 0 ? ` (checked ${sources.join(' and ')})` : ' (no launch sources found)';
+            return {
+              content: [{ type: 'text', text: `Failed to start '${configName}'${where}${detail}` }],
+              isError: true,
+            };
+          }
           return {
-            content: [{ type: 'text', text: success ? `Started debugging '${configName}'${detail}` : `Failed to start '${configName}'${detail}` }],
-            isError: !success,
+            content: [{ type: 'text', text: `Started debugging '${configName}'${detail}` }],
+            isError: false,
           };
         } catch (err) {
           return { content: [{ type: 'text', text: `Debug start error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
