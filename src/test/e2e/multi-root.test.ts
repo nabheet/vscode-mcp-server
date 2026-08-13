@@ -155,39 +155,42 @@ describe('multi-root workspace (E2E)', () => {
     fs.writeFileSync(path.join(folderB, 'src', 'util.ts'), '// shared util in backend\n');
 
     const workspaceFile = path.join(tmpDir, 'test.code-workspace');
+    // Deliberately JSONC (comments + trailing commas), not JSON.stringify'd —
+    // real .code-workspace files are JSONC and start_debugging must parse them.
     fs.writeFileSync(
       workspaceFile,
-      JSON.stringify(
-        {
-          folders: [
-            { name: 'frontend', path: folderA },
-            { name: 'backend', path: folderB },
+      `{
+        // Workspace files are JSONC: comments and trailing commas are legal
+        "folders": [
+          { "name": "frontend", "path": ${JSON.stringify(folderA)} },
+          { "name": "backend", "path": ${JSON.stringify(folderB)} },
+        ],
+        /* Launch configs at workspace-file level (not in a folder's
+           .vscode/launch.json) — requires start_debugging to resolve with
+           folder === undefined. Also includes a compound that bundles the
+           two configs into one named launch entry. */
+        "launch": {
+          "version": "0.2.0",
+          "configurations": [
+            { "name": "WorkspaceFile Debug", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))} },
+            { "name": "WorkspaceFile Debug 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))} },
           ],
-          // Launch config defined at workspace-file level (not in a folder's
-          // .vscode/launch.json) — requires start_debugging to resolve with
-          // folder === undefined.
-          launch: {
-            version: '0.2.0',
-            configurations: [
-              {
-                name: 'WorkspaceFile Debug',
-                type: 'node',
-                request: 'launch',
-                program: path.join(folderB, 'app.js'),
-              },
-            ],
-          },
+          "compounds": [
+            { "name": "WorkspaceFile Compound", "configurations": ["WorkspaceFile Debug", "WorkspaceFile Debug 2"], "stopAll": true },
+          ],
         },
-        null,
-        2,
-      ),
+      }`,
     );
 
-    // Debug target for the workspace-file launch config (plain JS so the
-    // built-in Node debug adapter can run it)
+    // Debug targets for the workspace-file launch configs (plain JS so the
+    // built-in Node debug adapter can run them)
     fs.writeFileSync(
       path.join(folderB, 'app.js'),
       '// e2e debug target\nsetTimeout(() => {}, 5000);\n',
+    );
+    fs.writeFileSync(
+      path.join(folderB, 'app2.js'),
+      '// e2e debug target 2\nsetTimeout(() => {}, 5000);\n',
     );
 
     // Set port via VS Code settings (env vars don't reliably propagate
@@ -776,6 +779,30 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(stop.result.isError).toBe(false);
     expect((stop.result.content[0].text as string)).toContain('stopped');
+  });
+
+  it('start_debugging launches a compound defined in the workspace file', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'WorkspaceFile Compound' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    // The compound bundles two configs, so both sessions should be live.
+    // stop_debugging only stops the active session — stopping twice succeeds
+    // only if both actually started (the second stop has a session to stop).
+    const stop1 = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop1.result.isError).toBe(false);
+    const stop2 = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop2.result.isError).toBe(false);
   });
 
   // ── Error cases ──────────────────────────────────────────────────────

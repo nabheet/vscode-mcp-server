@@ -2,25 +2,43 @@ import * as vscode from 'vscode';
 import { McpServer } from '../server';
 import { defineTool } from './index';
 import { resolvePath } from '../../utils/path';
+import { parseJsonc } from '../../utils/jsonc';
 
 /**
- * Read a launch configuration by name from the workspace file (*.code-workspace)
- * `launch` section. The debug service does not expose workspace-file launch configs
- * via name lookup in VS Code 1.133 (getLaunch(undefined) -> undefined throws
- * "'launch.json' does not exist for passed workspace folder."), so we read the file
- * and pass the config object directly — the object path skips name resolution.
+ * A named compound launch entry. Compounds bundle several launch configs and
+ * appear as a single named entry in the launch dropdown.
  */
-async function readWorkspaceFileLaunchConfig(configName: string): Promise<vscode.DebugConfiguration | undefined> {
+interface WorkspaceLaunchCompound {
+  name: string;
+  configurations: string[];
+  stopAll?: boolean;
+  preLaunchTask?: string;
+}
+
+interface WorkspaceLaunchSection {
+  configurations?: vscode.DebugConfiguration[];
+  compounds?: WorkspaceLaunchCompound[];
+}
+
+/**
+ * Read the `launch` section from the workspace file (*.code-workspace). The
+ * debug service does not expose workspace-file launch configs via name lookup
+ * in VS Code 1.133 (getLaunch(undefined) -> undefined throws "'launch.json'
+ * does not exist for passed workspace folder."), so we read the file and pass
+ * the config objects directly — the object path skips name resolution.
+ *
+ * Workspace files are JSONC (comments + trailing commas), so a plain
+ * JSON.parse fails on typical files — we use the JSONC parser.
+ */
+async function readWorkspaceFileLaunchSection(): Promise<WorkspaceLaunchSection | undefined> {
   // workspaceFile is a Uri on older API levels, a TextDocument on newer ones — handle both
   const wsFile = vscode.workspace.workspaceFile as unknown as { uri?: vscode.Uri } | vscode.Uri | undefined;
   const uri: vscode.Uri | undefined = wsFile && 'uri' in wsFile ? wsFile.uri : (wsFile as vscode.Uri | undefined);
   if (!uri || uri.scheme !== 'file') return undefined;
   try {
     const buf = await vscode.workspace.fs.readFile(uri);
-    const json = JSON.parse(Buffer.from(buf).toString('utf8')) as {
-      launch?: { configurations?: vscode.DebugConfiguration[] };
-    };
-    return json.launch?.configurations?.find((c) => c.name === configName);
+    const json = parseJsonc<{ launch?: WorkspaceLaunchSection }>(Buffer.from(buf).toString('utf8'));
+    return json.launch;
   } catch {
     return undefined;
   }
@@ -30,7 +48,7 @@ export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'start_debugging',
-      'Start a debug session using a launch config name. Works with configs from .vscode/launch.json and the workspace file (*.code-workspace).',
+      'Start a debug session using a launch config name. Works with configs from .vscode/launch.json and the workspace file (*.code-workspace), including compound configurations.',
       {
         type: 'object',
         properties: {
@@ -49,45 +67,87 @@ export function registerDebugTools(server: McpServer): void {
           return { content: [{ type: 'text', text: `Workspace folder '${args.folder}' not found` }], isError: true };
         }
 
+        const configName = String(args.configName);
+
         try {
           // Launch configs can live in a folder's .vscode/launch.json (requires the
           // folder scope) or in the workspace file (*.code-workspace) `launch` section.
           // Resolution attempts, in order:
-          //  1) folder + name      -> folder's .vscode/launch.json
+          //  1) folder + name      -> folder's .vscode/launch.json (incl. compounds)
           //  2) undefined + name   -> workspace-level name lookup (works on some versions)
-          //  3) undefined + object -> workspace-file config passed directly (bypasses the
-          //                           broken name resolution; works in VS Code 1.133)
-          //  4) folder + object    -> same config, scoped to a folder as a safety net
+          //  3) workspace file     -> read the launch section and pass config object(s)
+          //                           directly (bypasses the broken name resolution;
+          //                           works in VS Code 1.133)
           let success = false;
           if (folder) {
             try {
-              success = await vscode.debug.startDebugging(folder, String(args.configName));
+              success = await vscode.debug.startDebugging(folder, configName);
             } catch {
               // Config not in this folder's launch.json — try the next attempt
             }
           }
           if (!success) {
             try {
-              success = await vscode.debug.startDebugging(undefined, String(args.configName));
+              success = await vscode.debug.startDebugging(undefined, configName);
             } catch {
               // Workspace-level name lookup failed — fall through to the file read
             }
           }
+
+          let detail = '';
           if (!success) {
-            const wsConfig = await readWorkspaceFileLaunchConfig(String(args.configName));
-            if (wsConfig) {
-              try {
-                success = await vscode.debug.startDebugging(undefined, wsConfig);
-              } catch {
-                // try folder-scoped below
+            const launch = await readWorkspaceFileLaunchSection();
+            const configs = launch?.configurations ?? [];
+            const compounds = launch?.compounds ?? [];
+            const configByName = new Map(configs.map((c) => [c.name, c]));
+
+            const compound = compounds.find((c) => c.name === configName);
+            if (compound) {
+              // Compound: start every constituent config in sequence. Compounds are
+              // named launch entries, not DebugConfiguration objects, so they cannot
+              // be passed to startDebugging directly — expand them here.
+              const started: string[] = [];
+              const failed: string[] = [];
+              for (const subName of compound.configurations) {
+                const subConfig = configByName.get(subName);
+                if (!subConfig) {
+                  failed.push(`${subName} (not found in workspace file)`);
+                  continue;
+                }
+                let ok = false;
+                try {
+                  ok = await vscode.debug.startDebugging(undefined, subConfig);
+                } catch {
+                  ok = false;
+                }
+                if (!ok && folder) {
+                  try {
+                    ok = await vscode.debug.startDebugging(folder, subConfig);
+                  } catch {
+                    ok = false;
+                  }
+                }
+                if (ok) started.push(subName);
+                else failed.push(subName);
               }
-              if (!success && folder) {
-                success = await vscode.debug.startDebugging(folder, wsConfig);
+              success = failed.length === 0 && started.length > 0;
+              detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
+            } else {
+              const wsConfig = configByName.get(configName);
+              if (wsConfig) {
+                try {
+                  success = await vscode.debug.startDebugging(undefined, wsConfig);
+                } catch {
+                  // try folder-scoped below
+                }
+                if (!success && folder) {
+                  success = await vscode.debug.startDebugging(folder, wsConfig);
+                }
               }
             }
           }
           return {
-            content: [{ type: 'text', text: success ? `Started debugging '${args.configName}'` : `Failed to start '${args.configName}'` }],
+            content: [{ type: 'text', text: success ? `Started debugging '${configName}'${detail}` : `Failed to start '${configName}'${detail}` }],
             isError: !success,
           };
         } catch (err) {
