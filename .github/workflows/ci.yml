@@ -208,7 +208,7 @@ jobs:
           git push origin v${{ steps.published.outputs.v }}
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.published.outputs.v }}
           generate_release_notes: true
