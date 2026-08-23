@@ -76,6 +76,21 @@ async function waitForServer(port: number, timeoutMs = 120000): Promise<void> {
   throw new Error(`MCP server did not start within ${timeoutMs}ms`);
 }
 
+// VS Code ignores Chromium's --headless flag, so local macOS runs pop a
+// window. CI runs under xvfb (headless) and is unaffected. Hiding requires
+// Accessibility permission — failures are swallowed.
+function hideVSCodeWindows(proc: ChildProcess, delayMs = 1500) {
+  if (process.platform !== 'darwin') return;
+  setTimeout(() => {
+    try {
+      execSync(
+        'osascript -e \'tell application "System Events" to set visible of (first process whose name is "Code") to false\'',
+        { stdio: 'ignore' },
+      );
+    } catch { /* no Accessibility permission — window stays visible */ }
+  }, delayMs);
+}
+
 /**
  * Resolve the VS Code CLI binary via `@vscode/test-electron` (downloads
  * VS Code to a cache, works on all platforms, no local install required).
@@ -86,11 +101,24 @@ async function resolveCodeCli(): Promise<{
   cmd: string;
   args: string[];
 }> {
-  const { downloadAndUnzipVSCode, resolveCliPathFromVSCodeExecutablePath } = await import(
-    '@vscode/test-electron'
-  );
+  const { downloadAndUnzipVSCode } = await import('@vscode/test-electron');
 
   const vscodePath = await downloadAndUnzipVSCode('stable');
+  if (process.platform === 'darwin') {
+    // Spawn the app binary directly. The `bin/code` wrapper (returned by
+    // resolveCliPathFromVSCodeExecutablePath) launches the app detached via
+    // LaunchServices: under vitest the app can die before writing logs and
+    // leaves orphaned processes. The binary stays attached as our child.
+    const appRoot = vscodePath.endsWith('.app')
+      ? vscodePath
+      : vscodePath.replace(/\/Contents\/MacOS\/.+$/, '');
+    const binary = path.join(appRoot, 'Contents', 'MacOS', 'Code');
+    if (fs.existsSync(binary)) return { cmd: binary, args: [] };
+    throw new Error(`VS Code binary not found under ${appRoot}`);
+  }
+  const { resolveCliPathFromVSCodeExecutablePath } = await import(
+    '@vscode/test-electron'
+  );
   const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
 
   if (!fs.existsSync(cliPath)) {
@@ -145,7 +173,7 @@ describe('multi-root workspace (E2E)', () => {
     port = await findFreePort();
 
     // Create temp workspace with two named folders
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-mcp-e2e-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mre-'));
     const folderA = path.join(tmpDir, 'frontend');
     const folderB = path.join(tmpDir, 'backend');
     fs.mkdirSync(path.join(folderA, 'src'), { recursive: true });
@@ -194,8 +222,11 @@ describe('multi-root workspace (E2E)', () => {
     );
 
     // Set port via VS Code settings (env vars don't reliably propagate
-    // through VS Code's extension host process chain)
-    const vsCodeUserData = path.join(tmpDir, 'vscode-user-data');
+    // through VS Code's extension host process chain). Note: short names
+    // (`ud`, `mre-`) — VS Code's IPC socket under the user-data dir must stay
+    // under macOS's ~103-char Unix socket path limit (os.tmpdir() is already
+    // long: /var/folders/...).
+    const vsCodeUserData = path.join(tmpDir, 'ud');
     const userSettingsDir = path.join(vsCodeUserData, 'User');
     fs.mkdirSync(userSettingsDir, { recursive: true });
     fs.writeFileSync(
@@ -247,6 +278,12 @@ describe('multi-root workspace (E2E)', () => {
     };
 
     vsCodeProc = spawn(cliCmd, launchArgs, spawnOpts);
+
+    // VS Code ignores Chromium's --headless flag, so local macOS runs pop a
+    // window. Hide it via AppleScript — CI runs under xvfb and is unaffected.
+    // Requires Accessibility permission; failures are ignored (tests must
+    // never fail just because a window stayed visible).
+    hideVSCodeWindows(vsCodeProc);
 
     // Log VS Code output for debugging failures
     const logStream = fs.createWriteStream(logPath);

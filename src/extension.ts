@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { McpServer, McpServerOptions } from './mcp/server';
 import { registerAllTools } from './mcp/tools/index';
+import { Metrics } from './utils/metrics';
+import { ServerLog } from './utils/serverLog';
 
 const OUTPUT_CHANNEL_NAME = 'VS Code MCP Server';
 let server: McpServer | null = null;
@@ -9,6 +11,14 @@ let outputChannel: vscode.OutputChannel | null = null;
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
   outputChannel.appendLine('[mcp] Activating vscode-mcp-server...');
+
+  // Observability: shared metrics registry + rotating JSON-lines file log.
+  // The file log lives in context.logUri, so records survive the hot-reload
+  // crashes this server is hardened against (see /metrics, /diagnostics).
+  const metrics = new Metrics();
+  const logDir = context.logUri?.scheme === 'file' ? context.logUri.fsPath : undefined;
+  const fileLog = logDir ? new ServerLog(logDir) : undefined;
+  metrics.gauge('vscode_mcp_max_concurrent', 10, 'Concurrency cap');
 
   // Read config (VS Code settings with env fallbacks)
   const config = vscode.workspace.getConfiguration('vscode-mcp-server');
@@ -42,12 +52,19 @@ export function activate(context: vscode.ExtensionContext): void {
     outputChannel.appendLine('[mcp] TLS enabled — using cert: ' + tlsCertPath);
   }
 
+  if (fileLog) {
+    outputChannel.appendLine('[mcp] JSON log: ' + logDir);
+    fileLog.log({ type: 'lifecycle', event: 'activate', version: vscode.version, remote: vscode.env.remoteName ?? 'local' });
+  }
+
   // Build server options
   const opts: McpServerOptions = {
     port,
     host,
     ...(authToken ? { authToken } : {}),
     ...(useTls ? { tlsCertPath, tlsKeyPath } : {}),
+    metrics,
+    ...(fileLog ? { logger: fileLog } : {}),
   };
 
   server = new McpServer(opts);
@@ -67,7 +84,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Start server with port retry
-  startServerWithRetry(port, host, authToken, tlsCertPath, tlsKeyPath, context).catch((err) => {
+  startServerWithRetry(port, host, authToken, tlsCertPath, tlsKeyPath, context, metrics, fileLog).catch((err) => {
     outputChannel?.appendLine('[mcp] FATAL: ' + err.message);
   });
 
@@ -99,6 +116,8 @@ async function startServerWithRetry(
   tlsCertPath: string,
   tlsKeyPath: string,
   context: vscode.ExtensionContext,
+  metrics: Metrics,
+  fileLog: ServerLog | undefined,
 ): Promise<void> {
   let currentPort = basePort;
   const useTls = !!(tlsCertPath && tlsKeyPath);
@@ -111,6 +130,8 @@ async function startServerWithRetry(
       host,
       ...(authToken ? { authToken } : {}),
       ...(useTls ? { tlsCertPath, tlsKeyPath } : {}),
+      metrics,
+      ...(fileLog ? { logger: fileLog } : {}),
     };
 
     const srv = new McpServer(opts);

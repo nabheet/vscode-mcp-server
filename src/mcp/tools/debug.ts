@@ -3,6 +3,43 @@ import { McpServer } from '../server';
 import { defineTool } from './index';
 import { resolvePath } from '../../utils/path';
 import { parseJsonc } from '../../utils/jsonc';
+import { withTimeout } from '../../utils/timeout';
+
+/** DAP calls can hang indefinitely when the adapter is blocked (e.g. a slow
+ *  evaluate, mid-step). Bound every customRequest so a stuck adapter returns
+ *  a clear error instead of freezing the MCP server. */
+const DAP_TIMEOUT_MS = 10_000;
+
+/** get_debug_variables output caps — a deep object tree can serialize to
+ *  megabytes and saturate the MCP round trip. */
+const MAX_VARS_ROWS = 200;
+const MAX_VARS_BYTES = 200 * 1024;
+const EVAL_RESULT_MAX_CHARS = 100_000;
+
+/** Serialize a variables dump with caps. Returns text + a truncation note. */
+function truncateVariables(rows: unknown[]): { text: string; note: string } {
+  if (rows.length === 0) return { text: '[]', note: '' };
+  const limited = rows.slice(0, MAX_VARS_ROWS);
+  const text = JSON.stringify(limited, null, 2);
+  const notes: string[] = [];
+  if (rows.length > MAX_VARS_ROWS) {
+    notes.push(`${rows.length} total variables — showing first ${MAX_VARS_ROWS}`);
+  }
+  if (Buffer.byteLength(text, 'utf8') > MAX_VARS_BYTES) {
+    notes.push('output truncated at 200 KB');
+    return { text: text.slice(0, MAX_VARS_BYTES) + '\n…', note: notes.join('; ') };
+  }
+  return { text, note: notes.join('; ') };
+}
+
+/** Wrap a DebugSession customRequest with a hard deadline. */
+async function dapRequest<T>(session: vscode.DebugSession, command: string, args?: unknown): Promise<T> {
+  return withTimeout(
+    session.customRequest(command, args),
+    DAP_TIMEOUT_MS,
+    `Debugger request '${command}' timed out after ${DAP_TIMEOUT_MS / 1000}s (adapter unresponsive — is it paused on a slow operation?)`,
+  );
+}
 
 /**
  * A named compound launch entry. Compounds bundle several launch configs and
@@ -357,15 +394,16 @@ export function registerDebugTools(server: McpServer): void {
         if (!session) return { content: [{ type: 'text', text: 'No active debug session' }], isError: true };
         try {
           // Get stack frames first, then variables from top frame
-          const threads = await session.customRequest('threads');
+          const threads = await dapRequest<any>(session, 'threads');
           if (!threads?.threads?.length) return { content: [{ type: 'text', text: 'No threads available' }], isError: true };
-          const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+          const stack = await dapRequest<any>(session, 'stackTrace', { threadId: threads.threads[0].id });
           if (!stack?.stackFrames?.length) return { content: [{ type: 'text', text: 'No stack frames (is debugger paused?)' }], isError: true };
-          const scopes = await session.customRequest('scopes', { frameId: stack.stackFrames[0].id });
+          const scopes = await dapRequest<any>(session, 'scopes', { frameId: stack.stackFrames[0].id });
           const varsRef = scopes?.scopes?.[0]?.variablesReference;
           if (!varsRef) return { content: [{ type: 'text', text: 'No variables in scope' }], isError: true };
-          const vars = await session.customRequest('variables', { variablesReference: varsRef });
-          return { content: [{ type: 'text', text: JSON.stringify(vars?.variables || [], null, 2) }], isError: false };
+          const vars = await dapRequest<any>(session, 'variables', { variablesReference: varsRef });
+          const { text, note } = truncateVariables(vars?.variables || []);
+          return { content: [{ type: 'text', text: note ? text + '\n' + note : text }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Failed to get variables: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }
@@ -385,9 +423,9 @@ export function registerDebugTools(server: McpServer): void {
         const session = vscode.debug.activeDebugSession;
         if (!session) return { content: [{ type: 'text', text: 'No active debug session' }], isError: true };
         try {
-          const threads = await session.customRequest('threads');
+          const threads = await dapRequest<any>(session, 'threads');
           if (!threads?.threads?.length) return { content: [{ type: 'text', text: 'No threads' }], isError: true };
-          const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+          const stack = await dapRequest<any>(session, 'stackTrace', { threadId: threads.threads[0].id });
           if (!stack?.stackFrames?.length) return { content: [{ type: 'text', text: 'No stack frames' }], isError: true };
           const lines = stack.stackFrames.map((f: any) => `${f.name}${f.source?.path ? ` at ${f.source.path}:${f.line}` : ''}`);
           return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
@@ -416,20 +454,24 @@ export function registerDebugTools(server: McpServer): void {
           // Resolve top stack frame for frame-scoped evaluation (locals)
           let frameId: number | undefined;
           try {
-            const threads = await session.customRequest('threads');
+            const threads = await dapRequest<any>(session, 'threads');
             if (threads?.threads?.length) {
-              const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+              const stack = await dapRequest<any>(session, 'stackTrace', { threadId: threads.threads[0].id });
               frameId = stack?.stackFrames?.[0]?.id;
             }
           } catch {
             // Not paused — fall through to global-scope eval
           }
-          const result = await session.customRequest('evaluate', {
+          const result = await dapRequest<any>(session, 'evaluate', {
             expression: String(args.expression),
             context: 'repl',
             ...(frameId !== undefined ? { frameId } : {}),
           });
-          return { content: [{ type: 'text', text: result?.result || String(result) }], isError: false };
+          let out = result?.result || String(result);
+          if (out.length > EVAL_RESULT_MAX_CHARS) {
+            out = out.slice(0, EVAL_RESULT_MAX_CHARS) + '\n…result truncated at 100 KB…';
+          }
+          return { content: [{ type: 'text', text: out }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Evaluate error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }

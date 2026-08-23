@@ -8,6 +8,7 @@ import { registerWorkspaceTools } from './workspace';
 import { registerLspTools } from './lsp';
 import { registerDebugTools } from './debug';
 import { registerTerminalTools } from './terminal';
+import { registerLogsTools } from './logs';
 
 export function registerAllTools(server: McpServer, context: vscode.ExtensionContext): void {
   registerCommandsTools(server);
@@ -16,6 +17,7 @@ export function registerAllTools(server: McpServer, context: vscode.ExtensionCon
   registerLspTools(server);
   registerDebugTools(server);
   registerTerminalTools(server, context);
+  registerLogsTools(server, context);
 }
 
 export function defineTool(

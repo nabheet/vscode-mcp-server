@@ -9,11 +9,29 @@ import { defineTool } from './index';
 const terminalBuffers = new Map<string, string>();
 
 /**
- * Set of terminal names that we created and are tracking.
+ * Set of terminal names that we created and are tracking. Kept in creation
+ * order so the oldest can be evicted when the cap is hit.
  */
 const managedTerminals = new Set<string>();
+const managedOrder: string[] = [];
+
+/** Max terminals we will keep open. Prevents unbounded leak of VS Code
+ *  terminal processes when a client asks for a new named terminal per call. */
+const MAX_TERMINALS = 15;
 
 let outputCaptureRegistered = false;
+
+/** Enforce the terminal cap — evict the oldest tracked terminal. */
+function enforceTerminalCap(): void {
+  while (managedOrder.length > MAX_TERMINALS) {
+    const oldest = managedOrder.shift();
+    if (!oldest) break;
+    const term = vscode.window.terminals.find((t) => t.name === oldest);
+    term?.dispose();
+    managedTerminals.delete(oldest);
+    terminalBuffers.delete(oldest);
+  }
+}
 
 /**
  * Register one global listener for all terminal shell executions.
@@ -27,6 +45,8 @@ function ensureOutputCapture(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((terminal) => {
       managedTerminals.delete(terminal.name);
+      const idx = managedOrder.indexOf(terminal.name);
+      if (idx >= 0) managedOrder.splice(idx, 1);
       terminalBuffers.delete(terminal.name);
     })
   );
@@ -49,10 +69,18 @@ function ensureOutputCapture(context: vscode.ExtensionContext): void {
     try {
       await Promise.race([
         capture,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), OUTPUT_CAPTURE_TIMEOUT)),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            clearTimeout(timer);
+            // Timeout reached — stop waiting on the capture promise. The
+            // capture loop keeps accumulating by design (buffer is capped),
+            // but we no longer block on it.
+            resolve();
+          }, OUTPUT_CAPTURE_TIMEOUT);
+        }),
       ]);
     } catch {
-      // Timeout or execution error — stop capturing but keep accumulated output
+      // Execution error — stop capturing but keep accumulated output
     }
   });
   context.subscriptions.push(disposable);
@@ -64,7 +92,9 @@ function getOrCreateTerminal(name: string): vscode.Terminal {
   if (!term) {
     term = vscode.window.createTerminal(name);
     managedTerminals.add(name);
+    managedOrder.push(name);
     terminalBuffers.set(name, '');
+    enforceTerminalCap();
   }
   return term;
 }
