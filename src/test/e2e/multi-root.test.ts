@@ -208,14 +208,26 @@ describe('multi-root workspace (E2E)', () => {
                its own 120s budget — this must succeed, not get cut off
                mid-launch with a ghost handler still launching. */
             { "name": "Slow Launch", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 33s" },
+            /* Slow Compound members: EACH config establishes in ~10s — no
+               single member is slow. But a compound awaits every member
+               sequentially inside ONE start_debugging call, so cumulative
+               establishment (~40s+) exceeds the generic 30s tool timeout.
+               This mirrors a real ai-gateway-style "Run All": individual
+               launches look fast, the compound total is what matters. */
+            { "name": "Slow Compound 1", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 10s" },
+            { "name": "Slow Compound 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))}, "preLaunchTask": "Sleep 10s" },
+            { "name": "Slow Compound 3", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 10s" },
+            { "name": "Slow Compound 4", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))}, "preLaunchTask": "Sleep 10s" },
           ],
           "compounds": [
             { "name": "WorkspaceFile Compound", "configurations": ["WorkspaceFile Debug", "WorkspaceFile Debug 2"], "stopAll": true },
+            { "name": "Slow Compound", "configurations": ["Slow Compound 1", "Slow Compound 2", "Slow Compound 3", "Slow Compound 4"], "stopAll": true },
           ],
         },
-        /* Tasks for the Slow Launch preLaunchTask. Shell task, non-background
-           (isBackground defaults to false) — VS Code waits for it to finish
-           before the debug adapter starts, delaying session establishment. */
+        /* Tasks for the Slow Launch / Slow Compound preLaunchTasks. Shell
+           tasks, non-background (isBackground defaults to false) — VS Code
+           waits for each to finish before its debug adapter starts, delaying
+           session establishment. */
         "tasks": {
           "version": "2.0.0",
           "tasks": [
@@ -225,20 +237,28 @@ describe('multi-root workspace (E2E)', () => {
               "command": "sleep 33",
               "presentation": { "reveal": "silent", "panel": "shared" },
             },
+            {
+              "label": "Sleep 10s",
+              "type": "shell",
+              "command": "sleep 10",
+              "presentation": { "reveal": "silent", "panel": "shared" },
+            },
           ],
         },
       }`,
     );
 
     // Debug targets for the workspace-file launch configs (plain JS so the
-    // built-in Node debug adapter can run them)
+    // built-in Node debug adapter can run them). Long lifetime (60s) so
+    // sessions stay alive for the whole test — slow-launch tests take ~50s
+    // and need every member stoppable when they finish.
     fs.writeFileSync(
       path.join(folderB, 'app.js'),
-      '// e2e debug target\nsetTimeout(() => {}, 5000);\n',
+      '// e2e debug target\nsetTimeout(() => {}, 60000);\n',
     );
     fs.writeFileSync(
       path.join(folderB, 'app2.js'),
-      '// e2e debug target 2\nsetTimeout(() => {}, 5000);\n',
+      '// e2e debug target 2\nsetTimeout(() => {}, 60000);\n',
     );
 
     // Set port via VS Code settings (env vars don't reliably propagate
@@ -889,6 +909,37 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(stop.result.isError).toBe(false);
     expect((stop.result.content[0].text as string)).toContain('stopped');
+  }, 120000);
+
+  it('start_debugging completes a compound whose cumulative establishment exceeds the generic 30s tool timeout', async () => {
+    if (!ENABLED) return;
+
+    // 4 configs × ~10s preLaunchTask sleep ≈ 40s+ of cumulative session
+    // establishment. No single member is slow — but the compound awaits each
+    // member sequentially inside ONE tool call, so the total blows past the
+    // generic 30s DEFAULT_TOOL_TIMEOUT_MS (the ai-gateway "Run All" shape:
+    // individual launches look fast, the compound total is what matters).
+    // The per-tool 120s budget must let it finish with every member live.
+    const started = Date.now();
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Slow Compound' },
+    });
+    const elapsedMs = Date.now() - started;
+
+    expect(elapsedMs).toBeGreaterThan(30_000);
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    // All four members should be live: stopping succeeds once per session.
+    for (let i = 0; i < 4; i++) {
+      const stop = await mcpRequest(port, 'tools/call', {
+        name: 'stop_debugging',
+        arguments: {},
+      });
+      expect(stop.result.isError).toBe(false);
+      expect((stop.result.content[0].text as string)).toContain('stopped');
+    }
   }, 120000);
 
   // ── Error cases ──────────────────────────────────────────────────────
