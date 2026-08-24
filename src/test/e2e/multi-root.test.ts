@@ -202,9 +202,29 @@ describe('multi-root workspace (E2E)', () => {
           "configurations": [
             { "name": "WorkspaceFile Debug", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))} },
             { "name": "WorkspaceFile Debug 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))} },
+            /* Slow Launch: preLaunchTask sleeps 33s, so FULL session
+               establishment legitimately exceeds the generic 30s tool
+               timeout (DEFAULT_TOOL_TIMEOUT_MS). start_debugging declares
+               its own 120s budget — this must succeed, not get cut off
+               mid-launch with a ghost handler still launching. */
+            { "name": "Slow Launch", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 33s" },
           ],
           "compounds": [
             { "name": "WorkspaceFile Compound", "configurations": ["WorkspaceFile Debug", "WorkspaceFile Debug 2"], "stopAll": true },
+          ],
+        },
+        /* Tasks for the Slow Launch preLaunchTask. Shell task, non-background
+           (isBackground defaults to false) — VS Code waits for it to finish
+           before the debug adapter starts, delaying session establishment. */
+        "tasks": {
+          "version": "2.0.0",
+          "tasks": [
+            {
+              "label": "Sleep 33s",
+              "type": "shell",
+              "command": "sleep 33",
+              "presentation": { "reveal": "silent", "panel": "shared" },
+            },
           ],
         },
       }`,
@@ -841,6 +861,35 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(stop2.result.isError).toBe(false);
   });
+
+  it('start_debugging survives a launch slower than the generic 30s tool timeout (per-tool budget)', async () => {
+    if (!ENABLED) return;
+
+    // Slow Launch's preLaunchTask sleeps 33s, so full session establishment
+    // takes > 30s. The generic DEFAULT_TOOL_TIMEOUT_MS would cut this off
+    // mid-launch (and the abandoned handler would keep launching in the
+    // background); the per-tool 120s budget must let it complete normally.
+    const started = Date.now();
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Slow Launch' },
+    });
+    const elapsedMs = Date.now() - started;
+
+    // Prove the launch genuinely outlasted the old 30s default (sleep floor
+    // makes this deterministic) — otherwise this test passes vacuously.
+    expect(elapsedMs).toBeGreaterThan(30_000);
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text as string).toContain('Started debugging');
+
+    // Stop the slow session so later tests start clean.
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
+  }, 120000);
 
   // ── Error cases ──────────────────────────────────────────────────────
 
