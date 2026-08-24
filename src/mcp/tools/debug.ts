@@ -3,12 +3,24 @@ import { McpServer } from '../server';
 import { defineTool } from './index';
 import { resolvePath } from '../../utils/path';
 import { parseJsonc } from '../../utils/jsonc';
-import { withTimeout } from '../../utils/timeout';
+import { withTimeout, withLaunchBudget } from '../../utils/timeout';
 
 /** DAP calls can hang indefinitely when the adapter is blocked (e.g. a slow
  *  evaluate, mid-step). Bound every customRequest so a stuck adapter returns
  *  a clear error instead of freezing the MCP server. */
 const DAP_TIMEOUT_MS = 10_000;
+
+/** start_debugging legitimately exceeds the generic 30s tool budget: a launch
+ *  resolves only after FULL session establishment, and a multiprocess compound
+ *  (e.g. litellm --reload with a debugpy worker per process) attaches parent +
+ *  every worker before that. Give the tool its own dispatch deadline via
+ *  defineTool's timeoutMs (so dispatch won't cut it at 30s) and run the launch
+ *  phase under a slightly smaller INTERNAL budget. The internal one fires
+ *  first, so the handler returns a clean error result and flips isAborted() to
+ *  stop issuing new launches for remaining compound members — the dispatch
+ *  deadline is only the backstop. */
+const START_DEBUG_TIMEOUT_MS = 120_000;
+const START_DEBUG_BUDGET_MS = START_DEBUG_TIMEOUT_MS - 5_000;
 
 /** get_debug_variables output caps — a deep object tree can serialize to
  *  megabytes and saturate the MCP round trip. */
@@ -146,75 +158,104 @@ export function registerDebugTools(server: McpServer): void {
 
           let success = false;
           let detail = '';
+          let timedOut = false;
 
-          // 1) Folder scope — only when the folder's launch.json declares it.
-          //    VS Code resolves folder-level configs and compounds natively.
-          if (!success && folder && folderSection && hasLaunchEntry(folderSection, configName)) {
-            try {
-              success = await vscode.debug.startDebugging(folder, configName);
-            } catch {
-              success = false;
-            }
-          }
-
-          // 2) Workspace-file scope — only when the workspace file declares it.
-          //    VS Code 1.133+ cannot resolve workspace-file configs by name
-          //    (startDebugging(undefined, name) throws), so we read the file
-          //    and pass the config objects directly — the object path skips
-          //    name resolution.
-          if (!success && wsSection && hasLaunchEntry(wsSection, configName)) {
-            const configs = wsSection.configurations ?? [];
-            const compounds = wsSection.compounds ?? [];
-            const configByName = new Map(configs.map((c) => [c.name, c]));
-
-            const compound = compounds.find((c) => c.name === configName);
-            if (compound) {
-              // Compound: start every constituent config in sequence. Compounds
-              // are named launch entries, not DebugConfiguration objects, so
-              // they cannot be passed to startDebugging directly — expand here.
-              const started: string[] = [];
-              const failed: string[] = [];
-              for (const subName of compound.configurations) {
-                const subConfig = configByName.get(subName);
-                if (!subConfig) {
-                  failed.push(`${subName} (not found in workspace file)`);
-                  continue;
-                }
-                let ok = false;
-                try {
-                  ok = await vscode.debug.startDebugging(undefined, subConfig);
-                } catch {
-                  ok = false;
-                }
-                if (!ok && folder) {
+          // Run the whole launch phase under a budget. startDebugging resolves
+          // only after FULL session establishment, which for a heavy
+          // multiprocess compound (e.g. litellm --reload with debugpy attach
+          // per worker) can take well over the generic 30s tool timeout. The
+          // budget rejects the caller cleanly at ~115s and flips isAborted()
+          // so the loop below stops issuing NEW launches for remaining members
+          // instead of silently keeping the DAP busy in the background.
+          try {
+            await withLaunchBudget(
+              async (isAborted) => {
+                // 1) Folder scope — only when the folder's launch.json declares it.
+                //    VS Code resolves folder-level configs and compounds natively.
+                if (!success && folder && folderSection && hasLaunchEntry(folderSection, configName) && !isAborted()) {
                   try {
-                    ok = await vscode.debug.startDebugging(folder, subConfig);
-                  } catch {
-                    ok = false;
-                  }
-                }
-                if (ok) started.push(subName);
-                else failed.push(subName);
-              }
-              success = failed.length === 0 && started.length > 0;
-              detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
-            } else {
-              const wsConfig = configByName.get(configName);
-              if (wsConfig) {
-                try {
-                  success = await vscode.debug.startDebugging(undefined, wsConfig);
-                } catch {
-                  success = false;
-                }
-                if (!success && folder) {
-                  try {
-                    success = await vscode.debug.startDebugging(folder, wsConfig);
+                    success = await vscode.debug.startDebugging(folder, configName);
                   } catch {
                     success = false;
                   }
                 }
-              }
+
+                // 2) Workspace-file scope — only when the workspace file declares it.
+                //    VS Code 1.133+ cannot resolve workspace-file configs by name
+                //    (startDebugging(undefined, name) throws), so we read the file
+                //    and pass the config objects directly — the object path skips
+                //    name resolution.
+                if (!success && wsSection && hasLaunchEntry(wsSection, configName) && !isAborted()) {
+                  const configs = wsSection.configurations ?? [];
+                  const compounds = wsSection.compounds ?? [];
+                  const configByName = new Map(configs.map((c) => [c.name, c]));
+
+                  const compound = compounds.find((c) => c.name === configName);
+                  if (compound) {
+                    // Compound: start every constituent config in sequence. Compounds
+                    // are named launch entries, not DebugConfiguration objects, so
+                    // they cannot be passed to startDebugging directly — expand here.
+                    const started: string[] = [];
+                    const failed: string[] = [];
+                    for (const subName of compound.configurations) {
+                      if (isAborted()) {
+                        failed.push(`${subName} (launch timed out)`);
+                        break;
+                      }
+                      const subConfig = configByName.get(subName);
+                      if (!subConfig) {
+                        failed.push(`${subName} (not found in workspace file)`);
+                        continue;
+                      }
+                      let ok = false;
+                      try {
+                        ok = await vscode.debug.startDebugging(undefined, subConfig);
+                      } catch {
+                        ok = false;
+                      }
+                      if (!ok && folder) {
+                        try {
+                          ok = await vscode.debug.startDebugging(folder, subConfig);
+                        } catch {
+                          ok = false;
+                        }
+                      }
+                      if (ok) started.push(subName);
+                      else failed.push(subName);
+                    }
+                    success = failed.length === 0 && started.length > 0;
+                    detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
+                  } else {
+                    const wsConfig = configByName.get(configName);
+                    if (wsConfig) {
+                      try {
+                        success = await vscode.debug.startDebugging(undefined, wsConfig);
+                      } catch {
+                        success = false;
+                      }
+                      if (!success && folder) {
+                        try {
+                          success = await vscode.debug.startDebugging(folder, wsConfig);
+                        } catch {
+                          success = false;
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              START_DEBUG_BUDGET_MS,
+              `Debug launch '${configName}' did not complete within ${START_DEBUG_BUDGET_MS / 1000}s — stopped issuing further launches`,
+            );
+          } catch (err) {
+            // Budget expiry (or an error escaping the launch phase): report a
+            // clean error to the caller. isAborted() has already been flipped,
+            // so the ghost phase will not spawn further launches.
+            timedOut = err instanceof Error && /did not complete within/.test(err.message);
+            if (!timedOut) {
+              throw err;
             }
+            detail = detail ? detail + ' (launch timed out)' : ' (launch timed out)';
           }
 
           if (!success) {
@@ -236,6 +277,7 @@ export function registerDebugTools(server: McpServer): void {
           return { content: [{ type: 'text', text: `Debug start error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }
       },
+      START_DEBUG_TIMEOUT_MS,
     ),
   );
 

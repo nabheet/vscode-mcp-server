@@ -104,6 +104,27 @@ describe('tool schemas', () => {
     }
   });
 
+  it('only start_debugging declares a launch-specific timeoutMs override', async () => {
+    const { registerDebugTools } = await import('../mcp/tools/debug');
+    const allDefs: ToolDefinition[] = [];
+    class MockServer {
+      registerTool(def: ToolDefinition) { allDefs.push(def); }
+    }
+    registerDebugTools(new MockServer() as any);
+
+    const startDef = allDefs.find((d) => d.name === 'start_debugging');
+    expect(startDef).toBeDefined();
+    // A debug launch resolves only after FULL session establishment (multiprocess
+    // compounds attach a debugpy per worker), so it gets a budget far beyond the
+    // generic 30s tool timeout instead of being cut off mid-launch.
+    expect(startDef!.timeoutMs).toBe(120_000);
+    for (const def of allDefs) {
+      if (def.name !== 'start_debugging') {
+        expect(def.timeoutMs).toBeUndefined();
+      }
+    }
+  });
+
   it('tool schemas have only documented extra fields', async () => {
     const { registerCommandsTools } = await import('../mcp/tools/commands');
     const { registerNavigationTools } = await import('../mcp/tools/navigation');

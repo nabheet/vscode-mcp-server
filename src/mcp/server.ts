@@ -245,7 +245,8 @@ export class McpServer {
     const started = Date.now();
     const toolName = extractToolName(rawBody);
     try {
-      const timeoutMs = this.options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+      const toolDef = this.tools.get(toolName);
+      const timeoutMs = this.options.toolTimeoutMs ?? toolDef?.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
       const response = await withTimeout(
         handleRequest(rawBody, this.tools),
         timeoutMs,

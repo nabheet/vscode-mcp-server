@@ -25,6 +25,7 @@ export function defineTool(
   description: string,
   inputSchema: Record<string, unknown>,
   handler: ToolDefinition['handler'],
+  timeoutMs?: number,
 ): ToolDefinition {
-  return { name, description, inputSchema, handler };
+  return { name, description, inputSchema, handler, ...(timeoutMs !== undefined ? { timeoutMs } : {}) };
 }

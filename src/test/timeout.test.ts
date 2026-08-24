@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { withTimeout } from '../utils/timeout';
+import { withTimeout, withLaunchBudget } from '../utils/timeout';
 
 describe('withTimeout', () => {
   it('resolves with the value when the promise settles in time', async () => {
@@ -31,5 +31,35 @@ describe('withTimeout', () => {
     await expect(withTimeout(slow, 50, 'timeout')).rejects.toThrow('timeout');
     expect(Date.now() - start).toBeLessThan(500);
     expect(settledLate).toBe(false);
+  });
+});
+
+describe('withLaunchBudget', () => {
+  it('resolves when the phase completes within the budget', async () => {
+    await expect(withLaunchBudget(async () => {}, 1000, 'budget expired')).resolves.toBeUndefined();
+  });
+
+  it('rejects at the budget and flips isAborted so the phase can stop issuing side effects', async () => {
+    let isAbortedDuring: boolean | undefined;
+    let runDone: () => void = () => {};
+    const runDoneP = new Promise<void>((r) => { runDone = r; });
+    const run = async (isAborted: () => boolean) => {
+      // Simulate work that outlives the budget (e.g. an in-flight startDebugging)
+      await new Promise((r) => setTimeout(r, 30));
+      isAbortedDuring = isAborted();
+      runDone();
+    };
+
+    await expect(withLaunchBudget(run, 5, 'budget expired')).rejects.toThrow('budget expired');
+    await runDoneP; // wait for the abandoned phase to finish
+    expect(isAbortedDuring).toBe(true);
+  });
+
+  it('keeps isAborted false when the phase completes in time', async () => {
+    let probe: boolean | undefined;
+    await withLaunchBudget(async (isAborted) => {
+      probe = isAborted();
+    }, 1000, 'budget expired');
+    expect(probe).toBe(false);
   });
 });
