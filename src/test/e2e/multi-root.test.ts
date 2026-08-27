@@ -261,6 +261,22 @@ describe('multi-root workspace (E2E)', () => {
       '// e2e debug target 2\nsetTimeout(() => {}, 60000);\n',
     );
 
+    // Folder-level launch.json in the SECOND folder (backend). The default
+    // folder scope is the first folder (frontend) — a config declared only
+    // here must still be found when start_debugging is called WITHOUT a
+    // `folder` argument, proving every open folder's .vscode/launch.json is
+    // searched (not just the first folder's, and not just the workspace file).
+    fs.mkdirSync(path.join(folderB, '.vscode'), { recursive: true });
+    fs.writeFileSync(
+      path.join(folderB, '.vscode', 'launch.json'),
+      `{
+        "version": "0.2.0",
+        "configurations": [
+          { "name": "Folder Debug", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))} },
+        ],
+      }`,
+    );
+
     // Set port via VS Code settings (env vars don't reliably propagate
     // through VS Code's extension host process chain). Note: short names
     // (`ud`, `mre-`) — VS Code's IPC socket under the user-data dir must stay
@@ -880,6 +896,55 @@ describe('multi-root workspace (E2E)', () => {
       arguments: {},
     });
     expect(stop2.result.isError).toBe(false);
+  });
+
+  it('start_debugging finds a config in a NON-first folder launch.json without a folder argument', async () => {
+    if (!ENABLED) return;
+
+    // 'Folder Debug' lives only in backend/.vscode/launch.json; the default
+    // folder scope is the FIRST folder (frontend). It must still resolve —
+    // folder-level launch configs in any open folder are searchable.
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Debug' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
+  });
+
+  it('start_debugging with an explicit folder argument narrows the search to that folder', async () => {
+    if (!ENABLED) return;
+
+    // 'Folder Debug' is declared in backend, NOT frontend. With
+    // folder: 'frontend', start_debugging must NOT find it — the folder
+    // argument is a hard scope, not a hint.
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Debug', folder: 'frontend' },
+    });
+    expect(res.result.isError).toBe(true);
+    expect((res.result.content[0].text as string)).toContain("Failed to start 'Folder Debug'");
+
+    // And with folder: 'backend' it must resolve.
+    const ok = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Debug', folder: 'backend' },
+    });
+    expect(ok.result.isError).toBe(false);
+    expect((ok.result.content[0].text as string)).toContain('Started debugging');
+
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
   });
 
   it('start_debugging survives a launch slower than the generic 30s tool timeout (per-tool budget)', async () => {

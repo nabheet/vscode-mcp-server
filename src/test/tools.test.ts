@@ -440,12 +440,12 @@ describe('handler behavior', () => {
     (vscode.workspace as any).workspaceFolders = [
       { name: 'root', uri: vscode.Uri.file('/workspace') },
     ];
+    // A folder's .vscode/launch.json IS the launch section — no top-level
+    // `launch` wrapper (that only exists in *.code-workspace files).
     mockLaunchSources(
       JSON.stringify({
-        launch: {
-          version: '0.2.0',
-          configurations: [{ name: 'Launch', type: 'node', request: 'launch', program: '/workspace/app.js' }],
-        },
+        version: '0.2.0',
+        configurations: [{ name: 'Launch', type: 'node', request: 'launch', program: '/workspace/app.js' }],
       }),
     );
     (vscode.debug.startDebugging as any).mockResolvedValueOnce(true);
@@ -454,7 +454,12 @@ describe('handler behavior', () => {
     const res = await h({ configName: 'Launch' });
 
     expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(1);
-    expect(vscode.debug.startDebugging).toHaveBeenCalledWith(expect.objectContaining({ name: 'root' }), 'Launch');
+    // The parsed config OBJECT is passed (name-based resolution is unreliable
+    // on VS Code 1.133+), scoped to the declaring folder.
+    expect(vscode.debug.startDebugging).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'root' }),
+      expect.objectContaining({ name: 'Launch', type: 'node', request: 'launch' }),
+    );
     expect(res.isError).toBe(false);
     expect(res.content[0].text).toContain('Started debugging');
   });
@@ -500,10 +505,8 @@ describe('handler behavior', () => {
     // a genuine config failure, not a scope miss. No fallback attempt.
     mockLaunchSources(
       JSON.stringify({
-        launch: {
-          version: '0.2.0',
-          configurations: [{ name: 'Launch', type: 'node', request: 'launch', program: '/workspace/app.js' }],
-        },
+        version: '0.2.0',
+        configurations: [{ name: 'Launch', type: 'node', request: 'launch', program: '/workspace/app.js' }],
       }),
     );
     (vscode.debug.startDebugging as any).mockImplementation(() => {

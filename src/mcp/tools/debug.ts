@@ -97,13 +97,17 @@ async function readWorkspaceFileLaunchSection(): Promise<WorkspaceLaunchSection 
  * Read the `launch` section from a folder's .vscode/launch.json. Returns
  * undefined when the folder has no launch.json or it cannot be parsed — the
  * folder then simply does not contribute any folder-scoped configs.
+ *
+ * NOTE: a folder's launch.json IS the section — it has no top-level `launch`
+ * key (that wrapper only exists in *.code-workspace files). Parsing it as
+ * `json.launch` (the workspace-file shape) silently yields undefined, which
+ * made every folder-scoped config invisible.
  */
 async function readFolderLaunchSection(folder: vscode.WorkspaceFolder): Promise<WorkspaceLaunchSection | undefined> {
   try {
     const uri = vscode.Uri.joinPath(folder.uri, '.vscode', 'launch.json');
     const buf = await vscode.workspace.fs.readFile(uri);
-    const json = parseJsonc<{ launch?: WorkspaceLaunchSection }>(Buffer.from(buf).toString('utf8'));
-    return json.launch;
+    return parseJsonc<WorkspaceLaunchSection>(Buffer.from(buf).toString('utf8'));
   } catch {
     return undefined;
   }
@@ -132,13 +136,20 @@ export function registerDebugTools(server: McpServer): void {
         required: ['configName'],
       },
       async (args) => {
+        // Folder scope: a launch config can live in ANY workspace folder's
+        // .vscode/launch.json. With an explicit `folder` argument only that
+        // folder is searched; without one, every open folder is searched in
+        // order — a config in a non-first folder must still be found.
         const folders = vscode.workspace.workspaceFolders;
-        const folder = args.folder
-          ? folders?.find((f) => f.name === args.folder)
-          : folders?.[0];
-
-        if (args.folder && !folder) {
-          return { content: [{ type: 'text', text: `Workspace folder '${args.folder}' not found` }], isError: true };
+        let targetFolders: vscode.WorkspaceFolder[];
+        if (args.folder) {
+          const found = folders?.find((f) => f.name === args.folder);
+          if (!found) {
+            return { content: [{ type: 'text', text: `Workspace folder '${args.folder}' not found` }], isError: true };
+          }
+          targetFolders = [found];
+        } else {
+          targetFolders = [...(folders ?? [])];
         }
 
         const configName = String(args.configName);
@@ -151,8 +162,8 @@ export function registerDebugTools(server: McpServer): void {
           // error toasts ("launch.json does not exist for passed workspace
           // folder", "Configuration X is missing in launch.json") even when a
           // later attempt would succeed.
-          const [folderSection, wsSection] = await Promise.all([
-            folder ? readFolderLaunchSection(folder) : Promise.resolve(undefined),
+          const [folderSections, wsSection] = await Promise.all([
+            Promise.all(targetFolders.map((f) => readFolderLaunchSection(f))),
             readWorkspaceFileLaunchSection(),
           ]);
 
@@ -170,13 +181,30 @@ export function registerDebugTools(server: McpServer): void {
           try {
             await withLaunchBudget(
               async (isAborted) => {
-                // 1) Folder scope — only when the folder's launch.json declares it.
-                //    VS Code resolves folder-level configs and compounds natively.
-                if (!success && folder && folderSection && hasLaunchEntry(folderSection, configName) && !isAborted()) {
+                // 1) Folder scope — try every target folder whose launch.json
+                //    declares the config. Pass the parsed config OBJECT, not
+                //    just the name: VS Code 1.133+ name-based resolution is
+                //    unreliable ('launch.json does not exist for passed
+                //    workspace folder' even when the file exists), and the
+                //    object path also survives folder launch.json files that
+                //    were (re)written after the workspace opened. (Pre-scan
+                //    avoids doomed calls that fire error toasts.)
+                for (let i = 0; i < targetFolders.length && !success && !isAborted(); i++) {
+                  const tf = targetFolders[i];
+                  const fs = folderSections[i];
+                  if (!fs || !hasLaunchEntry(fs, configName)) continue;
+                  const cfg = (fs.configurations ?? []).find((c) => c.name === configName);
                   try {
-                    success = await vscode.debug.startDebugging(folder, configName);
-                  } catch {
+                    if (cfg) {
+                      success = await vscode.debug.startDebugging(tf, cfg as vscode.DebugConfiguration);
+                    } else {
+                      // Folder-level compound: not a DebugConfiguration
+                      // object, so fall back to name-based resolution.
+                      success = await vscode.debug.startDebugging(tf, configName);
+                    }
+                  } catch (err) {
                     success = false;
+                    detail = detail || ` (${err instanceof Error ? err.message : String(err)})`;
                   }
                 }
 
@@ -213,9 +241,10 @@ export function registerDebugTools(server: McpServer): void {
                       } catch {
                         ok = false;
                       }
-                      if (!ok && folder) {
+                      const primaryFolder = targetFolders[0];
+                      if (!ok && primaryFolder) {
                         try {
-                          ok = await vscode.debug.startDebugging(folder, subConfig);
+                          ok = await vscode.debug.startDebugging(primaryFolder, subConfig);
                         } catch {
                           ok = false;
                         }
@@ -233,9 +262,10 @@ export function registerDebugTools(server: McpServer): void {
                       } catch {
                         success = false;
                       }
-                      if (!success && folder) {
+                      const primaryFolderWs = targetFolders[0];
+                      if (!success && primaryFolderWs) {
                         try {
-                          success = await vscode.debug.startDebugging(folder, wsConfig);
+                          success = await vscode.debug.startDebugging(primaryFolderWs, wsConfig);
                         } catch {
                           success = false;
                         }
@@ -259,10 +289,10 @@ export function registerDebugTools(server: McpServer): void {
           }
 
           if (!success) {
-            const sources = [
-              folderSection ? `launch.json in folder '${folder!.name}'` : null,
-              wsSection ? 'the workspace file' : null,
-            ].filter(Boolean);
+            const sources = targetFolders
+              .map((f, i) => (folderSections[i] ? `launch.json in folder '${f.name}'` : null))
+              .concat(wsSection ? ['the workspace file'] : [])
+              .filter((s): s is string => !!s);
             const where = sources.length > 0 ? ` (checked ${sources.join(' and ')})` : ' (no launch sources found)';
             return {
               content: [{ type: 'text', text: `Failed to start '${configName}'${where}${detail}` }],
