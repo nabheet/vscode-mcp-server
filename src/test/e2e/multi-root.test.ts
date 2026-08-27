@@ -478,6 +478,55 @@ describe('multi-root workspace (E2E)', () => {
     expect(res.result.content[0].text).toContain('// backend code');
   });
 
+  // ── search_files (grep) ──────────────────────────────────────────────
+
+  it('search_files finds literal text with file:line:col', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'frontend code' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('frontend/src/index.ts:1:');
+    expect(text).toContain('// frontend code');
+  });
+
+  it('search_files matches across folders and supports regex + case sensitivity', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'const [ab] =', useRegex: true },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('frontend/src/index.ts:2:');
+    expect(text).toContain('const a = 1;');
+    expect(text).toContain('backend/src/index.ts:2:');
+    expect(text).toContain('const b = 2;');
+
+    // Case-sensitive: uppercase query must NOT match lowercase source
+    const strict = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'FRONTEND', caseSensitive: true },
+    });
+    expect(strict.result.isError).toBe(false);
+    expect(strict.result.content[0].text).toContain('(no matches)');
+  });
+
+  it('search_files respects workspaceFolder scope and include globs', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'backend', workspaceFolder: 'backend', include: '**/*.ts' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('backend/src/index.ts:1:');
+    expect(text).toContain('backend/src/util.ts:1:');
+    expect(text).not.toContain('frontend');
+  });
+
   it('read_file without workspaceFolder uses the first folder', async () => {
     if (!ENABLED) return;
     const res = await mcpRequest(port, 'tools/call', {

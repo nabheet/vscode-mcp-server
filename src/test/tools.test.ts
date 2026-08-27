@@ -218,6 +218,7 @@ describe('tool schemas', () => {
     const { registerNavigationTools } = await import('../mcp/tools/navigation');
     const { registerWorkspaceTools } = await import('../mcp/tools/workspace');
     const { registerDebugTools } = await import('../mcp/tools/debug');
+    const { registerSearchTools } = await import('../mcp/tools/search');
 
     const allDefs: ToolDefinition[] = [];
     class MockServer {
@@ -228,11 +229,13 @@ describe('tool schemas', () => {
     registerNavigationTools(new MockServer() as any);
     registerWorkspaceTools(new MockServer() as any);
     registerDebugTools(new MockServer() as any);
+    registerSearchTools(new MockServer() as any);
 
     // Verify specific tool patterns
     const readFile = allDefs.find(d => d.name === 'read_file');
     expect(readFile).toBeDefined();
     expect(readFile!.inputSchema).toHaveProperty('properties');
+    expect(allDefs.find(d => d.name === 'search_files')).toBeDefined();
   });
 });
 
@@ -257,6 +260,7 @@ describe('handler behavior', () => {
     const { registerNavigationTools } = await import('../mcp/tools/navigation');
     const { registerWorkspaceTools } = await import('../mcp/tools/workspace');
     const { registerDebugTools } = await import('../mcp/tools/debug');
+    const { registerSearchTools } = await import('../mcp/tools/search');
 
     handlers = new Map();
     class MockServer {
@@ -268,6 +272,7 @@ describe('handler behavior', () => {
     registerNavigationTools(new MockServer() as any);
     registerWorkspaceTools(new MockServer() as any);
     registerDebugTools(new MockServer() as any);
+    registerSearchTools(new MockServer() as any);
   });
 
   /**
@@ -892,5 +897,177 @@ describe('handler behavior', () => {
     );
     expect(res.isError).toBe(false);
     expect(res.content[0].text).toContain('Started debugging');
+  });
+
+  // ── Search ────────────────────────────────────────────────────────────
+
+  function mockSearchFiles(contents: Record<string, string>, uris: { fsPath: string }[]) {
+    (vscode.workspace as any).findFiles = vi.fn().mockResolvedValue(uris);
+    (vscode.workspace as any).fs.readFile = vi.fn().mockImplementation((uri: any) => {
+      const text = contents[uri?.fsPath ?? ''];
+      return text !== undefined
+        ? Promise.resolve(Buffer.from(text))
+        : Promise.reject(new Error('ENOENT'));
+    });
+  }
+
+  it('search_files finds matching lines with file:line:col', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: vscode.Uri.file('/ws') },
+    ];
+    mockSearchFiles(
+      {
+        '/ws/frontend/src/index.ts': '// frontend code\nconst a = 1;\n',
+        '/ws/backend/src/index.ts': '// backend code\nconst b = 2;\n',
+      },
+      [
+        { fsPath: '/ws/frontend/src/index.ts' },
+        { fsPath: '/ws/backend/src/index.ts' },
+      ],
+    );
+
+    const h = handlers.get('search_files')!;
+    const res = await h({ query: 'const' });
+
+    expect(res.isError).toBe(false);
+    const text: string = res.content[0].text;
+    expect(text).toContain('2 matches');
+    expect(text).toContain('/ws/frontend/src/index.ts:2:1: const a = 1;');
+    expect(text).toContain('/ws/backend/src/index.ts:2:1: const b = 2;');
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ pattern: '**/*' }),
+      '**/node_modules/**',
+      2000,
+    );
+  });
+
+  it('search_files returns (no matches) when nothing matches', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: vscode.Uri.file('/ws') },
+    ];
+    mockSearchFiles(
+      { '/ws/a.ts': 'nothing here\n' },
+      [{ fsPath: '/ws/a.ts' }],
+    );
+
+    const h = handlers.get('search_files')!;
+    const res = await h({ query: 'zzz-nope' });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('(no matches)');
+  });
+
+  it('search_files searches every workspace folder by default', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'fe', uri: vscode.Uri.file('/ws/fe') },
+      { name: 'be', uri: vscode.Uri.file('/ws/be') },
+    ];
+    mockSearchFiles(
+      {
+        '/ws/fe/a.ts': 'shared marker\n',
+        '/ws/be/b.ts': 'shared marker\n',
+      },
+      [
+        { fsPath: '/ws/fe/a.ts' },
+        { fsPath: '/ws/be/b.ts' },
+      ],
+    );
+
+    const h = handlers.get('search_files')!;
+    const res = await h({ query: 'marker' });
+
+    expect(vscode.workspace.findFiles).toHaveBeenCalledTimes(2);
+    expect(vscode.workspace.findFiles).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: '/ws/fe' }) }),
+      '**/node_modules/**',
+      2000,
+    );
+    expect(vscode.workspace.findFiles).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: '/ws/be' }) }),
+      '**/node_modules/**',
+      2000,
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('2 matches');
+    expect(res.content[0].text).toContain('/ws/fe/a.ts:1:8: shared marker');
+    expect(res.content[0].text).toContain('/ws/be/b.ts:1:8: shared marker');
+  });
+
+  it('search_files is case-insensitive by default and honors caseSensitive', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: vscode.Uri.file('/ws') },
+    ];
+    mockSearchFiles(
+      { '/ws/a.ts': 'Hello World\n' },
+      [{ fsPath: '/ws/a.ts' }],
+    );
+
+    const h = handlers.get('search_files')!;
+    const loose = await h({ query: 'hello' });
+    expect(loose.content[0].text).toContain('/ws/a.ts:1:1: Hello World');
+
+    const strict = await h({ query: 'hello', caseSensitive: true });
+    expect(strict.content[0].text).toContain('(no matches)');
+  });
+
+  it('search_files treats query as a regex with useRegex and reports invalid regexes', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: vscode.Uri.file('/ws') },
+    ];
+    mockSearchFiles(
+      { '/ws/a.ts': 'const value = 42;\n' },
+      [{ fsPath: '/ws/a.ts' }],
+    );
+
+    const h = handlers.get('search_files')!;
+    const res = await h({ query: 'const \\w+ = \\d+', useRegex: true });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('/ws/a.ts:1:1: const value = 42;');
+
+    const bad = await h({ query: '([unclosed', useRegex: true });
+    expect(bad.isError).toBe(true);
+    expect(bad.content[0].text).toMatch(/invalid regular expression/i);
+  });
+
+  it('search_files caps results at maxResults', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: vscode.Uri.file('/ws') },
+    ];
+    mockSearchFiles(
+      { '/ws/a.ts': 'foo\nfoo\nfoo\nfoo\n' },
+      [{ fsPath: '/ws/a.ts' }],
+    );
+
+    const h = handlers.get('search_files')!;
+    const res = await h({ query: 'foo', maxResults: 2 });
+
+    expect(res.isError).toBe(false);
+    const text: string = res.content[0].text;
+    expect(text).toContain('2 matches');
+    expect(text).not.toContain('/ws/a.ts:4:');
+  });
+
+  it('search_files supports include/exclude globs and workspaceFolder scoping', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'fe', uri: vscode.Uri.file('/ws/fe') },
+      { name: 'be', uri: vscode.Uri.file('/ws/be') },
+    ];
+    mockSearchFiles(
+      { '/ws/be/src/app.ts': 'const x = 1;\n' },
+      [{ fsPath: '/ws/be/src/app.ts' }],
+    );
+
+    const h = handlers.get('search_files')!;
+    const res = await h({ query: 'x =', include: '**/*.ts', exclude: '**/dist/**', workspaceFolder: 'be' });
+
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: '/ws/be' }), pattern: '**/*.ts' }),
+      '**/dist/**',
+      2000,
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('/ws/be/src/app.ts:1:7: const x = 1;');
   });
 });

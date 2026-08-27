@@ -19,6 +19,7 @@ const mockWorkspace = {
   workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
   workspaceFile: undefined as { uri: { scheme: string; fsPath: string } } | undefined,
   fs: { readFile: vi.fn() },
+  findFiles: vi.fn().mockResolvedValue([]),
   updateWorkspaceFolders: vi.fn(),
   onDidChangeWorkspaceFolders: vi.fn().mockImplementation((cb: () => void) => {
     cb();
@@ -79,6 +80,9 @@ const mockCommands = {
 // Build the mock vscode module
 const mockVscode = {
   Uri: mockUri,
+  RelativePattern: class {
+    constructor(public base: any, public pattern: string) {}
+  },
   workspace: mockWorkspace,
   window: mockWindow,
   env: mockEnv,

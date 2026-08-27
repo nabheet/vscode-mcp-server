@@ -40,12 +40,13 @@ VS Code Extension (onStartupFinished)
        └─ tools/
             ├─ commands.ts     — Execute any VS Code command, list commands, get code actions
             ├─ navigation.ts   — Open files, line/column jump, select lines, explorer reveal, close editors
-            ├─ workspace.ts    — Read/write/create/delete files, glob search, workspace folders
-            ├─ debug.ts        — Start/stop debugging, breakpoints (add/remove/list), step/continue,
-            │                    stack trace, variables, frame-scoped evaluate
-            ├─ terminal.ts     — Execute commands in integrated terminal, capture output (30s timeout)
-            └─ lsp.ts          — Diagnostics (200-line cap), hover, references, definitions, symbols,
-                                 completions, code actions, call hierarchy, rename
+├─ workspace.ts    — Read/write/create/delete files, glob search, workspace folder CRUD
+             ├─ debug.ts        — Start/stop debugging, breakpoints (add/remove/list), step/continue,
+             │                    stack trace, variables, frame-scoped evaluate
+             ├─ terminal.ts     — Execute commands in integrated terminal, capture output (30s timeout)
+             ├─ search.ts       — Full-text content search across workspace folders (grep)
+             └─ lsp.ts          — Diagnostics (200-line cap), hover, references, definitions, symbols,
+                                  completions, code actions, call hierarchy, rename
   └─ src/utils/
        ├─ types.ts             — MCP method constants, type definitions
        └─ path.ts              — Workspace-root-aware path resolution
@@ -72,6 +73,12 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
+| `add_workspace_folder` | workspace | Add a folder to the workspace (multi-root) |
+| `update_workspace_folder` | workspace | Rename and/or change the path of a workspace folder (multi-root) |
+| `remove_workspace_folder` | workspace | Remove a folder from the workspace (multi-root) |
+| `search_files` | search | Grep file contents across the workspace (regex, case sensitivity, globs, context lines) |
+| `list_logs` | logs | List VS Code log sessions and files |
+| `read_log` | logs | Tail a VS Code log file (with optional grep filter) |
 | `start_debugging` | debug | Start a debug session from a launch config (`launch.json` or workspace file) |
 | `stop_debugging` | debug | Stop the active debug session |
 | `step_over` | debug | Step over current line |
@@ -326,16 +333,18 @@ The old MCP SSE transport (`GET /mcp` → SSE stream → `endpoint` event → `P
 
 This server supports **both** transports transparently — no configuration change needed. Just use `POST /mcp` as the endpoint and the server handles everything synchronously.
 
-### Example: tool list (42 tools)
+### Example: tool list (48 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
 | Category | Tools |
 |----------|-------|
 | **Editor** | `open_file`, `open_file_at_line`, `open_file_at_position`, `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`, `close_all_editors` |
-| **Workspace** | `read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `get_workspace_folders` |
+| **Workspace** | `read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `get_workspace_folders`, `add_workspace_folder`, `update_workspace_folder`, `remove_workspace_folder` |
+| **Search** | `search_files` |
 | **Debug** | `start_debugging`, `stop_debugging`, `step_over`, `step_into`, `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`, `list_breakpoints`, `get_debug_variables`, `get_stack_trace`, `evaluate_in_debug_console` |
 | **Terminal** | `execute_in_terminal`, `get_terminal_output` |
+| **Logs** | `list_logs`, `read_log` |
 | **LSP** | `find_references`, `go_to_definition`, `go_to_type_definition`, `go_to_implementation`, `get_hover`, `get_diagnostics`, `get_document_symbols`, `get_workspace_symbols`, `get_call_hierarchy`, `rename_symbol`, `get_completions`, `get_code_actions` |
 | **Commands** | `execute_command`, `list_commands` |
 
