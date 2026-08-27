@@ -84,6 +84,46 @@ export function registerWorkspaceTools(server: McpServer): void {
 
   server.registerTool(
     defineTool(
+      'read_files',
+      'Read the contents of multiple files in one call. Each result is prefixed with a "=== <path> ===" marker. Missing/unreadable files are reported inline without aborting the batch.',
+      {
+        type: 'object',
+        properties: {
+          paths: {
+            type: 'array',
+            items: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+            description: 'File paths to read (absolute or relative to workspace root)',
+          },
+          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+        },
+        required: ['paths'],
+      },
+      async (args) => {
+        const paths: string[] = Array.isArray(args.paths) ? args.paths.map(String) : [];
+        if (paths.length === 0) {
+          return { content: [{ type: 'text', text: 'No paths provided' }], isError: true };
+        }
+        const folderName = args.workspaceFolder ? String(args.workspaceFolder) : undefined;
+        const parts: string[] = [];
+        let failures = 0;
+        for (const p of paths) {
+          try {
+            const uri = resolvePath(p, folderName);
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            const text = Buffer.from(bytes).toString('utf-8');
+            parts.push(`=== ${uri.fsPath} ===\n${text}`);
+          } catch (err) {
+            failures++;
+            parts.push(`=== ${p} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`);
+          }
+        }
+        return { content: [{ type: 'text', text: parts.join('\n\n') }], isError: failures > 0 };
+      },
+    ),
+  );
+
+  server.registerTool(
+    defineTool(
       'write_file',
       'Write content to a file (creates or overwrites).',
       {

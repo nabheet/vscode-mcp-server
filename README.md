@@ -69,6 +69,7 @@ VS Code Extension (onStartupFinished)
 | `close_all_editors` | navigation | Close all editors |
 | `list_files` | workspace | List files by glob pattern |
 | `read_file` | workspace | Read file content |
+| `read_files` | workspace | Read multiple files in one call (batch, per-file errors inline) |
 | `write_file` | workspace | Write content to a file (creates or overwrites) |
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
@@ -333,14 +334,14 @@ The old MCP SSE transport (`GET /mcp` → SSE stream → `endpoint` event → `P
 
 This server supports **both** transports transparently — no configuration change needed. Just use `POST /mcp` as the endpoint and the server handles everything synchronously.
 
-### Example: tool list (48 tools)
+### Example: tool list (49 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
 | Category | Tools |
 |----------|-------|
 | **Editor** | `open_file`, `open_file_at_line`, `open_file_at_position`, `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`, `close_all_editors` |
-| **Workspace** | `read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `get_workspace_folders`, `add_workspace_folder`, `update_workspace_folder`, `remove_workspace_folder` |
+| **Workspace** | `read_file`, `read_files`, `write_file`, `create_file`, `delete_file`, `list_files`, `get_workspace_folders`, `add_workspace_folder`, `update_workspace_folder`, `remove_workspace_folder` |
 | **Search** | `search_files` |
 | **Debug** | `start_debugging`, `stop_debugging`, `step_over`, `step_into`, `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`, `list_breakpoints`, `get_debug_variables`, `get_stack_trace`, `evaluate_in_debug_console` |
 | **Terminal** | `execute_in_terminal`, `get_terminal_output` |
@@ -477,7 +478,7 @@ See `RELEASE.md` for details.
 
 ## Notes
 
-- Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
+- Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `read_files`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
 - Debug tools require an active debug configuration — either in a folder's `.vscode/launch.json` or in the workspace file (`*.code-workspace`). `start_debugging` checks both, preferring folder-level configs
 - Terminal tools create integrated terminals in VS Code; output capture has a 30-second timeout to prevent resource leaks
 - LSP tools query the active language server; diagnostics are capped at 200 lines with `... and N more` suffix

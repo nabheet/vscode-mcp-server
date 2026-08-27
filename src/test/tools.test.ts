@@ -429,6 +429,73 @@ describe('handler behavior', () => {
     expect(vscode.workspace.updateWorkspaceFolders).not.toHaveBeenCalled();
   });
 
+  // ── read_files (batch) ───────────────────────────────────────────────
+
+  it('read_files reads multiple files with === path === markers', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    (vscode.workspace as any).fs.readFile = vi.fn().mockImplementation((uri: any) => {
+      if (uri.fsPath === '/ws/frontend/a.ts') return Promise.resolve(Buffer.from('const a = 1;'));
+      if (uri.fsPath === '/ws/frontend/b.ts') return Promise.resolve(Buffer.from('const b = 2;'));
+      return Promise.reject(new Error('ENOENT'));
+    });
+    const h = handlers.get('read_files')!;
+    const res = await h({ paths: ['a.ts', 'b.ts'] });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('=== /ws/frontend/a.ts ===\nconst a = 1;');
+    expect(res.content[0].text).toContain('=== /ws/frontend/b.ts ===\nconst b = 2;');
+  });
+
+  it('read_files reports per-file errors inline without aborting the batch', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    (vscode.workspace as any).fs.readFile = vi.fn().mockImplementation((uri: any) => {
+      if (uri.fsPath === '/ws/frontend/ok.ts') return Promise.resolve(Buffer.from('ok'));
+      return Promise.reject(new Error('ENOENT'));
+    });
+    const h = handlers.get('read_files')!;
+    const res = await h({ paths: ['ok.ts', 'missing.ts'] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('=== /ws/frontend/ok.ts ===\nok');
+    expect(res.content[0].text).toContain('=== missing.ts ===\n[error:');
+    expect(res.content[0].text).toContain('ENOENT');
+  });
+
+  it('read_files resolves relative paths against the named workspaceFolder', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+      { name: 'backend', uri: vscode.Uri.file('/ws/backend') },
+    ];
+    (vscode.workspace as any).fs.readFile = vi.fn().mockImplementation((uri: any) => {
+      if (uri.fsPath === '/ws/backend/util.ts') return Promise.resolve(Buffer.from('// shared util'));
+      return Promise.reject(new Error('ENOENT'));
+    });
+    const h = handlers.get('read_files')!;
+    const res = await h({ paths: ['util.ts'], workspaceFolder: 'backend' });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('=== /ws/backend/util.ts ===\n// shared util');
+  });
+
+  it('read_files rejects absolute paths outside the workspace', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    const h = handlers.get('read_files')!;
+    const res = await h({ paths: ['/etc/passwd'] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('outside the workspace');
+    expect(vscode.workspace.fs.readFile).not.toHaveBeenCalled();
+  });
+
+  it('read_files errors on empty paths array', async () => {
+    const h = handlers.get('read_files')!;
+    const res = await h({ paths: [] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('No paths');
+  });
+
   // ── Navigation (no-editor handlers) ──────────────────────────────────
 
   it('select_lines returns error with no active editor', async () => {

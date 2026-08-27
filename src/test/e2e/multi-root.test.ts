@@ -478,6 +478,35 @@ describe('multi-root workspace (E2E)', () => {
     expect(res.result.content[0].text).toContain('// backend code');
   });
 
+  // ── read_files (batch) ───────────────────────────────────────────────
+
+  it('read_files reads files across folders in one call with === markers', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'read_files',
+      arguments: {
+        paths: [path.join(tmpDir!, 'frontend/src/index.ts'), path.join(tmpDir!, 'backend/src/index.ts')],
+      },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('=== ');
+    expect(text).toContain(`${tmpDir}/frontend/src/index.ts ===\n// frontend code`);
+    expect(text).toContain(`${tmpDir}/backend/src/index.ts ===\n// backend code`);
+  });
+
+  it('read_files reports missing files inline without aborting the batch', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'read_files',
+      arguments: { paths: ['src/index.ts', 'src/nope.ts'], workspaceFolder: 'frontend' },
+    });
+    expect(res.result.isError).toBe(true);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('frontend/src/index.ts ===\n// frontend code');
+    expect(text).toContain('src/nope.ts ===\n[error:');
+  });
+
   // ── search_files (grep) ──────────────────────────────────────────────
 
   it('search_files finds literal text with file:line:col', async () => {
