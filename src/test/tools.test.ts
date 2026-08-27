@@ -314,6 +314,116 @@ describe('handler behavior', () => {
     expect(res.content[0].text).toMatch(/no workspace folders|none/i);
   });
 
+  it('add_workspace_folder appends a folder to the workspace', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+      { name: 'backend', uri: vscode.Uri.file('/ws/backend') },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/ws/test.code-workspace' } };
+    (vscode.workspace.updateWorkspaceFolders as any).mockReturnValue(true);
+
+    const h = handlers.get('add_workspace_folder')!;
+    const res = await h({ path: '/elsewhere/services' });
+
+    expect(vscode.workspace.updateWorkspaceFolders).toHaveBeenCalledTimes(1);
+    expect(vscode.workspace.updateWorkspaceFolders).toHaveBeenCalledWith(2, 0, {
+      uri: expect.objectContaining({ fsPath: '/elsewhere/services' }),
+      name: 'services',
+    });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("Added workspace folder 'services'");
+  });
+
+  it('add_workspace_folder rejects a name collision', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    const h = handlers.get('add_workspace_folder')!;
+    const res = await h({ path: '/elsewhere/thing', name: 'frontend' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('already exists');
+    expect(vscode.workspace.updateWorkspaceFolders).not.toHaveBeenCalled();
+  });
+
+  it('add_workspace_folder reports failure when the API rejects (single-folder workspace)', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    (vscode.workspace.updateWorkspaceFolders as any).mockReturnValue(false);
+
+    const h = handlers.get('add_workspace_folder')!;
+    const res = await h({ path: '/elsewhere/thing' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/multi-root|failed/i);
+  });
+
+  it('update_workspace_folder renames and moves a folder', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+      { name: 'backend', uri: vscode.Uri.file('/ws/backend') },
+    ];
+    (vscode.workspace.updateWorkspaceFolders as any).mockReturnValue(true);
+
+    const h = handlers.get('update_workspace_folder')!;
+    const res = await h({ name: 'backend', path: '/elsewhere/api', newName: 'api' });
+
+    expect(vscode.workspace.updateWorkspaceFolders).toHaveBeenCalledTimes(1);
+    expect(vscode.workspace.updateWorkspaceFolders).toHaveBeenCalledWith(1, 1, {
+      uri: expect.objectContaining({ fsPath: '/elsewhere/api' }),
+      name: 'api',
+    });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("Updated workspace folder 'backend' → 'api'");
+  });
+
+  it('update_workspace_folder rejects an unknown folder name', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    const h = handlers.get('update_workspace_folder')!;
+    const res = await h({ name: 'nope', path: '/x' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/not found/i);
+    expect(vscode.workspace.updateWorkspaceFolders).not.toHaveBeenCalled();
+  });
+
+  it('update_workspace_folder requires path or newName', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    const h = handlers.get('update_workspace_folder')!;
+    const res = await h({ name: 'frontend' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/path.*newName|newName.*path/i);
+  });
+
+  it('remove_workspace_folder removes by name', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+      { name: 'backend', uri: vscode.Uri.file('/ws/backend') },
+    ];
+    (vscode.workspace.updateWorkspaceFolders as any).mockReturnValue(true);
+
+    const h = handlers.get('remove_workspace_folder')!;
+    const res = await h({ name: 'backend' });
+
+    expect(vscode.workspace.updateWorkspaceFolders).toHaveBeenCalledTimes(1);
+    expect(vscode.workspace.updateWorkspaceFolders).toHaveBeenCalledWith(1, 1);
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("Removed workspace folder 'backend'");
+  });
+
+  it('remove_workspace_folder rejects an unknown folder name', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'frontend', uri: vscode.Uri.file('/ws/frontend') },
+    ];
+    const h = handlers.get('remove_workspace_folder')!;
+    const res = await h({ name: 'nope' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/not found/i);
+    expect(vscode.workspace.updateWorkspaceFolders).not.toHaveBeenCalled();
+  });
+
   // ── Navigation (no-editor handlers) ──────────────────────────────────
 
   it('select_lines returns error with no active editor', async () => {
@@ -434,6 +544,40 @@ describe('handler behavior', () => {
     const res = await h({ path: 'src/main.ts', line: 10, workspaceFolder: 'bogus' });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/failed|not found/i);
+  });
+
+  it('add_breakpoint allows absolute paths outside the workspace', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    const h = handlers.get('add_breakpoint')!;
+    const res = await h({ path: '/Users/me/elsewhere/lib.js', line: 3 });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('elsewhere/lib.js');
+    expect((vscode.debug as any).breakpoints.length).toBe(1);
+  });
+
+  it('remove_breakpoint removes a breakpoint outside the workspace', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    const addH = handlers.get('add_breakpoint')!;
+    await addH({ path: '/Users/me/elsewhere/lib.js', line: 3 });
+    const h = handlers.get('remove_breakpoint')!;
+    const res = await h({ path: '/Users/me/elsewhere/lib.js', line: 3 });
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('elsewhere/lib.js');
+    expect((vscode.debug as any).breakpoints.length).toBe(0);
+  });
+
+  it('add_breakpoint still rejects relative paths from outside the workspace', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'root', uri: { fsPath: '/workspace' } },
+    ];
+    const h = handlers.get('add_breakpoint')!;
+    const res = await h({ path: '../escape.js', line: 3 });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/outside the workspace/i);
   });
 
   it('start_debugging starts a folder-scoped config from launch.json', async () => {
@@ -708,5 +852,45 @@ describe('handler behavior', () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/failed to start/i);
     expect(res.content[0].text).toContain('Ghost');
+  });
+
+  it('start_debugging expands a compound config from a folder launch.json', async () => {
+    (vscode.workspace as any).workspaceFolders = [
+      { name: 'backend', uri: vscode.Uri.file('/ws/backend') },
+    ];
+    (vscode.workspace as any).workspaceFile = { uri: { scheme: 'file', fsPath: '/ws/test.code-workspace' } };
+    mockLaunchSources(
+      JSON.stringify({
+        version: '0.2.0',
+        configurations: [
+          { name: 'Worker', type: 'node', request: 'launch', program: '/ws/backend/worker.js' },
+          { name: 'API', type: 'node', request: 'launch', program: '/ws/backend/api.js' },
+        ],
+        compounds: [
+          { name: 'Stack', configurations: ['Worker', 'API'] },
+        ],
+      }),
+      undefined,
+    );
+    // Each compound member starts with the declaring folder + config object —
+    // no name-based resolution (unreliable in VS Code 1.133+)
+    (vscode.debug.startDebugging as any).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+
+    const h = handlers.get('start_debugging')!;
+    const res = await h({ configName: 'Stack' });
+
+    expect(vscode.debug.startDebugging).toHaveBeenCalledTimes(2);
+    expect(vscode.debug.startDebugging).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ name: 'backend' }),
+      expect.objectContaining({ name: 'Worker', type: 'node', request: 'launch' }),
+    );
+    expect(vscode.debug.startDebugging).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ name: 'backend' }),
+      expect.objectContaining({ name: 'API', type: 'node', request: 'launch' }),
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain('Started debugging');
   });
 });

@@ -122,6 +122,60 @@ function hasLaunchEntry(section: WorkspaceLaunchSection | undefined, name: strin
   );
 }
 
+/**
+ * Launch every constituent config of a compound in sequence, passing each
+ * config OBJECT to startDebugging. Compounds are named entries, not
+ * DebugConfiguration objects, so they cannot be passed to startDebugging
+ * directly — and name-based resolution is unreliable in VS Code 1.133+.
+ *
+ * @param compound - The compound to expand.
+ * @param configs - Configs from the same scope as the compound (its
+ *                  constituents live in the same launch.json / workspace file).
+ * @param folder - Workspace folder to start each config in (may be undefined
+ *                 for workspace-file scope, where VS Code resolves the root).
+ * @param fallbackFolder - Optional second folder to retry a failed start
+ *                         against (used by the workspace-file path).
+ * @param isAborted - Budget callback; stops issuing new launches when true.
+ */
+async function launchCompound(
+  compound: WorkspaceLaunchCompound,
+  configs: vscode.DebugConfiguration[],
+  folder: vscode.WorkspaceFolder | undefined,
+  fallbackFolder: vscode.WorkspaceFolder | undefined,
+  isAborted: () => boolean,
+): Promise<{ started: string[]; failed: string[] }> {
+  const configByName = new Map(configs.map((c) => [c.name, c]));
+  const started: string[] = [];
+  const failed: string[] = [];
+  for (const subName of compound.configurations) {
+    if (isAborted()) {
+      failed.push(`${subName} (launch timed out)`);
+      break;
+    }
+    const subConfig = configByName.get(subName);
+    if (!subConfig) {
+      failed.push(`${subName} (not found)`);
+      continue;
+    }
+    let ok = false;
+    try {
+      ok = await vscode.debug.startDebugging(folder, subConfig);
+    } catch {
+      ok = false;
+    }
+    if (!ok && fallbackFolder && fallbackFolder !== folder) {
+      try {
+        ok = await vscode.debug.startDebugging(fallbackFolder, subConfig);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) started.push(subName);
+    else failed.push(subName);
+  }
+  return { started, failed };
+}
+
 export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
@@ -198,9 +252,22 @@ export function registerDebugTools(server: McpServer): void {
                     if (cfg) {
                       success = await vscode.debug.startDebugging(tf, cfg as vscode.DebugConfiguration);
                     } else {
-                      // Folder-level compound: not a DebugConfiguration
-                      // object, so fall back to name-based resolution.
-                      success = await vscode.debug.startDebugging(tf, configName);
+                      // Folder-level compound: expand it — its constituents live
+                      // in THIS folder's launch.json. Name-based resolution
+                      // (startDebugging(tf, name)) is unreliable in VS Code
+                      // 1.133+, so pass each config object instead.
+                      const compound = (fs.compounds ?? []).find((c) => c.name === configName);
+                      if (compound) {
+                        const { started, failed } = await launchCompound(
+                          compound,
+                          fs.configurations ?? [],
+                          tf,
+                          undefined,
+                          isAborted,
+                        );
+                        success = failed.length === 0 && started.length > 0;
+                        detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
+                      }
                     }
                   } catch (err) {
                     success = false;
@@ -220,38 +287,16 @@ export function registerDebugTools(server: McpServer): void {
 
                   const compound = compounds.find((c) => c.name === configName);
                   if (compound) {
-                    // Compound: start every constituent config in sequence. Compounds
-                    // are named launch entries, not DebugConfiguration objects, so
-                    // they cannot be passed to startDebugging directly — expand here.
-                    const started: string[] = [];
-                    const failed: string[] = [];
-                    for (const subName of compound.configurations) {
-                      if (isAborted()) {
-                        failed.push(`${subName} (launch timed out)`);
-                        break;
-                      }
-                      const subConfig = configByName.get(subName);
-                      if (!subConfig) {
-                        failed.push(`${subName} (not found in workspace file)`);
-                        continue;
-                      }
-                      let ok = false;
-                      try {
-                        ok = await vscode.debug.startDebugging(undefined, subConfig);
-                      } catch {
-                        ok = false;
-                      }
-                      const primaryFolder = targetFolders[0];
-                      if (!ok && primaryFolder) {
-                        try {
-                          ok = await vscode.debug.startDebugging(primaryFolder, subConfig);
-                        } catch {
-                          ok = false;
-                        }
-                      }
-                      if (ok) started.push(subName);
-                      else failed.push(subName);
-                    }
+                    // Compound: expand via the shared helper. Start each
+                    // constituent with no folder (VS Code picks the root), then
+                    // retry against the first target folder if a start fails.
+                    const { started, failed } = await launchCompound(
+                      compound,
+                      configs,
+                      undefined,
+                      targetFolders[0],
+                      isAborted,
+                    );
                     success = failed.length === 0 && started.length > 0;
                     detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
                   } else {
@@ -366,11 +411,11 @@ export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'add_breakpoint',
-      'Add a breakpoint at a file and line.',
+      'Add a breakpoint at a file and line. Absolute paths may point outside the workspace (the debug adapter decides whether the file is debuggable).',
       {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          path: { type: 'string', description: 'File path (absolute — any location; or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           condition: { type: 'string', description: 'Optional breakpoint condition expression (e.g. "x > 5")' },
           hitCondition: { type: 'string', description: 'Optional hit count condition (e.g. "5" for every 5th hit)' },
@@ -381,7 +426,7 @@ export function registerDebugTools(server: McpServer): void {
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
         try {
-          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined, true);
           const cond = args.condition ? String(args.condition) : undefined;
           const hitCond = args.hitCondition ? String(args.hitCondition) : undefined;
           const loc = new vscode.Location(uri, new vscode.Position(line, 0));
@@ -398,11 +443,11 @@ export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'remove_breakpoint',
-      'Remove a breakpoint at a file and line.',
+      'Remove a breakpoint at a file and line. Absolute paths may point outside the workspace.',
       {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          path: { type: 'string', description: 'File path (absolute — any location; or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
@@ -411,7 +456,7 @@ export function registerDebugTools(server: McpServer): void {
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
         try {
-          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined, true);
           const toRemove = vscode.debug.breakpoints.filter((bp) => {
             if (bp instanceof vscode.SourceBreakpoint) {
               const loc = bp.location;

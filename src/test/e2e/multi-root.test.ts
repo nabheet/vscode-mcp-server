@@ -273,6 +273,10 @@ describe('multi-root workspace (E2E)', () => {
         "version": "0.2.0",
         "configurations": [
           { "name": "Folder Debug", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))} },
+          { "name": "Folder Debug 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))} },
+        ],
+        "compounds": [
+          { "name": "Folder Stack", "configurations": ["Folder Debug", "Folder Debug 2"] },
         ],
       }`,
     );
@@ -406,6 +410,60 @@ describe('multi-root workspace (E2E)', () => {
     const text: string = res.result.content[0].text;
     expect(text).toContain('frontend:');
     expect(text).toContain('backend:');
+  });
+
+  // ── Workspace folder mutation (add / update / remove) ────────────────
+  // These run against the live multi-root window opened from test.code-workspace,
+  // so vscode.workspace.updateWorkspaceFolders applies immediately.
+
+  async function pollFolders(want: string[], notWant: string[] = []): Promise<string> {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const res = await mcpRequest(port, 'tools/call', {
+        name: 'get_workspace_folders',
+        arguments: {},
+      });
+      const text: string = res.result.content[0].text;
+      if (want.every((w) => text.includes(w)) && notWant.every((n) => !text.includes(n))) return text;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error(`Folder state not reached: want=${want.join(',')} notWant=${notWant.join(',')}`);
+  }
+
+  it('add_workspace_folder appends a folder (relative path resolves against the workspace file)', async () => {
+    if (!ENABLED) return;
+    fs.mkdirSync(path.join(tmpDir!, 'data'), { recursive: true });
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'add_workspace_folder',
+      arguments: { path: 'data' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text).toContain("Added workspace folder 'data'");
+    const list = await pollFolders(['data:']);
+    expect(list).toContain('frontend:');
+    expect(list).toContain('backend:');
+  });
+
+  it('update_workspace_folder renames an existing folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'update_workspace_folder',
+      arguments: { name: 'data', newName: 'data2' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    expect(res.result.content[0].text).toContain("Updated workspace folder 'data' → 'data2'");
+    await pollFolders(['data2:'], ['data:']);
+  });
+
+  it('remove_workspace_folder removes the added folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'remove_workspace_folder',
+      arguments: { name: 'data2' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    expect(res.result.content[0].text).toContain("Removed workspace folder 'data2'");
+    await pollFolders(['frontend:', 'backend:'], ['data']);
   });
 
   // ── read_file with workspaceFolder ───────────────────────────────────
@@ -945,6 +1003,28 @@ describe('multi-root workspace (E2E)', () => {
       arguments: {},
     });
     expect(stop.result.isError).toBe(false);
+  });
+
+  it('start_debugging expands a compound declared in a folder launch.json', async () => {
+    if (!ENABLED) return;
+
+    // 'Folder Stack' is a compound in backend/.vscode/launch.json (not the
+    // workspace file). Compounds are named entries, not DebugConfiguration
+    // objects, and name-based resolution is unreliable in VS Code 1.133+ —
+    // the tool must expand the compound and pass each member config object.
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Stack', folder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
   });
 
   it('start_debugging survives a launch slower than the generic 30s tool timeout (per-tool budget)', async () => {

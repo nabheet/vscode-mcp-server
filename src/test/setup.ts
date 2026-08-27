@@ -19,6 +19,11 @@ const mockWorkspace = {
   workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
   workspaceFile: undefined as { uri: { scheme: string; fsPath: string } } | undefined,
   fs: { readFile: vi.fn() },
+  updateWorkspaceFolders: vi.fn(),
+  onDidChangeWorkspaceFolders: vi.fn().mockImplementation((cb: () => void) => {
+    cb();
+    return { dispose: vi.fn() };
+  }),
   getConfiguration: () => ({
     get: <T>(_: string, defaultValue?: T) => defaultValue,
   }),
