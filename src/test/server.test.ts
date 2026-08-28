@@ -408,6 +408,39 @@ describe('McpServer', () => {
     neverResolve?.('cleanup');
   });
 
+  // ── Per-tool timeout override ─────────────────────────────────────
+
+  it('uses per-tool timeoutMs override instead of the default 30s deadline', async () => {
+    server = new McpServer({ port, host: '127.0.0.1' });
+    let neverResolve: ((v: unknown) => void) | undefined;
+    server.registerTool({
+      name: 'slow-tool',
+      description: 'Never finishes, but declares a short per-tool timeout',
+      inputSchema: { type: 'object', properties: {} },
+      timeoutMs: 200,
+      handler: async () => {
+        await new Promise((r) => { neverResolve = r; });
+        return { content: [{ type: 'text', text: 'done' }] };
+      },
+    });
+    await server.start();
+
+    const started = Date.now();
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'slow-tool', arguments: {} },
+    });
+    const elapsed = Date.now() - started;
+
+    // The 200ms per-tool deadline fires — not the 30s default
+    expect(elapsed).toBeLessThan(5000);
+    expect(res.status).toBe(500);
+    expect((res.body as any).error?.message).toContain('timed out after 200ms');
+
+    // Clean up the dangling promise
+    neverResolve?.('cleanup');
+  });
+
   // ── Auth Edge Cases ─────────────────────────────────────────────────
 
   it('rejects malformed Authorization header', async () => {

@@ -8,6 +8,8 @@ import { registerWorkspaceTools } from './workspace';
 import { registerLspTools } from './lsp';
 import { registerDebugTools } from './debug';
 import { registerTerminalTools } from './terminal';
+import { registerLogsTools } from './logs';
+import { registerSearchTools } from './search';
 
 export function registerAllTools(server: McpServer, context: vscode.ExtensionContext): void {
   registerCommandsTools(server);
@@ -16,6 +18,8 @@ export function registerAllTools(server: McpServer, context: vscode.ExtensionCon
   registerLspTools(server);
   registerDebugTools(server);
   registerTerminalTools(server, context);
+  registerLogsTools(server, context);
+  registerSearchTools(server);
 }
 
 export function defineTool(
@@ -23,6 +27,7 @@ export function defineTool(
   description: string,
   inputSchema: Record<string, unknown>,
   handler: ToolDefinition['handler'],
+  timeoutMs?: number,
 ): ToolDefinition {
-  return { name, description, inputSchema, handler };
+  return { name, description, inputSchema, handler, ...(timeoutMs !== undefined ? { timeoutMs } : {}) };
 }

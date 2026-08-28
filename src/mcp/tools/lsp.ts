@@ -1,6 +1,21 @@
 import * as vscode from 'vscode';
 import { McpServer } from '../server';
 import { defineTool } from './index';
+import { withTimeout } from '../../utils/timeout';
+
+/** LSP provider calls go to the language server — slow or hung servers never
+ *  answer. Same protection as DAP: bound every call so the MCP server never
+ *  waits on a dead language server. */
+const LSP_TIMEOUT_MS = 10_000;
+
+/** Run an `vscode.execute*Provider` command with a hard deadline. */
+function lspCommand<T>(command: string, ...args: unknown[]): Promise<T> {
+  return withTimeout(
+    vscode.commands.executeCommand<T>(command, ...args),
+    LSP_TIMEOUT_MS,
+    `Language server request '${command}' timed out after ${LSP_TIMEOUT_MS / 1000}s (language server unresponsive)`,
+  );
+}
 
 /** Get active text editor or return a CallToolResult error */
 function requireEditor(): { editor: vscode.TextEditor; err: null } | { editor: null; err: { content: { type: 'text'; text: string }[]; isError: true } } {
@@ -37,7 +52,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const refs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeReferenceProvider', editor!.document.uri, getCursor(editor!));
+          const refs = await lspCommand<vscode.Location[]>('vscode.executeReferenceProvider', editor!.document.uri, getCursor(editor!));
           if (!refs || refs.length === 0) return { content: [{ type: 'text', text: 'No references found' }], isError: false };
           const lines = refs.map((r) => `${r.uri.fsPath}:${r.range.start.line + 1}:${r.range.start.character + 1}`);
           return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
@@ -60,7 +75,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const defs = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', editor!.document.uri, getCursor(editor!));
+          const defs = await lspCommand('vscode.executeDefinitionProvider', editor!.document.uri, getCursor(editor!));
           if (!defs || !Array.isArray(defs) || defs.length === 0) return { content: [{ type: 'text', text: 'No definition found' }], isError: false };
           const loc = normaliseLocation(defs[0]);
           await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(loc.uri), { selection: loc.range });
@@ -84,7 +99,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const defs = await vscode.commands.executeCommand('vscode.executeTypeDefinitionProvider', editor!.document.uri, getCursor(editor!));
+          const defs = await lspCommand('vscode.executeTypeDefinitionProvider', editor!.document.uri, getCursor(editor!));
           if (!defs || !Array.isArray(defs) || defs.length === 0) return { content: [{ type: 'text', text: 'No type definition found' }], isError: false };
           const loc = normaliseLocation(defs[0]);
           await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(loc.uri), { selection: loc.range });
@@ -108,7 +123,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const impls = await vscode.commands.executeCommand('vscode.executeImplementationProvider', editor!.document.uri, getCursor(editor!));
+          const impls = await lspCommand('vscode.executeImplementationProvider', editor!.document.uri, getCursor(editor!));
           if (!impls || !Array.isArray(impls) || impls.length === 0) return { content: [{ type: 'text', text: 'No implementation found' }], isError: false };
           const loc = normaliseLocation(impls[0]);
           await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(loc.uri), { selection: loc.range });
@@ -132,7 +147,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', editor!.document.uri, getCursor(editor!));
+          const hovers = await lspCommand<vscode.Hover[]>('vscode.executeHoverProvider', editor!.document.uri, getCursor(editor!));
           if (!hovers || hovers.length === 0) return { content: [{ type: 'text', text: 'No hover info' }], isError: false };
           const texts = hovers.flatMap((h) => h.contents.map((c) => (c instanceof vscode.MarkdownString ? c.value : String(c))));
           return { content: [{ type: 'text', text: texts.join('\n---\n') }], isError: false };
@@ -214,7 +229,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const symbols = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', editor!.document.uri);
+          const symbols = await lspCommand('vscode.executeDocumentSymbolProvider', editor!.document.uri);
           if (!symbols || (Array.isArray(symbols) && symbols.length === 0)) return { content: [{ type: 'text', text: 'No symbols found' }], isError: false };
           const lines: string[] = [];
           function flattenSymbol(s: any): void {
@@ -250,7 +265,7 @@ export function registerLspTools(server: McpServer): void {
       },
       async (args) => {
         try {
-          const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>('vscode.executeWorkspaceSymbolProvider', String(args.query));
+          const symbols = await lspCommand<vscode.SymbolInformation[]>('vscode.executeWorkspaceSymbolProvider', String(args.query));
           if (!symbols || symbols.length === 0) return { content: [{ type: 'text', text: 'No matching symbols' }], isError: false };
           const lines = symbols.map((s) => `${s.name} (${vscode.SymbolKind[s.kind]}) — ${s.location.uri.fsPath}:${s.location.range.start.line + 1}`);
           return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
@@ -278,7 +293,7 @@ export function registerLspTools(server: McpServer): void {
         const line = Math.max(0, Number(args.line) - 1);
         const lineRange = editor!.document.lineAt(line).range;
         try {
-          const actions = await vscode.commands.executeCommand<vscode.CodeAction[]>('vscode.executeCodeActionProvider', editor!.document.uri, lineRange);
+          const actions = await lspCommand<vscode.CodeAction[]>('vscode.executeCodeActionProvider', editor!.document.uri, lineRange);
           if (!actions || actions.length === 0) return { content: [{ type: 'text', text: 'No code actions available' }], isError: false };
           const lines = actions.map((a) => `${a.title}${a.kind ? ` (${a.kind.value})` : ''}`);
           return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
@@ -301,11 +316,11 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const items = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>('vscode.executePrepareCallHierarchy', editor!.document.uri, getCursor(editor!));
+          const items = await lspCommand<vscode.CallHierarchyItem[]>('vscode.executePrepareCallHierarchy', editor!.document.uri, getCursor(editor!));
           if (!items || items.length === 0) return { content: [{ type: 'text', text: 'No call hierarchy available' }], isError: false };
 
-          const incoming = await vscode.commands.executeCommand<vscode.CallHierarchyIncomingCall[]>('vscode.executeCallHierarchyIncomingCalls', items[0]);
-          const outgoing = await vscode.commands.executeCommand<vscode.CallHierarchyOutgoingCall[]>('vscode.executeCallHierarchyOutgoingCalls', items[0]);
+          const incoming = await lspCommand<vscode.CallHierarchyIncomingCall[]>('vscode.executeCallHierarchyIncomingCalls', items[0]);
+          const outgoing = await lspCommand<vscode.CallHierarchyOutgoingCall[]>('vscode.executeCallHierarchyOutgoingCalls', items[0]);
 
           const lines: string[] = [];
           lines.push(`Symbol: ${items[0].name}`);
@@ -340,7 +355,7 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         try {
-          const edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>('vscode.executeDocumentRenameProvider', editor!.document.uri, getCursor(editor!), String(args.newName));
+          const edit = await lspCommand<vscode.WorkspaceEdit>('vscode.executeDocumentRenameProvider', editor!.document.uri, getCursor(editor!), String(args.newName));
           if (!edit) return { content: [{ type: 'text', text: 'Rename provider returned no changes' }], isError: false };
           const applied = await vscode.workspace.applyEdit(edit);
           return { content: [{ type: 'text', text: applied ? `Renamed to '${args.newName}'` : 'Rename failed to apply' }], isError: !applied };
@@ -371,7 +386,7 @@ export function registerLspTools(server: McpServer): void {
         const maxResults = Number(args.maxResults) || 50;
         const pos = new vscode.Position(line, col);
         try {
-          const list = await vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', editor!.document.uri, pos);
+          const list = await lspCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', editor!.document.uri, pos);
           if (!list || !list.items || list.items.length === 0) return { content: [{ type: 'text', text: 'No completions available' }], isError: false };
           const items = list.items
             .sort((a, b) => (a.sortText || a.label.toString()).localeCompare(b.sortText || b.label.toString()))

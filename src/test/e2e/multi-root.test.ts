@@ -76,6 +76,21 @@ async function waitForServer(port: number, timeoutMs = 120000): Promise<void> {
   throw new Error(`MCP server did not start within ${timeoutMs}ms`);
 }
 
+// VS Code ignores Chromium's --headless flag, so local macOS runs pop a
+// window. CI runs under xvfb (headless) and is unaffected. Hiding requires
+// Accessibility permission — failures are swallowed.
+function hideVSCodeWindows(proc: ChildProcess, delayMs = 1500) {
+  if (process.platform !== 'darwin') return;
+  setTimeout(() => {
+    try {
+      execSync(
+        'osascript -e \'tell application "System Events" to set visible of (first process whose name is "Code") to false\'',
+        { stdio: 'ignore' },
+      );
+    } catch { /* no Accessibility permission — window stays visible */ }
+  }, delayMs);
+}
+
 /**
  * Resolve the VS Code CLI binary via `@vscode/test-electron` (downloads
  * VS Code to a cache, works on all platforms, no local install required).
@@ -86,11 +101,24 @@ async function resolveCodeCli(): Promise<{
   cmd: string;
   args: string[];
 }> {
-  const { downloadAndUnzipVSCode, resolveCliPathFromVSCodeExecutablePath } = await import(
-    '@vscode/test-electron'
-  );
+  const { downloadAndUnzipVSCode } = await import('@vscode/test-electron');
 
   const vscodePath = await downloadAndUnzipVSCode('stable');
+  if (process.platform === 'darwin') {
+    // Spawn the app binary directly. The `bin/code` wrapper (returned by
+    // resolveCliPathFromVSCodeExecutablePath) launches the app detached via
+    // LaunchServices: under vitest the app can die before writing logs and
+    // leaves orphaned processes. The binary stays attached as our child.
+    const appRoot = vscodePath.endsWith('.app')
+      ? vscodePath
+      : vscodePath.replace(/\/Contents\/MacOS\/.+$/, '');
+    const binary = path.join(appRoot, 'Contents', 'MacOS', 'Code');
+    if (fs.existsSync(binary)) return { cmd: binary, args: [] };
+    throw new Error(`VS Code binary not found under ${appRoot}`);
+  }
+  const { resolveCliPathFromVSCodeExecutablePath } = await import(
+    '@vscode/test-electron'
+  );
   const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
 
   if (!fs.existsSync(cliPath)) {
@@ -145,7 +173,7 @@ describe('multi-root workspace (E2E)', () => {
     port = await findFreePort();
 
     // Create temp workspace with two named folders
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-mcp-e2e-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mre-'));
     const folderA = path.join(tmpDir, 'frontend');
     const folderB = path.join(tmpDir, 'backend');
     fs.mkdirSync(path.join(folderA, 'src'), { recursive: true });
@@ -174,28 +202,91 @@ describe('multi-root workspace (E2E)', () => {
           "configurations": [
             { "name": "WorkspaceFile Debug", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))} },
             { "name": "WorkspaceFile Debug 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))} },
+            /* Slow Launch: preLaunchTask sleeps 33s, so FULL session
+               establishment legitimately exceeds the generic 30s tool
+               timeout (DEFAULT_TOOL_TIMEOUT_MS). start_debugging declares
+               its own 120s budget — this must succeed, not get cut off
+               mid-launch with a ghost handler still launching. */
+            { "name": "Slow Launch", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 33s" },
+            /* Slow Compound members: EACH config establishes in ~10s — no
+               single member is slow. But a compound awaits every member
+               sequentially inside ONE start_debugging call, so cumulative
+               establishment (~40s+) exceeds the generic 30s tool timeout.
+               This mirrors a real ai-gateway-style "Run All": individual
+               launches look fast, the compound total is what matters. */
+            { "name": "Slow Compound 1", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 10s" },
+            { "name": "Slow Compound 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))}, "preLaunchTask": "Sleep 10s" },
+            { "name": "Slow Compound 3", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))}, "preLaunchTask": "Sleep 10s" },
+            { "name": "Slow Compound 4", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))}, "preLaunchTask": "Sleep 10s" },
           ],
           "compounds": [
             { "name": "WorkspaceFile Compound", "configurations": ["WorkspaceFile Debug", "WorkspaceFile Debug 2"], "stopAll": true },
+            { "name": "Slow Compound", "configurations": ["Slow Compound 1", "Slow Compound 2", "Slow Compound 3", "Slow Compound 4"], "stopAll": true },
+          ],
+        },
+        /* Tasks for the Slow Launch / Slow Compound preLaunchTasks. Shell
+           tasks, non-background (isBackground defaults to false) — VS Code
+           waits for each to finish before its debug adapter starts, delaying
+           session establishment. */
+        "tasks": {
+          "version": "2.0.0",
+          "tasks": [
+            {
+              "label": "Sleep 33s",
+              "type": "shell",
+              "command": "sleep 33",
+              "presentation": { "reveal": "silent", "panel": "shared" },
+            },
+            {
+              "label": "Sleep 10s",
+              "type": "shell",
+              "command": "sleep 10",
+              "presentation": { "reveal": "silent", "panel": "shared" },
+            },
           ],
         },
       }`,
     );
 
     // Debug targets for the workspace-file launch configs (plain JS so the
-    // built-in Node debug adapter can run them)
+    // built-in Node debug adapter can run them). Long lifetime (60s) so
+    // sessions stay alive for the whole test — slow-launch tests take ~50s
+    // and need every member stoppable when they finish.
     fs.writeFileSync(
       path.join(folderB, 'app.js'),
-      '// e2e debug target\nsetTimeout(() => {}, 5000);\n',
+      '// e2e debug target\nsetTimeout(() => {}, 60000);\n',
     );
     fs.writeFileSync(
       path.join(folderB, 'app2.js'),
-      '// e2e debug target 2\nsetTimeout(() => {}, 5000);\n',
+      '// e2e debug target 2\nsetTimeout(() => {}, 60000);\n',
+    );
+
+    // Folder-level launch.json in the SECOND folder (backend). The default
+    // folder scope is the first folder (frontend) — a config declared only
+    // here must still be found when start_debugging is called WITHOUT a
+    // `folder` argument, proving every open folder's .vscode/launch.json is
+    // searched (not just the first folder's, and not just the workspace file).
+    fs.mkdirSync(path.join(folderB, '.vscode'), { recursive: true });
+    fs.writeFileSync(
+      path.join(folderB, '.vscode', 'launch.json'),
+      `{
+        "version": "0.2.0",
+        "configurations": [
+          { "name": "Folder Debug", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app.js'))} },
+          { "name": "Folder Debug 2", "type": "node", "request": "launch", "program": ${JSON.stringify(path.join(folderB, 'app2.js'))} },
+        ],
+        "compounds": [
+          { "name": "Folder Stack", "configurations": ["Folder Debug", "Folder Debug 2"] },
+        ],
+      }`,
     );
 
     // Set port via VS Code settings (env vars don't reliably propagate
-    // through VS Code's extension host process chain)
-    const vsCodeUserData = path.join(tmpDir, 'vscode-user-data');
+    // through VS Code's extension host process chain). Note: short names
+    // (`ud`, `mre-`) — VS Code's IPC socket under the user-data dir must stay
+    // under macOS's ~103-char Unix socket path limit (os.tmpdir() is already
+    // long: /var/folders/...).
+    const vsCodeUserData = path.join(tmpDir, 'ud');
     const userSettingsDir = path.join(vsCodeUserData, 'User');
     fs.mkdirSync(userSettingsDir, { recursive: true });
     fs.writeFileSync(
@@ -247,6 +338,12 @@ describe('multi-root workspace (E2E)', () => {
     };
 
     vsCodeProc = spawn(cliCmd, launchArgs, spawnOpts);
+
+    // VS Code ignores Chromium's --headless flag, so local macOS runs pop a
+    // window. Hide it via AppleScript — CI runs under xvfb and is unaffected.
+    // Requires Accessibility permission; failures are ignored (tests must
+    // never fail just because a window stayed visible).
+    hideVSCodeWindows(vsCodeProc);
 
     // Log VS Code output for debugging failures
     const logStream = fs.createWriteStream(logPath);
@@ -315,6 +412,60 @@ describe('multi-root workspace (E2E)', () => {
     expect(text).toContain('backend:');
   });
 
+  // ── Workspace folder mutation (add / update / remove) ────────────────
+  // These run against the live multi-root window opened from test.code-workspace,
+  // so vscode.workspace.updateWorkspaceFolders applies immediately.
+
+  async function pollFolders(want: string[], notWant: string[] = []): Promise<string> {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const res = await mcpRequest(port, 'tools/call', {
+        name: 'get_workspace_folders',
+        arguments: {},
+      });
+      const text: string = res.result.content[0].text;
+      if (want.every((w) => text.includes(w)) && notWant.every((n) => !text.includes(n))) return text;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error(`Folder state not reached: want=${want.join(',')} notWant=${notWant.join(',')}`);
+  }
+
+  it('add_workspace_folder appends a folder (relative path resolves against the workspace file)', async () => {
+    if (!ENABLED) return;
+    fs.mkdirSync(path.join(tmpDir!, 'data'), { recursive: true });
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'add_workspace_folder',
+      arguments: { path: 'data' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text).toContain("Added workspace folder 'data'");
+    const list = await pollFolders(['data:']);
+    expect(list).toContain('frontend:');
+    expect(list).toContain('backend:');
+  });
+
+  it('update_workspace_folder renames an existing folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'update_workspace_folder',
+      arguments: { name: 'data', newName: 'data2' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    expect(res.result.content[0].text).toContain("Updated workspace folder 'data' → 'data2'");
+    await pollFolders(['data2:'], ['data:']);
+  });
+
+  it('remove_workspace_folder removes the added folder', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'remove_workspace_folder',
+      arguments: { name: 'data2' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    expect(res.result.content[0].text).toContain("Removed workspace folder 'data2'");
+    await pollFolders(['frontend:', 'backend:'], ['data']);
+  });
+
   // ── read_file with workspaceFolder ───────────────────────────────────
 
   it('read_file with workspaceFolder resolves to the correct folder', async () => {
@@ -325,6 +476,84 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(res.result.isError).toBe(false);
     expect(res.result.content[0].text).toContain('// backend code');
+  });
+
+  // ── read_files (batch) ───────────────────────────────────────────────
+
+  it('read_files reads files across folders in one call with === markers', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'read_files',
+      arguments: {
+        paths: [path.join(tmpDir!, 'frontend/src/index.ts'), path.join(tmpDir!, 'backend/src/index.ts')],
+      },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('=== ');
+    expect(text).toContain(`${tmpDir}/frontend/src/index.ts ===\n// frontend code`);
+    expect(text).toContain(`${tmpDir}/backend/src/index.ts ===\n// backend code`);
+  });
+
+  it('read_files reports missing files inline without aborting the batch', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'read_files',
+      arguments: { paths: ['src/index.ts', 'src/nope.ts'], workspaceFolder: 'frontend' },
+    });
+    expect(res.result.isError).toBe(true);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('frontend/src/index.ts ===\n// frontend code');
+    expect(text).toContain('src/nope.ts ===\n[error:');
+  });
+
+  // ── search_files (grep) ──────────────────────────────────────────────
+
+  it('search_files finds literal text with file:line:col', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'frontend code' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('frontend/src/index.ts:1:');
+    expect(text).toContain('// frontend code');
+  });
+
+  it('search_files matches across folders and supports regex + case sensitivity', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'const [ab] =', useRegex: true },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('frontend/src/index.ts:2:');
+    expect(text).toContain('const a = 1;');
+    expect(text).toContain('backend/src/index.ts:2:');
+    expect(text).toContain('const b = 2;');
+
+    // Case-sensitive: uppercase query must NOT match lowercase source
+    const strict = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'FRONTEND', caseSensitive: true },
+    });
+    expect(strict.result.isError).toBe(false);
+    expect(strict.result.content[0].text).toContain('(no matches)');
+  });
+
+  it('search_files respects workspaceFolder scope and include globs', async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'search_files',
+      arguments: { query: 'backend', workspaceFolder: 'backend', include: '**/*.ts' },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('backend/src/index.ts:1:');
+    expect(text).toContain('backend/src/util.ts:1:');
+    expect(text).not.toContain('frontend');
   });
 
   it('read_file without workspaceFolder uses the first folder', async () => {
@@ -804,6 +1033,137 @@ describe('multi-root workspace (E2E)', () => {
     });
     expect(stop2.result.isError).toBe(false);
   });
+
+  it('start_debugging finds a config in a NON-first folder launch.json without a folder argument', async () => {
+    if (!ENABLED) return;
+
+    // 'Folder Debug' lives only in backend/.vscode/launch.json; the default
+    // folder scope is the FIRST folder (frontend). It must still resolve —
+    // folder-level launch configs in any open folder are searchable.
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Debug' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
+  });
+
+  it('start_debugging with an explicit folder argument narrows the search to that folder', async () => {
+    if (!ENABLED) return;
+
+    // 'Folder Debug' is declared in backend, NOT frontend. With
+    // folder: 'frontend', start_debugging must NOT find it — the folder
+    // argument is a hard scope, not a hint.
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Debug', folder: 'frontend' },
+    });
+    expect(res.result.isError).toBe(true);
+    expect((res.result.content[0].text as string)).toContain("Failed to start 'Folder Debug'");
+
+    // And with folder: 'backend' it must resolve.
+    const ok = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Debug', folder: 'backend' },
+    });
+    expect(ok.result.isError).toBe(false);
+    expect((ok.result.content[0].text as string)).toContain('Started debugging');
+
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+  });
+
+  it('start_debugging expands a compound declared in a folder launch.json', async () => {
+    if (!ENABLED) return;
+
+    // 'Folder Stack' is a compound in backend/.vscode/launch.json (not the
+    // workspace file). Compounds are named entries, not DebugConfiguration
+    // objects, and name-based resolution is unreliable in VS Code 1.133+ —
+    // the tool must expand the compound and pass each member config object.
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Folder Stack', folder: 'backend' },
+    });
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
+  });
+
+  it('start_debugging survives a launch slower than the generic 30s tool timeout (per-tool budget)', async () => {
+    if (!ENABLED) return;
+
+    // Slow Launch's preLaunchTask sleeps 33s, so full session establishment
+    // takes > 30s. The generic DEFAULT_TOOL_TIMEOUT_MS would cut this off
+    // mid-launch (and the abandoned handler would keep launching in the
+    // background); the per-tool 120s budget must let it complete normally.
+    const started = Date.now();
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Slow Launch' },
+    });
+    const elapsedMs = Date.now() - started;
+
+    // Prove the launch genuinely outlasted the old 30s default (sleep floor
+    // makes this deterministic) — otherwise this test passes vacuously.
+    expect(elapsedMs).toBeGreaterThan(30_000);
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text as string).toContain('Started debugging');
+
+    // Stop the slow session so later tests start clean.
+    const stop = await mcpRequest(port, 'tools/call', {
+      name: 'stop_debugging',
+      arguments: {},
+    });
+    expect(stop.result.isError).toBe(false);
+    expect((stop.result.content[0].text as string)).toContain('stopped');
+  }, 120000);
+
+  it('start_debugging completes a compound whose cumulative establishment exceeds the generic 30s tool timeout', async () => {
+    if (!ENABLED) return;
+
+    // 4 configs × ~10s preLaunchTask sleep ≈ 40s+ of cumulative session
+    // establishment. No single member is slow — but the compound awaits each
+    // member sequentially inside ONE tool call, so the total blows past the
+    // generic 30s DEFAULT_TOOL_TIMEOUT_MS (the ai-gateway "Run All" shape:
+    // individual launches look fast, the compound total is what matters).
+    // The per-tool 120s budget must let it finish with every member live.
+    const started = Date.now();
+    const res = await mcpRequest(port, 'tools/call', {
+      name: 'start_debugging',
+      arguments: { configName: 'Slow Compound' },
+    });
+    const elapsedMs = Date.now() - started;
+
+    expect(elapsedMs).toBeGreaterThan(30_000);
+    expect(res.result.isError).toBe(false);
+    expect((res.result.content[0].text as string)).toContain('Started debugging');
+
+    // All four members should be live: stopping succeeds once per session.
+    for (let i = 0; i < 4; i++) {
+      const stop = await mcpRequest(port, 'tools/call', {
+        name: 'stop_debugging',
+        arguments: {},
+      });
+      expect(stop.result.isError).toBe(false);
+      expect((stop.result.content[0].text as string)).toContain('stopped');
+    }
+  }, 120000);
 
   // ── Error cases ──────────────────────────────────────────────────────
 
