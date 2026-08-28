@@ -3,6 +3,55 @@ import { McpServer } from '../server';
 import { defineTool } from './index';
 import { resolvePath } from '../../utils/path';
 import { parseJsonc } from '../../utils/jsonc';
+import { withTimeout, withLaunchBudget } from '../../utils/timeout';
+
+/** DAP calls can hang indefinitely when the adapter is blocked (e.g. a slow
+ *  evaluate, mid-step). Bound every customRequest so a stuck adapter returns
+ *  a clear error instead of freezing the MCP server. */
+const DAP_TIMEOUT_MS = 10_000;
+
+/** start_debugging legitimately exceeds the generic 30s tool budget: a launch
+ *  resolves only after FULL session establishment, and a multiprocess compound
+ *  (e.g. litellm --reload with a debugpy worker per process) attaches parent +
+ *  every worker before that. Give the tool its own dispatch deadline via
+ *  defineTool's timeoutMs (so dispatch won't cut it at 30s) and run the launch
+ *  phase under a slightly smaller INTERNAL budget. The internal one fires
+ *  first, so the handler returns a clean error result and flips isAborted() to
+ *  stop issuing new launches for remaining compound members — the dispatch
+ *  deadline is only the backstop. */
+const START_DEBUG_TIMEOUT_MS = 120_000;
+const START_DEBUG_BUDGET_MS = START_DEBUG_TIMEOUT_MS - 5_000;
+
+/** get_debug_variables output caps — a deep object tree can serialize to
+ *  megabytes and saturate the MCP round trip. */
+const MAX_VARS_ROWS = 200;
+const MAX_VARS_BYTES = 200 * 1024;
+const EVAL_RESULT_MAX_CHARS = 100_000;
+
+/** Serialize a variables dump with caps. Returns text + a truncation note. */
+function truncateVariables(rows: unknown[]): { text: string; note: string } {
+  if (rows.length === 0) return { text: '[]', note: '' };
+  const limited = rows.slice(0, MAX_VARS_ROWS);
+  const text = JSON.stringify(limited, null, 2);
+  const notes: string[] = [];
+  if (rows.length > MAX_VARS_ROWS) {
+    notes.push(`${rows.length} total variables — showing first ${MAX_VARS_ROWS}`);
+  }
+  if (Buffer.byteLength(text, 'utf8') > MAX_VARS_BYTES) {
+    notes.push('output truncated at 200 KB');
+    return { text: text.slice(0, MAX_VARS_BYTES) + '\n…', note: notes.join('; ') };
+  }
+  return { text, note: notes.join('; ') };
+}
+
+/** Wrap a DebugSession customRequest with a hard deadline. */
+async function dapRequest<T>(session: vscode.DebugSession, command: string, args?: unknown): Promise<T> {
+  return withTimeout(
+    session.customRequest(command, args),
+    DAP_TIMEOUT_MS,
+    `Debugger request '${command}' timed out after ${DAP_TIMEOUT_MS / 1000}s (adapter unresponsive — is it paused on a slow operation?)`,
+  );
+}
 
 /**
  * A named compound launch entry. Compounds bundle several launch configs and
@@ -48,13 +97,17 @@ async function readWorkspaceFileLaunchSection(): Promise<WorkspaceLaunchSection 
  * Read the `launch` section from a folder's .vscode/launch.json. Returns
  * undefined when the folder has no launch.json or it cannot be parsed — the
  * folder then simply does not contribute any folder-scoped configs.
+ *
+ * NOTE: a folder's launch.json IS the section — it has no top-level `launch`
+ * key (that wrapper only exists in *.code-workspace files). Parsing it as
+ * `json.launch` (the workspace-file shape) silently yields undefined, which
+ * made every folder-scoped config invisible.
  */
 async function readFolderLaunchSection(folder: vscode.WorkspaceFolder): Promise<WorkspaceLaunchSection | undefined> {
   try {
     const uri = vscode.Uri.joinPath(folder.uri, '.vscode', 'launch.json');
     const buf = await vscode.workspace.fs.readFile(uri);
-    const json = parseJsonc<{ launch?: WorkspaceLaunchSection }>(Buffer.from(buf).toString('utf8'));
-    return json.launch;
+    return parseJsonc<WorkspaceLaunchSection>(Buffer.from(buf).toString('utf8'));
   } catch {
     return undefined;
   }
@@ -67,6 +120,60 @@ function hasLaunchEntry(section: WorkspaceLaunchSection | undefined, name: strin
     (section.configurations ?? []).some((c) => c.name === name) ||
     (section.compounds ?? []).some((c) => c.name === name)
   );
+}
+
+/**
+ * Launch every constituent config of a compound in sequence, passing each
+ * config OBJECT to startDebugging. Compounds are named entries, not
+ * DebugConfiguration objects, so they cannot be passed to startDebugging
+ * directly — and name-based resolution is unreliable in VS Code 1.133+.
+ *
+ * @param compound - The compound to expand.
+ * @param configs - Configs from the same scope as the compound (its
+ *                  constituents live in the same launch.json / workspace file).
+ * @param folder - Workspace folder to start each config in (may be undefined
+ *                 for workspace-file scope, where VS Code resolves the root).
+ * @param fallbackFolder - Optional second folder to retry a failed start
+ *                         against (used by the workspace-file path).
+ * @param isAborted - Budget callback; stops issuing new launches when true.
+ */
+async function launchCompound(
+  compound: WorkspaceLaunchCompound,
+  configs: vscode.DebugConfiguration[],
+  folder: vscode.WorkspaceFolder | undefined,
+  fallbackFolder: vscode.WorkspaceFolder | undefined,
+  isAborted: () => boolean,
+): Promise<{ started: string[]; failed: string[] }> {
+  const configByName = new Map(configs.map((c) => [c.name, c]));
+  const started: string[] = [];
+  const failed: string[] = [];
+  for (const subName of compound.configurations) {
+    if (isAborted()) {
+      failed.push(`${subName} (launch timed out)`);
+      break;
+    }
+    const subConfig = configByName.get(subName);
+    if (!subConfig) {
+      failed.push(`${subName} (not found)`);
+      continue;
+    }
+    let ok = false;
+    try {
+      ok = await vscode.debug.startDebugging(folder, subConfig);
+    } catch {
+      ok = false;
+    }
+    if (!ok && fallbackFolder && fallbackFolder !== folder) {
+      try {
+        ok = await vscode.debug.startDebugging(fallbackFolder, subConfig);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) started.push(subName);
+    else failed.push(subName);
+  }
+  return { started, failed };
 }
 
 export function registerDebugTools(server: McpServer): void {
@@ -83,13 +190,20 @@ export function registerDebugTools(server: McpServer): void {
         required: ['configName'],
       },
       async (args) => {
+        // Folder scope: a launch config can live in ANY workspace folder's
+        // .vscode/launch.json. With an explicit `folder` argument only that
+        // folder is searched; without one, every open folder is searched in
+        // order — a config in a non-first folder must still be found.
         const folders = vscode.workspace.workspaceFolders;
-        const folder = args.folder
-          ? folders?.find((f) => f.name === args.folder)
-          : folders?.[0];
-
-        if (args.folder && !folder) {
-          return { content: [{ type: 'text', text: `Workspace folder '${args.folder}' not found` }], isError: true };
+        let targetFolders: vscode.WorkspaceFolder[];
+        if (args.folder) {
+          const found = folders?.find((f) => f.name === args.folder);
+          if (!found) {
+            return { content: [{ type: 'text', text: `Workspace folder '${args.folder}' not found` }], isError: true };
+          }
+          targetFolders = [found];
+        } else {
+          targetFolders = [...(folders ?? [])];
         }
 
         const configName = String(args.configName);
@@ -102,89 +216,128 @@ export function registerDebugTools(server: McpServer): void {
           // error toasts ("launch.json does not exist for passed workspace
           // folder", "Configuration X is missing in launch.json") even when a
           // later attempt would succeed.
-          const [folderSection, wsSection] = await Promise.all([
-            folder ? readFolderLaunchSection(folder) : Promise.resolve(undefined),
+          const [folderSections, wsSection] = await Promise.all([
+            Promise.all(targetFolders.map((f) => readFolderLaunchSection(f))),
             readWorkspaceFileLaunchSection(),
           ]);
 
           let success = false;
           let detail = '';
+          let timedOut = false;
 
-          // 1) Folder scope — only when the folder's launch.json declares it.
-          //    VS Code resolves folder-level configs and compounds natively.
-          if (!success && folder && folderSection && hasLaunchEntry(folderSection, configName)) {
-            try {
-              success = await vscode.debug.startDebugging(folder, configName);
-            } catch {
-              success = false;
-            }
-          }
-
-          // 2) Workspace-file scope — only when the workspace file declares it.
-          //    VS Code 1.133+ cannot resolve workspace-file configs by name
-          //    (startDebugging(undefined, name) throws), so we read the file
-          //    and pass the config objects directly — the object path skips
-          //    name resolution.
-          if (!success && wsSection && hasLaunchEntry(wsSection, configName)) {
-            const configs = wsSection.configurations ?? [];
-            const compounds = wsSection.compounds ?? [];
-            const configByName = new Map(configs.map((c) => [c.name, c]));
-
-            const compound = compounds.find((c) => c.name === configName);
-            if (compound) {
-              // Compound: start every constituent config in sequence. Compounds
-              // are named launch entries, not DebugConfiguration objects, so
-              // they cannot be passed to startDebugging directly — expand here.
-              const started: string[] = [];
-              const failed: string[] = [];
-              for (const subName of compound.configurations) {
-                const subConfig = configByName.get(subName);
-                if (!subConfig) {
-                  failed.push(`${subName} (not found in workspace file)`);
-                  continue;
-                }
-                let ok = false;
-                try {
-                  ok = await vscode.debug.startDebugging(undefined, subConfig);
-                } catch {
-                  ok = false;
-                }
-                if (!ok && folder) {
+          // Run the whole launch phase under a budget. startDebugging resolves
+          // only after FULL session establishment, which for a heavy
+          // multiprocess compound (e.g. litellm --reload with debugpy attach
+          // per worker) can take well over the generic 30s tool timeout. The
+          // budget rejects the caller cleanly at ~115s and flips isAborted()
+          // so the loop below stops issuing NEW launches for remaining members
+          // instead of silently keeping the DAP busy in the background.
+          try {
+            await withLaunchBudget(
+              async (isAborted) => {
+                // 1) Folder scope — try every target folder whose launch.json
+                //    declares the config. Pass the parsed config OBJECT, not
+                //    just the name: VS Code 1.133+ name-based resolution is
+                //    unreliable ('launch.json does not exist for passed
+                //    workspace folder' even when the file exists), and the
+                //    object path also survives folder launch.json files that
+                //    were (re)written after the workspace opened. (Pre-scan
+                //    avoids doomed calls that fire error toasts.)
+                for (let i = 0; i < targetFolders.length && !success && !isAborted(); i++) {
+                  const tf = targetFolders[i];
+                  const fs = folderSections[i];
+                  if (!fs || !hasLaunchEntry(fs, configName)) continue;
+                  const cfg = (fs.configurations ?? []).find((c) => c.name === configName);
                   try {
-                    ok = await vscode.debug.startDebugging(folder, subConfig);
-                  } catch {
-                    ok = false;
-                  }
-                }
-                if (ok) started.push(subName);
-                else failed.push(subName);
-              }
-              success = failed.length === 0 && started.length > 0;
-              detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
-            } else {
-              const wsConfig = configByName.get(configName);
-              if (wsConfig) {
-                try {
-                  success = await vscode.debug.startDebugging(undefined, wsConfig);
-                } catch {
-                  success = false;
-                }
-                if (!success && folder) {
-                  try {
-                    success = await vscode.debug.startDebugging(folder, wsConfig);
-                  } catch {
+                    if (cfg) {
+                      success = await vscode.debug.startDebugging(tf, cfg as vscode.DebugConfiguration);
+                    } else {
+                      // Folder-level compound: expand it — its constituents live
+                      // in THIS folder's launch.json. Name-based resolution
+                      // (startDebugging(tf, name)) is unreliable in VS Code
+                      // 1.133+, so pass each config object instead.
+                      const compound = (fs.compounds ?? []).find((c) => c.name === configName);
+                      if (compound) {
+                        const { started, failed } = await launchCompound(
+                          compound,
+                          fs.configurations ?? [],
+                          tf,
+                          undefined,
+                          isAborted,
+                        );
+                        success = failed.length === 0 && started.length > 0;
+                        detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
+                      }
+                    }
+                  } catch (err) {
                     success = false;
+                    detail = detail || ` (${err instanceof Error ? err.message : String(err)})`;
                   }
                 }
-              }
+
+                // 2) Workspace-file scope — only when the workspace file declares it.
+                //    VS Code 1.133+ cannot resolve workspace-file configs by name
+                //    (startDebugging(undefined, name) throws), so we read the file
+                //    and pass the config objects directly — the object path skips
+                //    name resolution.
+                if (!success && wsSection && hasLaunchEntry(wsSection, configName) && !isAborted()) {
+                  const configs = wsSection.configurations ?? [];
+                  const compounds = wsSection.compounds ?? [];
+                  const configByName = new Map(configs.map((c) => [c.name, c]));
+
+                  const compound = compounds.find((c) => c.name === configName);
+                  if (compound) {
+                    // Compound: expand via the shared helper. Start each
+                    // constituent with no folder (VS Code picks the root), then
+                    // retry against the first target folder if a start fails.
+                    const { started, failed } = await launchCompound(
+                      compound,
+                      configs,
+                      undefined,
+                      targetFolders[0],
+                      isAborted,
+                    );
+                    success = failed.length === 0 && started.length > 0;
+                    detail = failed.length > 0 ? ` (failed: ${failed.join(', ')})` : '';
+                  } else {
+                    const wsConfig = configByName.get(configName);
+                    if (wsConfig) {
+                      try {
+                        success = await vscode.debug.startDebugging(undefined, wsConfig);
+                      } catch {
+                        success = false;
+                      }
+                      const primaryFolderWs = targetFolders[0];
+                      if (!success && primaryFolderWs) {
+                        try {
+                          success = await vscode.debug.startDebugging(primaryFolderWs, wsConfig);
+                        } catch {
+                          success = false;
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              START_DEBUG_BUDGET_MS,
+              `Debug launch '${configName}' did not complete within ${START_DEBUG_BUDGET_MS / 1000}s — stopped issuing further launches`,
+            );
+          } catch (err) {
+            // Budget expiry (or an error escaping the launch phase): report a
+            // clean error to the caller. isAborted() has already been flipped,
+            // so the ghost phase will not spawn further launches.
+            timedOut = err instanceof Error && /did not complete within/.test(err.message);
+            if (!timedOut) {
+              throw err;
             }
+            detail = detail ? detail + ' (launch timed out)' : ' (launch timed out)';
           }
 
           if (!success) {
-            const sources = [
-              folderSection ? `launch.json in folder '${folder!.name}'` : null,
-              wsSection ? 'the workspace file' : null,
-            ].filter(Boolean);
+            const sources = targetFolders
+              .map((f, i) => (folderSections[i] ? `launch.json in folder '${f.name}'` : null))
+              .concat(wsSection ? ['the workspace file'] : [])
+              .filter((s): s is string => !!s);
             const where = sources.length > 0 ? ` (checked ${sources.join(' and ')})` : ' (no launch sources found)';
             return {
               content: [{ type: 'text', text: `Failed to start '${configName}'${where}${detail}` }],
@@ -199,6 +352,7 @@ export function registerDebugTools(server: McpServer): void {
           return { content: [{ type: 'text', text: `Debug start error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }
       },
+      START_DEBUG_TIMEOUT_MS,
     ),
   );
 
@@ -257,11 +411,11 @@ export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'add_breakpoint',
-      'Add a breakpoint at a file and line.',
+      'Add a breakpoint at a file and line. Absolute paths may point outside the workspace (the debug adapter decides whether the file is debuggable).',
       {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          path: { type: 'string', description: 'File path (absolute — any location; or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           condition: { type: 'string', description: 'Optional breakpoint condition expression (e.g. "x > 5")' },
           hitCondition: { type: 'string', description: 'Optional hit count condition (e.g. "5" for every 5th hit)' },
@@ -272,7 +426,7 @@ export function registerDebugTools(server: McpServer): void {
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
         try {
-          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined, true);
           const cond = args.condition ? String(args.condition) : undefined;
           const hitCond = args.hitCondition ? String(args.hitCondition) : undefined;
           const loc = new vscode.Location(uri, new vscode.Position(line, 0));
@@ -289,11 +443,11 @@ export function registerDebugTools(server: McpServer): void {
   server.registerTool(
     defineTool(
       'remove_breakpoint',
-      'Remove a breakpoint at a file and line.',
+      'Remove a breakpoint at a file and line. Absolute paths may point outside the workspace.',
       {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
+          path: { type: 'string', description: 'File path (absolute — any location; or relative to workspace root)' },
           line: { type: 'integer', description: 'Line number (1-indexed)' },
           workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
         },
@@ -302,7 +456,7 @@ export function registerDebugTools(server: McpServer): void {
       async (args) => {
         const line = Math.max(0, Number(args.line) - 1);
         try {
-          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+          const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined, true);
           const toRemove = vscode.debug.breakpoints.filter((bp) => {
             if (bp instanceof vscode.SourceBreakpoint) {
               const loc = bp.location;
@@ -357,15 +511,16 @@ export function registerDebugTools(server: McpServer): void {
         if (!session) return { content: [{ type: 'text', text: 'No active debug session' }], isError: true };
         try {
           // Get stack frames first, then variables from top frame
-          const threads = await session.customRequest('threads');
+          const threads = await dapRequest<any>(session, 'threads');
           if (!threads?.threads?.length) return { content: [{ type: 'text', text: 'No threads available' }], isError: true };
-          const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+          const stack = await dapRequest<any>(session, 'stackTrace', { threadId: threads.threads[0].id });
           if (!stack?.stackFrames?.length) return { content: [{ type: 'text', text: 'No stack frames (is debugger paused?)' }], isError: true };
-          const scopes = await session.customRequest('scopes', { frameId: stack.stackFrames[0].id });
+          const scopes = await dapRequest<any>(session, 'scopes', { frameId: stack.stackFrames[0].id });
           const varsRef = scopes?.scopes?.[0]?.variablesReference;
           if (!varsRef) return { content: [{ type: 'text', text: 'No variables in scope' }], isError: true };
-          const vars = await session.customRequest('variables', { variablesReference: varsRef });
-          return { content: [{ type: 'text', text: JSON.stringify(vars?.variables || [], null, 2) }], isError: false };
+          const vars = await dapRequest<any>(session, 'variables', { variablesReference: varsRef });
+          const { text, note } = truncateVariables(vars?.variables || []);
+          return { content: [{ type: 'text', text: note ? text + '\n' + note : text }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Failed to get variables: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }
@@ -385,9 +540,9 @@ export function registerDebugTools(server: McpServer): void {
         const session = vscode.debug.activeDebugSession;
         if (!session) return { content: [{ type: 'text', text: 'No active debug session' }], isError: true };
         try {
-          const threads = await session.customRequest('threads');
+          const threads = await dapRequest<any>(session, 'threads');
           if (!threads?.threads?.length) return { content: [{ type: 'text', text: 'No threads' }], isError: true };
-          const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+          const stack = await dapRequest<any>(session, 'stackTrace', { threadId: threads.threads[0].id });
           if (!stack?.stackFrames?.length) return { content: [{ type: 'text', text: 'No stack frames' }], isError: true };
           const lines = stack.stackFrames.map((f: any) => `${f.name}${f.source?.path ? ` at ${f.source.path}:${f.line}` : ''}`);
           return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
@@ -416,20 +571,24 @@ export function registerDebugTools(server: McpServer): void {
           // Resolve top stack frame for frame-scoped evaluation (locals)
           let frameId: number | undefined;
           try {
-            const threads = await session.customRequest('threads');
+            const threads = await dapRequest<any>(session, 'threads');
             if (threads?.threads?.length) {
-              const stack = await session.customRequest('stackTrace', { threadId: threads.threads[0].id });
+              const stack = await dapRequest<any>(session, 'stackTrace', { threadId: threads.threads[0].id });
               frameId = stack?.stackFrames?.[0]?.id;
             }
           } catch {
             // Not paused — fall through to global-scope eval
           }
-          const result = await session.customRequest('evaluate', {
+          const result = await dapRequest<any>(session, 'evaluate', {
             expression: String(args.expression),
             context: 'repl',
             ...(frameId !== undefined ? { frameId } : {}),
           });
-          return { content: [{ type: 'text', text: result?.result || String(result) }], isError: false };
+          let out = result?.result || String(result);
+          if (out.length > EVAL_RESULT_MAX_CHARS) {
+            out = out.slice(0, EVAL_RESULT_MAX_CHARS) + '\n…result truncated at 100 KB…';
+          }
+          return { content: [{ type: 'text', text: out }], isError: false };
         } catch (err) {
           return { content: [{ type: 'text', text: `Evaluate error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
         }

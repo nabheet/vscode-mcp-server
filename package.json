@@ -2,7 +2,7 @@
   "name": "vscode-ide-mcp",
   "displayName": "MCP Server for VS Code",
   "description": "MCP server that lets AI agents (opencode, Claude, Cursor) debug, edit, and control VS Code directly. Debugger, terminal, LSP, file ops.",
-  "version": "0.3.29",
+  "version": "0.3.30",
   "publisher": "nabheet",
   "license": "MIT",
   "repository": {
@@ -88,6 +88,6 @@
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }

@@ -28,9 +28,13 @@ export function registerCommandsTools(server: McpServer): void {
         console.warn('[vscode-mcp-server] execute_command: ' + command + ' args=' + JSON.stringify(cmdArgs));
         try {
           const result = await vscode.commands.executeCommand(command, ...cmdArgs);
-          const text = result === undefined
+          const MAX_RESULT_CHARS = 100_000;
+          let text = result === undefined
             ? `Command '${command}' executed successfully (no return value)`
             : `Command '${command}' returned: ${JSON.stringify(result)}`;
+          if (text.length > MAX_RESULT_CHARS) {
+            text = text.slice(0, MAX_RESULT_CHARS) + '\n…result truncated at 100 KB…';
+          }
           return { content: [{ type: 'text', text }], isError: false };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -56,8 +60,17 @@ export function registerCommandsTools(server: McpServer): void {
       async (args) => {
         const internal = args.includeInternal === true;
         const commands = await vscode.commands.getCommands(internal);
+        // VS Code registers thousands of commands (esp. with extensions) —
+        // cap the dump so the MCP round trip stays bounded.
+        const MAX_COMMANDS = 200;
+        const capped = commands.length > MAX_COMMANDS;
+        const list = capped ? commands.slice(0, MAX_COMMANDS) : commands;
+        const text = JSON.stringify(list, null, 2);
+        const note = capped
+          ? `\n…${commands.length - MAX_COMMANDS} more commands omitted (showing first ${MAX_COMMANDS} of ${commands.length})`
+          : '';
         return {
-          content: [{ type: 'text', text: JSON.stringify(commands, null, 2) }],
+          content: [{ type: 'text', text: text + note }],
           isError: false,
         };
       },

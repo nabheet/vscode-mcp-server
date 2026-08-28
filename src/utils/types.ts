@@ -29,6 +29,11 @@ export interface ToolDefinition {
   description: string;
   inputSchema: Record<string, unknown>;
   handler: ToolHandler;
+  /** Per-tool timeout override (ms). Overrides DEFAULT_TOOL_TIMEOUT_MS for
+   *  this tool only; an explicit McpServerOptions.toolTimeoutMs still caps it.
+   *  Use for tools that legitimately exceed the generic budget (e.g. a debug
+   *  launch that must wait for multiprocess debugpy attach). */
+  timeoutMs?: number;
 }
 
 export interface TextContent {

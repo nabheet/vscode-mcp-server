@@ -12,13 +12,18 @@ import * as path from 'path';
  * @param input - Absolute or relative file path.
  * @param folderName - Optional workspace folder name (for multi-root workspaces).
  *                     If provided, resolves relative paths against this folder.
+ * @param allowOutsideWorkspace - When true, absolute paths outside all open
+ *                     workspace folders are accepted. Used by tools whose
+ *                     target is not a workspace file (e.g. breakpoints).
  * @throws If `folderName` is provided but no matching folder exists.
- * @throws If the resolved path escapes all open workspace folders.
+ * @throws If the resolved path escapes all open workspace folders (unless
+ *         `allowOutsideWorkspace` is true).
  */
-export function resolvePath(input: string, folderName?: string): vscode.Uri {
+export function resolvePath(input: string, folderName?: string, allowOutsideWorkspace = false): vscode.Uri {
   let resolved: string;
+  const inputWasAbsolute = path.isAbsolute(input);
 
-  if (path.isAbsolute(input)) {
+  if (inputWasAbsolute) {
     resolved = input;
   } else {
     const folders = vscode.workspace.workspaceFolders;
@@ -45,9 +50,11 @@ export function resolvePath(input: string, folderName?: string): vscode.Uri {
     }
   }
 
-  // Enforce workspace boundary: reject paths outside all open workspace folders
+  // Enforce workspace boundary: reject paths outside all open workspace folders.
+  // When `allowOutsideWorkspace` is set, only ABSOLUTE inputs may leave the
+  // workspace — relative inputs still resolve against (and must stay inside) it.
   const folders = vscode.workspace.workspaceFolders;
-  if (folders && folders.length > 0) {
+  if (folders && folders.length > 0 && (!allowOutsideWorkspace || !inputWasAbsolute)) {
     const normalized = path.normalize(resolved);
     const inWorkspace = folders.some(f => {
       const wsPath = path.normalize(f.uri.fsPath);

@@ -3,7 +3,10 @@ import * as https from 'https';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { handleRequest } from './transport';
-import { ToolDefinition } from '../utils/types';
+import { ToolDefinition, JsonRpcResponse } from '../utils/types';
+import { withTimeout } from '../utils/timeout';
+import { Metrics } from '../utils/metrics';
+import { ServerLog } from '../utils/serverLog';
 
 interface SseSession {
   id: string;
@@ -20,9 +23,30 @@ export interface McpServerOptions {
   tlsKeyPath?: string;
   /** Optional bearer token for authentication */
   authToken?: string;
+  /** Hard deadline for any tool call, ms. Default 30s. Prevents a hung
+   *  VS Code / DAP call from freezing the server and killing the port. */
+  toolTimeoutMs?: number;
+  /** Concurrent tool-call cap. Default 10. Overflow gets an immediate
+   *  429 / error response instead of queueing behind a stall. */
+  maxConcurrentRequests?: number;
+  /** Metrics registry feeding /metrics and /diagnostics. */
+  metrics?: Metrics;
+  /** JSON-lines file logger (survives process death — hot reload). */
+  logger?: ServerLog;
+}
+
+/** Thrown when the concurrency cap is exceeded. */
+export class BusyError extends Error {
+  constructor(public readonly current: number, public readonly max: number) {
+    super(`Server busy: ${current} tool calls in flight (max ${max})`);
+    this.name = 'BusyError';
+  }
 }
 
 const SSE_KEEPALIVE_MS = 15_000;
+const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_CONCURRENT = 10;
+const LAG_INTERVAL_MS = 1_000;
 
 export class McpServer {
   private server: http.Server | https.Server | null = null;
@@ -33,10 +57,20 @@ export class McpServer {
   private onListen?: (url: string) => void;
   private useTls: boolean;
   private sessions = new Map<string, SseSession>();
+  private metrics: Metrics;
+  private readonly fileLog?: ServerLog;
+  private readonly maxConcurrent: number;
+  private inFlight = 0;
+  private lagMs = 0;
+  private lastLagSample = Date.now();
+  private lagTimer: NodeJS.Timeout | null = null;
 
   constructor(options: McpServerOptions) {
     this.options = options;
     this.useTls = !!(options.tlsCertPath && options.tlsKeyPath);
+    this.metrics = options.metrics ?? new Metrics();
+    this.maxConcurrent = options.maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT;
+    this.fileLog = options.logger;
     if (options.authToken && !this.useTls) {
       console.warn('[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.');
     }
@@ -79,13 +113,29 @@ export class McpServer {
       this.server.listen(this.options.port, this.options.host, () => {
         const scheme = this.useTls ? 'https' : 'http';
         this.onListen?.(scheme + '://' + this.options.host + ':' + this.options.port + '/mcp');
+        this.startLagMonitor();
         resolve();
       });
     });
   }
 
+  /** Event-loop lag monitor — fires late if the loop is blocked. */
+  private startLagMonitor(): void {
+    this.lastLagSample = Date.now();
+    this.lagTimer = setInterval(() => {
+      const now = Date.now();
+      this.lagMs = Math.max(0, now - this.lastLagSample - LAG_INTERVAL_MS);
+      this.lastLagSample = now;
+    }, LAG_INTERVAL_MS);
+    this.lagTimer.unref();
+  }
+
   async stop(timeoutMs = 10_000): Promise<void> {
     this.shuttingDown = true;
+    if (this.lagTimer) {
+      clearInterval(this.lagTimer);
+      this.lagTimer = null;
+    }
     if (!this.server) return;
 
     // server.close() stops accepting new connections and waits for existing
@@ -173,6 +223,59 @@ export class McpServer {
 
   // ── Request Handler ────────────────────────────────────────────────
 
+  /** Refresh process-level gauges before serving /metrics or /diagnostics. */
+  private updateGauges(): void {
+    const mem = process.memoryUsage();
+    this.metrics.gauge('vscode_mcp_memory_rss_bytes', mem.rss, 'Resident set size (bytes)');
+    this.metrics.gauge('vscode_mcp_memory_heap_used_bytes', mem.heapUsed, 'Heap used (bytes)');
+    this.metrics.gauge('vscode_mcp_event_loop_lag_ms', this.lagMs, 'Event loop lag (ms), sampled each second');
+    this.metrics.gauge('vscode_mcp_inflight_requests', this.inFlight, 'Tool calls currently in flight');
+    this.metrics.gauge('vscode_mcp_sse_sessions', this.sessions.size, 'Open SSE sessions');
+    this.metrics.gauge('vscode_mcp_max_concurrent', this.maxConcurrent, 'Concurrency cap');
+  }
+
+  /** Run a JSON-RPC request under the concurrency cap; time it; record
+   *  metrics and a durable log line per request. Throws BusyError when
+   *  over the cap, and rethrows tool errors after recording them. */
+  private async dispatch(rawBody: string): Promise<JsonRpcResponse> {
+    if (this.inFlight >= this.maxConcurrent) {
+      throw new BusyError(this.inFlight, this.maxConcurrent);
+    }
+    this.inFlight++;
+    const started = Date.now();
+    const toolName = extractToolName(rawBody);
+    try {
+      const toolDef = this.tools.get(toolName);
+      const timeoutMs = this.options.toolTimeoutMs ?? toolDef?.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+      const response = await withTimeout(
+        handleRequest(rawBody, this.tools),
+        timeoutMs,
+        `Tool call timed out after ${timeoutMs}ms (VS Code/DAP unresponsive)`,
+      );
+      const durMs = Date.now() - started;
+      this.metrics.histogram('vscode_mcp_tool_duration_seconds', 'Tool call duration (seconds)')
+        .observe(durMs / 1000);
+      this.metrics.counterInc('vscode_mcp_tool_total', 'Total tool calls dispatched');
+      if (response.error) {
+        const msg = response.error.message || ('code ' + response.error.code);
+        this.metrics.recordError(toolName, msg);
+        this.metrics.counterInc('vscode_mcp_tool_errors', 'Tool calls that returned an error');
+        this.fileLog?.log({ type: 'tool', tool: toolName, ok: false, durMs, error: msg });
+      } else {
+        this.fileLog?.log({ type: 'tool', tool: toolName, ok: true, durMs });
+      }
+      return response;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.metrics.counterInc('vscode_mcp_tool_errors', 'Tool calls that threw');
+      this.metrics.recordError(toolName, msg);
+      this.fileLog?.log({ type: 'tool', tool: toolName, ok: false, durMs: Date.now() - started, error: msg, threw: true });
+      throw err;
+    } finally {
+      this.inFlight--;
+    }
+  }
+
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const origin = req.headers['origin'] as string | undefined;
     const pathname = (req.url || '').split('?')[0];
@@ -181,6 +284,22 @@ export class McpServer {
     if (req.method === 'GET' && pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+      return;
+    }
+
+    // Metrics — Prometheus text format
+    if (req.method === 'GET' && pathname === '/metrics') {
+      this.updateGauges();
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+      res.end(this.metrics.text());
+      return;
+    }
+
+    // Diagnostics — human-readable JSON snapshot
+    if (req.method === 'GET' && pathname === '/diagnostics') {
+      this.updateGauges();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(this.metrics.diagnostics(), null, 2));
       return;
     }
 
@@ -291,14 +410,16 @@ export class McpServer {
       res.end(JSON.stringify({ accepted: true }));
 
       try {
-        const response = await handleRequest(rawBody, this.tools);
+        const response = await this.dispatch(rawBody);
         if (response) {
           session.sendEvent('message', JSON.stringify(response));
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        const code = err instanceof BusyError ? -32050 : -32603;
+        const message = err instanceof BusyError ? msg : 'Internal error: ' + msg;
         session.sendEvent('message', JSON.stringify({
-          jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error: ' + msg },
+          jsonrpc: '2.0', id: null, error: { code, message },
         }));
       }
     });
@@ -365,7 +486,7 @@ export class McpServer {
       const rawBody = Buffer.concat(chunks).toString('utf-8');
 
       try {
-        const response = await handleRequest(rawBody, this.tools);
+        const response = await this.dispatch(rawBody);
         const body = JSON.stringify(response);
         this.writeCorsHeaders(res, origin);
 
@@ -382,6 +503,11 @@ export class McpServer {
         res.end(body);
       } catch (err) {
         this.writeCorsHeaders(res, origin);
+        if (err instanceof BusyError) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32050, message: err.message } }));
+          return;
+        }
         res.writeHead(500, { 'Content-Type': 'application/json' });
         const msg = err instanceof Error ? err.message : String(err);
         res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error: ' + msg } }));
@@ -392,4 +518,16 @@ export class McpServer {
 
     req.on('error', () => { activeRequestDone(); });
   }
+}
+
+/** Best-effort extraction of the MCP method / tool name for metrics and logs. */
+function extractToolName(rawBody: string): string {
+  try {
+    const parsed = JSON.parse(rawBody) as { method?: string; params?: { name?: string } };
+    if (parsed?.method === 'tools/call' && typeof parsed.params?.name === 'string') {
+      return parsed.params.name;
+    }
+    if (typeof parsed?.method === 'string') return parsed.method;
+  } catch { /* fall through */ }
+  return '<unparseable>';
 }
