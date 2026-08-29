@@ -14,7 +14,7 @@
   },
   "homepage": "https://github.com/nabheet/vscode-mcp-server#readme",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.134.0"
   },
   "icon": "icon.png",
   "categories": [
@@ -84,7 +84,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.134.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2",
