@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
-import type { McpServer } from "../server";
-import { defineTool } from "./index";
+import { defineTool, type ToolRegistrar } from "./index";
 
 /**
  * Buffer for terminal output captured via shell integration.
@@ -99,7 +98,10 @@ function getOrCreateTerminal(name: string): vscode.Terminal {
   return term;
 }
 
-export function registerTerminalTools(server: McpServer, context: vscode.ExtensionContext): void {
+export function registerTerminalTools(
+  server: ToolRegistrar,
+  context: vscode.ExtensionContext,
+): void {
   ensureOutputCapture(context);
 
   server.registerTool(
@@ -119,7 +121,7 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
       },
       async (args) => {
         const cmd = String(args.command);
-        const termName = String(args.name || `mcp-${Date.now()}`);
+        const termName = String(args.name || "mcp-" + Date.now());
         const term = getOrCreateTerminal(termName);
 
         term.show();
@@ -132,7 +134,7 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
         }
 
         return {
-          content: [{ type: "text", text: `Executed command in terminal "${termName}"` }],
+          content: [{ type: "text", text: 'Executed command in terminal "' + termName + '"' }],
           isError: false,
         };
       },
@@ -187,7 +189,7 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
         }
 
         const text =
-          buffer.length > maxChars ? `...(truncated)\n${buffer.slice(-maxChars)}` : buffer;
+          buffer.length > maxChars ? "...(truncated)\n" + buffer.slice(-maxChars) : buffer;
         return { content: [{ type: "text", text }], isError: false };
       },
     ),

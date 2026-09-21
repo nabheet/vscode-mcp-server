@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import { withTimeout } from "../../utils/timeout";
-import type { McpServer } from "../server";
-import { defineTool } from "./index";
+import { defineTool, type ToolRegistrar } from "./index";
 
 /** LSP provider calls go to the language server — slow or hung servers never
  *  answer. Same protection as DAP: bound every call so the MCP server never
@@ -41,15 +40,15 @@ interface NormalisedLocation {
   uri: vscode.Uri;
   range: vscode.Range;
 }
-function normaliseLocation(loc: vscode.Location | vscode.LocationLink): NormalisedLocation {
-  if ("uri" in loc && loc.range) return loc; // vscode.Location
-  if ("targetUri" in loc && loc.targetRange) return { uri: loc.targetUri, range: loc.targetRange }; // LocationLink
+function normaliseLocation(loc: any): NormalisedLocation {
+  if (loc.uri && loc.range && loc.range.start) return loc; // vscode.Location
+  if (loc.targetUri && loc.targetRange) return { uri: loc.targetUri, range: loc.targetRange }; // LocationLink
   throw new Error(
-    `Unexpected location format from language server: ${JSON.stringify(loc).slice(0, 200)}`,
+    "Unexpected location format from language server: " + JSON.stringify(loc).slice(0, 200),
   );
 }
 
-export function registerLspTools(server: McpServer): void {
+export function registerLspTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "find_references",
@@ -64,8 +63,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const refs = await lspCommand<vscode.Location[]>(
             "vscode.executeReferenceProvider",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
           );
           if (!refs || refs.length === 0)
             return { content: [{ type: "text", text: "No references found" }], isError: false };
@@ -99,8 +98,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const defs = await lspCommand(
             "vscode.executeDefinitionProvider",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
           );
           if (!defs || !Array.isArray(defs) || defs.length === 0)
             return { content: [{ type: "text", text: "No definition found" }], isError: false };
@@ -140,8 +139,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const defs = await lspCommand(
             "vscode.executeTypeDefinitionProvider",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
           );
           if (!defs || !Array.isArray(defs) || defs.length === 0)
             return {
@@ -184,8 +183,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const impls = await lspCommand(
             "vscode.executeImplementationProvider",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
           );
           if (!impls || !Array.isArray(impls) || impls.length === 0)
             return { content: [{ type: "text", text: "No implementation found" }], isError: false };
@@ -225,8 +224,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const hovers = await lspCommand<vscode.Hover[]>(
             "vscode.executeHoverProvider",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
           );
           if (!hovers || hovers.length === 0)
             return { content: [{ type: "text", text: "No hover info" }], isError: false };
@@ -277,12 +276,8 @@ export function registerLspTools(server: McpServer): void {
         const entries = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
         for (const diag of entries) {
           if ("uri" in diag && "diagnostics" in diag) {
-            const fileDiag = diag as unknown as {
-              uri: vscode.Uri;
-              diagnostics: vscode.Diagnostic[];
-            };
-            for (const d of fileDiag.diagnostics) {
-              const line = `${fileDiag.uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
+            for (const d of (diag as any).diagnostics) {
+              const line = `${(diag as any).uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
               if (lines.length < MAX_DIAG_LINES) {
                 lines.push(line);
               }
@@ -295,10 +290,10 @@ export function registerLspTools(server: McpServer): void {
             }
           }
         }
-        const rawDiag: unknown[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
-        const total = rawDiag.reduce((sum: number, entry: unknown) => {
+        const rawDiag: any[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
+        const total = rawDiag.reduce((sum: number, entry: any) => {
           if (entry && typeof entry === "object" && "diagnostics" in entry) {
-            const arr = (entry as { diagnostics?: unknown }).diagnostics;
+            const arr = entry.diagnostics as any[] | undefined;
             return sum + (Array.isArray(arr) ? arr.length : 1);
           }
           return sum + 1;
@@ -323,25 +318,25 @@ export function registerLspTools(server: McpServer): void {
         try {
           const symbols = await lspCommand(
             "vscode.executeDocumentSymbolProvider",
-            editor?.document.uri,
+            editor!.document.uri,
           );
           if (!symbols || (Array.isArray(symbols) && symbols.length === 0))
             return { content: [{ type: "text", text: "No symbols found" }], isError: false };
           const lines: string[] = [];
-          function flattenSymbol(s: vscode.DocumentSymbol | vscode.SymbolInformation): void {
-            if ("location" in s) {
+          function flattenSymbol(s: any): void {
+            if (s.location) {
               lines.push(
                 `${s.name} (${vscode.SymbolKind[s.kind]}) at ${s.location.range.start.line + 1}`,
               );
-            } else {
+            } else if (s.range) {
               // DocumentSymbol uses .range instead of .location
               lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${s.range.start.line + 1}`);
             }
-            if ("children" in s) {
+            if (s.children) {
               for (const child of s.children) flattenSymbol(child);
             }
           }
-          for (const s of symbols as vscode.DocumentSymbol[]) flattenSymbol(s);
+          for (const s of symbols as any[]) flattenSymbol(s);
           return {
             content: [{ type: "text", text: lines.join("\n") || "No symbols found" }],
             isError: false,
@@ -409,11 +404,11 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         const line = Math.max(0, Number(args.line) - 1);
-        const lineRange = editor?.document.lineAt(line).range;
+        const lineRange = editor!.document.lineAt(line).range;
         try {
           const actions = await lspCommand<vscode.CodeAction[]>(
             "vscode.executeCodeActionProvider",
-            editor?.document.uri,
+            editor!.document.uri,
             lineRange,
           );
           if (!actions || actions.length === 0)
@@ -449,8 +444,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const items = await lspCommand<vscode.CallHierarchyItem[]>(
             "vscode.executePrepareCallHierarchy",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
           );
           if (!items || items.length === 0)
             return {
@@ -513,8 +508,8 @@ export function registerLspTools(server: McpServer): void {
         try {
           const edit = await lspCommand<vscode.WorkspaceEdit>(
             "vscode.executeDocumentRenameProvider",
-            editor?.document.uri,
-            getCursor(editor),
+            editor!.document.uri,
+            getCursor(editor!),
             String(args.newName),
           );
           if (!edit)
@@ -569,20 +564,20 @@ export function registerLspTools(server: McpServer): void {
         const { editor, err } = requireEditor();
         if (err) return err;
         const line =
-          args.line !== undefined ? Math.max(0, Number(args.line) - 1) : getCursor(editor).line;
+          args.line !== undefined ? Math.max(0, Number(args.line) - 1) : getCursor(editor!).line;
         const col =
           args.column !== undefined
             ? Math.max(0, Number(args.column) - 1)
-            : getCursor(editor).character;
+            : getCursor(editor!).character;
         const maxResults = Number(args.maxResults) || 50;
         const pos = new vscode.Position(line, col);
         try {
           const list = await lspCommand<vscode.CompletionList>(
             "vscode.executeCompletionItemProvider",
-            editor?.document.uri,
+            editor!.document.uri,
             pos,
           );
-          if (!list?.items || list.items.length === 0)
+          if (!list || !list.items || list.items.length === 0)
             return {
               content: [{ type: "text", text: "No completions available" }],
               isError: false,

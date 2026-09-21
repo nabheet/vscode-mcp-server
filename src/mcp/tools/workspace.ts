@@ -1,10 +1,9 @@
-import * as path from "node:path";
+import * as path from "path";
 import * as vscode from "vscode";
 import { resolvePath } from "../../utils/path";
-import type { McpServer } from "../server";
-import { defineTool } from "./index";
+import { defineTool, type ToolRegistrar } from "./index";
 
-export function registerWorkspaceTools(server: McpServer): void {
+export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "list_files",
