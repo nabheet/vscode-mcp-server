@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import { resolvePath } from "../../utils/path";
-import type { McpServer } from "../server";
-import { defineTool } from "./index";
+import { defineTool, type ToolRegistrar } from "./index";
 
 /** Ensure a text editor is open for the given URI, return it */
 async function openEditor(uri: vscode.Uri): Promise<vscode.TextEditor> {
@@ -9,7 +8,7 @@ async function openEditor(uri: vscode.Uri): Promise<vscode.TextEditor> {
   return await vscode.window.showTextDocument(doc);
 }
 
-export function registerNavigationTools(server: McpServer): void {
+export function registerNavigationTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "open_file",

@@ -1,6 +1,5 @@
 import type * as vscode from "vscode";
 import type { ToolDefinition } from "../../utils/types";
-import type { McpServer } from "../server";
 
 import { registerCommandsTools } from "./commands";
 import { registerDebugTools } from "./debug";
@@ -11,7 +10,16 @@ import { registerSearchTools } from "./search";
 import { registerTerminalTools } from "./terminal";
 import { registerWorkspaceTools } from "./workspace";
 
-export function registerAllTools(server: McpServer, context: vscode.ExtensionContext): void {
+/**
+ * Minimal surface the tool registration functions need. Satisfied by both
+ * McpServer (master HTTP layer) and ToolExecutor (worker IPC execution), so
+ * every cluster member registers the exact same tool set.
+ */
+export interface ToolRegistrar {
+  registerTool(def: ToolDefinition): void;
+}
+
+export function registerAllTools(server: ToolRegistrar, context: vscode.ExtensionContext): void {
   registerCommandsTools(server);
   registerNavigationTools(server);
   registerWorkspaceTools(server);

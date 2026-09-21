@@ -1,11 +1,10 @@
 import * as vscode from "vscode";
-import type { McpServer } from "../server";
-import { defineTool } from "./index";
+import { defineTool, type ToolRegistrar } from "./index";
 
 const MAX_FILE_BYTES = 512 * 1024; // skip files larger than 512 KB
 const MAX_SCAN_FILES = 2000; // cap on files handed to findFiles
 
-export function registerSearchTools(server: McpServer): void {
+export function registerSearchTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "search_files",

@@ -1,0 +1,451 @@
+import { type ChildProcess, execSync, type SpawnOptions, spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+const PROJECT_ROOT = process.cwd();
+
+let ENABLED = true;
+
+function findFreePort(): Promise<number> {
+  return new Promise((resolve) => {
+    const srv = http.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+interface McpContentPart {
+  type: string;
+  text: string;
+}
+
+interface McpToolResult {
+  isError?: boolean;
+  content: McpContentPart[];
+  [key: string]: unknown;
+}
+
+interface McpResponse {
+  jsonrpc: "2.0";
+  id: number;
+  result: McpToolResult;
+  error?: { code: number; message: string };
+}
+
+function mcpRequest(
+  port: number,
+  method: string,
+  params?: Record<string, unknown>,
+): Promise<McpResponse> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method,
+      params,
+    });
+    const req = http.request(
+      `http://127.0.0.1:${port}/mcp`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function waitForServer(port: number, timeoutMs = 120000): Promise<void> {
+  const start = Date.now();
+  let lastLog = 0;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await mcpRequest(port, "tools/list");
+      if (res?.result) return;
+    } catch {
+      // Server not ready yet
+    }
+    const elapsed = Date.now() - start;
+    if (elapsed - lastLog >= 10000) {
+      lastLog = elapsed;
+      console.log(`⌛ Waiting for MCP server... ${(elapsed / 1000).toFixed(0)}s`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`MCP server did not start within ${timeoutMs}ms`);
+}
+
+// VS Code ignores Chromium's --headless flag, so local macOS runs pop a
+// window. CI runs under xvfb (headless) and is unaffected. Hiding requires
+// Accessibility permission — failures are swallowed.
+function hideVSCodeWindows(_procs: ChildProcess[], delayMs = 1500) {
+  if (process.platform !== "darwin") return;
+  setTimeout(() => {
+    try {
+      execSync(
+        'osascript -e \'tell application "System Events" to set visible of (first process whose name is "Code") to false\'',
+        { stdio: "ignore" },
+      );
+    } catch {
+      /* no Accessibility permission — window stays visible */
+    }
+  }, delayMs);
+}
+
+/**
+ * Resolve the VS Code CLI binary via `@vscode/test-electron` (downloads
+ * VS Code to a cache, works on all platforms, no local install required).
+ *
+ * On headless Linux, xvfb-run is auto-detected and wrapped around the command.
+ */
+async function resolveCodeCli(): Promise<{
+  cmd: string;
+  args: string[];
+}> {
+  const { downloadAndUnzipVSCode } = await import("@vscode/test-electron");
+
+  const vscodePath = await downloadAndUnzipVSCode("stable");
+  if (process.platform === "darwin") {
+    // Spawn the app binary directly. The `bin/code` wrapper (returned by
+    // resolveCliPathFromVSCodeExecutablePath) launches the app detached via
+    // LaunchServices: under vitest the app can die before writing logs and
+    // leaves orphaned processes. The binary stays attached as our child.
+    const appRoot = vscodePath.endsWith(".app")
+      ? vscodePath
+      : vscodePath.replace(/\/Contents\/MacOS\/.+$/, "");
+    const binary = path.join(appRoot, "Contents", "MacOS", "Code");
+    if (fs.existsSync(binary)) return { cmd: binary, args: [] };
+    throw new Error(`VS Code binary not found under ${appRoot}`);
+  }
+  const { resolveCliPathFromVSCodeExecutablePath } = await import("@vscode/test-electron");
+  const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
+
+  if (!fs.existsSync(cliPath)) {
+    throw new Error(`VS Code CLI not found at resolved path: ${cliPath}`);
+  }
+
+  return wrapForDisplay(cliPath, []);
+}
+
+/**
+ * On headless Linux, wrap the command with xvfb-run.
+ */
+function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: string[] } {
+  const isLinux = process.platform === "linux";
+  const hasDisplay = !!process.env.DISPLAY;
+
+  if (isLinux && !hasDisplay) {
+    try {
+      execSync("which xvfb-run", { stdio: "pipe" });
+      return { cmd: "xvfb-run", args: ["--auto-servernum", cmd, ...extraArgs] };
+    } catch {
+      console.warn(
+        "Headless Linux detected but xvfb-run not found. Install xvfb: apt-get install xvfb",
+      );
+    }
+  }
+
+  return { cmd, args: extraArgs };
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+/**
+ * Two-window cluster E2E: proves wire-level instance identity end to end.
+ *
+ * Spawns TWO VS Code windows (distinct user-data dirs, distinct single-root
+ * workspaces) sharing ONE cluster port. Election decides which becomes
+ * master; the other joins over IPC. The test then:
+ *  1. lists the cluster (2 rows, distinct instanceIds, one master + one worker)
+ *  2. targets each window BY instanceId and proves the calls land in the
+ *     right window (folder listing + file content)
+ *  3. lists tools per window (worker must not expose master-only tools)
+ */
+describe("cluster master-worker (E2E)", () => {
+  const procs: ChildProcess[] = [];
+  let tmpDir: string | null = null;
+  let ipcPath: string;
+  let port: number;
+
+  beforeAll(async () => {
+    if (!process.env.RUN_E2E) {
+      ENABLED = false;
+      return;
+    }
+
+    // Verify extension is compiled
+    const extMain = path.join(PROJECT_ROOT, "out", "extension.js");
+    if (!fs.existsSync(extMain)) {
+      console.warn("⚠  Skipping E2E tests: extension not compiled (run `npm run compile` first)");
+      ENABLED = false;
+      return;
+    }
+
+    port = await findFreePort();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cl-"));
+    // Short socket name — macOS Unix socket paths must stay under ~103 chars
+    // (os.tmpdir() is already long: /var/folders/...).
+    ipcPath = path.join(tmpDir, "cl.sock");
+
+    // Two single-root workspaces with distinct, greppable content
+    const folderA = path.join(tmpDir, "alpha");
+    const folderB = path.join(tmpDir, "beta");
+    fs.mkdirSync(path.join(folderA, "src"), { recursive: true });
+    fs.mkdirSync(path.join(folderB, "src"), { recursive: true });
+    fs.writeFileSync(path.join(folderA, "src", "index.ts"), "// alpha code\nconst a = 1;\n");
+    fs.writeFileSync(path.join(folderB, "src", "index.ts"), "// beta code\nconst b = 2;\n");
+
+    // Resolve VS Code CLI (download if needed, wrap with xvfb on headless Linux)
+    let cliCmd: string;
+    let cliArgs: string[];
+    try {
+      const resolved = await resolveCodeCli();
+      cliCmd = resolved.cmd;
+      cliArgs = resolved.args;
+    } catch (err) {
+      console.warn("⚠  Skipping E2E tests:", (err as Error).message);
+      ENABLED = false;
+      return;
+    }
+
+    // Two distinct user-data dirs = two distinct windows. BOTH windows share
+    // the SAME cluster port + IPC socket — the cluster elects exactly one
+    // master; the other joins as worker. Settings carry the port (env vars
+    // don't reliably propagate through VS Code's extension host chain).
+    const spawns: Array<[string, string]> = [
+      [folderA, "a"],
+      [folderB, "b"],
+    ];
+    for (const [folder, tag] of spawns) {
+      const vsCodeUserData = path.join(tmpDir, `ud${tag}`);
+      const userSettingsDir = path.join(vsCodeUserData, "User");
+      fs.mkdirSync(userSettingsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(userSettingsDir, "settings.json"),
+        JSON.stringify({
+          "vscode-mcp-server.port": port,
+          "vscode-mcp-server.authToken": "",
+        }),
+      );
+
+      const launchArgs: string[] = [
+        ...cliArgs,
+        "--extensionDevelopmentPath",
+        PROJECT_ROOT,
+        "--user-data-dir",
+        vsCodeUserData,
+        "--disable-workspace-trust",
+        "--new-window",
+        folder,
+      ];
+      if (process.platform === "linux") {
+        launchArgs.push("--no-sandbox");
+      }
+
+      const spawnOpts: SpawnOptions = {
+        env: {
+          ...process.env,
+          MCP_PORT: String(port),
+          MCP_SERVER_MAX_RETRIES: "1",
+          VSCODE_MCP_IPC_PATH: ipcPath,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      };
+
+      const proc = spawn(cliCmd, launchArgs, spawnOpts);
+      procs.push(proc);
+
+      // Log VS Code output for debugging failures
+      const logPath = path.join(tmpDir, `vscode-${tag}.log`);
+      const logStream = fs.createWriteStream(logPath);
+      if (proc.stdout) proc.stdout.pipe(logStream);
+      if (proc.stderr) proc.stderr.pipe(logStream);
+    }
+
+    // VS Code ignores Chromium's --headless flag, so local macOS runs pop
+    // windows. Hide them via AppleScript — CI runs under xvfb and is
+    // unaffected. Requires Accessibility permission; failures are ignored.
+    hideVSCodeWindows(procs);
+
+    // Wait for the elected master to come up (up to 180s — two windows on
+    // slow CI runners). The worker joins shortly after.
+    await waitForServer(port, 180000);
+  }, 240000);
+
+  afterAll(async () => {
+    for (const proc of procs) {
+      if (!proc.killed) {
+        proc.kill("SIGTERM");
+        // Wait for graceful exit, then force kill
+        const exited = new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            if (!proc.killed) proc.kill("SIGKILL");
+            resolve();
+          }, 5000);
+          proc.on("exit", () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+        await exited;
+      }
+    }
+    if (tmpDir) {
+      // Retry cleanup with backoff — VS Code may still hold file locks briefly
+      let lastErr: unknown;
+      for (let i = 0; i < 5; i++) {
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          lastErr = undefined;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (i < 4) await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+      if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
+    }
+    // Stale IPC socket may outlive the master on crash — remove defensively.
+    try {
+      fs.unlinkSync(ipcPath);
+    } catch {
+      /* already gone */
+    }
+  }, 20000);
+
+  /** Poll list_workspaces until both windows have registered. */
+  async function waitForTwoWindows(deadlineMs = 90000): Promise<Array<Record<string, unknown>>> {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      const res = await mcpRequest(port, "tools/call", {
+        name: "list_workspaces",
+        arguments: {},
+      });
+      if (res.result && !res.result.isError) {
+        try {
+          const rows = JSON.parse(res.result.content[0].text) as Array<Record<string, unknown>>;
+          if (Array.isArray(rows) && rows.length >= 2) return rows;
+        } catch {
+          /* not JSON yet */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`Cluster did not reach 2 windows within ${deadlineMs}ms`);
+  }
+
+  // ── Discovery ─────────────────────────────────────────────────────────
+
+  it("list_workspaces returns both windows with distinct instanceIds", async () => {
+    if (!ENABLED) return;
+    const rows = await waitForTwoWindows();
+    expect(rows).toHaveLength(2);
+
+    const ids = rows.map((r) => r.instanceId);
+    expect(new Set(ids).size).toBe(2);
+    expect(ids[0]).toBeTruthy();
+
+    const roles = rows.map((r) => r.role).sort();
+    expect(roles).toEqual(["master", "worker"]);
+
+    const folders = rows.flatMap((r) => (r.folders as string[]) ?? []);
+    expect(folders.some((f) => f.endsWith("alpha"))).toBe(true);
+    expect(folders.some((f) => f.endsWith("beta"))).toBe(true);
+  });
+
+  // ── Targeting by instanceId ──────────────────────────────────────────
+
+  it("routes tools/call by instanceId: each window answers with its own folder + file content", async () => {
+    if (!ENABLED) return;
+    const rows = await waitForTwoWindows();
+    const alphaIdx = rows.findIndex((r) =>
+      (r.folders as string[]).some((f) => f.endsWith("alpha")),
+    );
+    const betaIdx = rows.findIndex((r) => (r.folders as string[]).some((f) => f.endsWith("beta")));
+    expect(alphaIdx).toBeGreaterThanOrEqual(0);
+    expect(betaIdx).toBeGreaterThanOrEqual(0);
+    expect(alphaIdx).not.toBe(betaIdx);
+    const alphaId = rows[alphaIdx].instanceId as string;
+    const betaId = rows[betaIdx].instanceId as string;
+
+    // get_workspace_folders targeted at each window reports that window only
+    const aFolders = await mcpRequest(port, "tools/call", {
+      name: "get_workspace_folders",
+      arguments: {},
+      workspace: alphaId,
+    });
+    expect(aFolders.result.isError, `alpha folders: ${aFolders.result.content[0].text}`).toBe(
+      false,
+    );
+    expect(aFolders.result.content[0].text).toContain("alpha:");
+
+    const bFolders = await mcpRequest(port, "tools/call", {
+      name: "get_workspace_folders",
+      arguments: {},
+      workspace: betaId,
+    });
+    expect(bFolders.result.isError, `beta folders: ${bFolders.result.content[0].text}`).toBe(false);
+    expect(bFolders.result.content[0].text).toContain("beta:");
+
+    // read_file targeted at each window returns THAT window's file content
+    const aRead = await mcpRequest(port, "tools/call", {
+      name: "read_file",
+      arguments: { path: "src/index.ts" },
+      workspace: alphaId,
+    });
+    expect(aRead.result.isError, `alpha read: ${aRead.result.content[0].text}`).toBe(false);
+    expect(aRead.result.content[0].text).toContain("// alpha code");
+
+    const bRead = await mcpRequest(port, "tools/call", {
+      name: "read_file",
+      arguments: { path: "src/index.ts" },
+      workspace: betaId,
+    });
+    expect(bRead.result.isError, `beta read: ${bRead.result.content[0].text}`).toBe(false);
+    expect(bRead.result.content[0].text).toContain("// beta code");
+  });
+
+  // ── Per-window tool list ─────────────────────────────────────────────
+
+  it("routes tools/list by instanceId: worker list excludes master-only list_workspaces", async () => {
+    if (!ENABLED) return;
+    const rows = await waitForTwoWindows();
+    const workerIdx = rows.findIndex((r) => r.role === "worker");
+    expect(workerIdx).toBeGreaterThanOrEqual(0);
+    const workerId = rows[workerIdx].instanceId as string;
+
+    const res = (await mcpRequest(port, "tools/list", {
+      workspace: workerId,
+    })) as unknown as { result: { tools: Array<{ name: string }> } };
+
+    expect(res.result.tools).toBeDefined();
+    const names = res.result.tools.map((t) => t.name);
+    expect(names).toContain("read_file");
+    expect(names).toContain("get_workspace_folders");
+    expect(names).not.toContain("list_workspaces");
+  });
+});
