@@ -1,20 +1,20 @@
-import * as pkg from '../../package.json';
+import * as pkg from "../../package.json";
 
 import {
-  JsonRpcRequest,
-  JsonRpcResponse,
-  JsonRpcError,
+  type CallToolResult,
   ErrorCode,
-  MCP_TOOLS_LIST,
-  MCP_TOOLS_CALL,
+  type JsonRpcError,
+  type JsonRpcRequest,
+  type JsonRpcResponse,
+  type ListToolsResult,
   MCP_INITIALIZE,
   MCP_NOTIFICATION_INITIALIZED,
-  ToolCallParams,
-  ToolDefinition,
-  ToolListItem,
-  CallToolResult,
-  ListToolsResult,
-} from '../utils/types';
+  MCP_TOOLS_CALL,
+  MCP_TOOLS_LIST,
+  type ToolCallParams,
+  type ToolDefinition,
+  type ToolListItem,
+} from "../utils/types";
 
 // ── Schema Validator ─────────────────────────────────────────────────
 
@@ -22,8 +22,8 @@ function validateAgainstSchema(
   args: Record<string, unknown>,
   schema: Record<string, unknown>,
 ): string | null {
-  const props = (schema as any).properties as Record<string, { type?: string }> | undefined;
-  const required = (schema as any).required as string[] | undefined;
+  const props = schema.properties as Record<string, { type?: string }> | undefined;
+  const required = schema.required as string[] | undefined;
 
   if (required) {
     for (const key of required) {
@@ -36,12 +36,13 @@ function validateAgainstSchema(
   if (props) {
     for (const [key, value] of Object.entries(args)) {
       const prop = props[key];
-      if (prop && prop.type) {
+      if (prop?.type) {
         const expected = prop.type;
-        if (expected === 'array' && Array.isArray(value)) continue;
+        if (expected === "array" && Array.isArray(value)) continue;
         const actual = typeof value;
-        if (expected === 'integer' && actual === 'number' && Number.isInteger(value as number)) continue;
-        if (expected === 'number' && actual === 'number') continue;
+        if (expected === "integer" && actual === "number" && Number.isInteger(value as number))
+          continue;
+        if (expected === "number" && actual === "number") continue;
         if (actual !== expected) {
           return `Argument '${key}' expected type '${expected}', got '${actual}'`;
         }
@@ -55,11 +56,11 @@ function validateAgainstSchema(
 // ── Response Helpers ─────────────────────────────────────────────────
 
 function makeResult(id: number | string | null, result: unknown): JsonRpcResponse {
-  return { jsonrpc: '2.0', id, result };
+  return { jsonrpc: "2.0", id, result };
 }
 
 function makeError(id: number | string | null, error: JsonRpcError): JsonRpcResponse {
-  return { jsonrpc: '2.0', id, error };
+  return { jsonrpc: "2.0", id, error };
 }
 
 function jrpcError(code: number, message: string, data?: unknown): JsonRpcError {
@@ -73,26 +74,41 @@ function parseBody(raw: string): { req?: JsonRpcRequest; error?: JsonRpcResponse
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { error: makeError(null, jrpcError(ErrorCode.ParseError, 'Parse error: invalid JSON')) };
+    return { error: makeError(null, jrpcError(ErrorCode.ParseError, "Parse error: invalid JSON")) };
   }
 
-  if (typeof parsed !== 'object' || parsed === null) {
-    return { error: makeError(null, jrpcError(ErrorCode.InvalidRequest, 'Invalid Request: body must be a JSON object')) };
+  if (typeof parsed !== "object" || parsed === null) {
+    return {
+      error: makeError(
+        null,
+        jrpcError(ErrorCode.InvalidRequest, "Invalid Request: body must be a JSON object"),
+      ),
+    };
   }
 
   const req = parsed as Record<string, unknown>;
 
-  if (req.jsonrpc !== '2.0') {
-    return { error: makeError((req.id as string | number | null) ?? null, jrpcError(ErrorCode.InvalidRequest, 'Invalid Request: jsonrpc must be "2.0"')) };
+  if (req.jsonrpc !== "2.0") {
+    return {
+      error: makeError(
+        (req.id as string | number | null) ?? null,
+        jrpcError(ErrorCode.InvalidRequest, 'Invalid Request: jsonrpc must be "2.0"'),
+      ),
+    };
   }
 
-  if (typeof req.method !== 'string') {
-    return { error: makeError((req.id as string | number | null) ?? null, jrpcError(ErrorCode.InvalidRequest, 'Invalid Request: method must be a string')) };
+  if (typeof req.method !== "string") {
+    return {
+      error: makeError(
+        (req.id as string | number | null) ?? null,
+        jrpcError(ErrorCode.InvalidRequest, "Invalid Request: method must be a string"),
+      ),
+    };
   }
 
   return {
     req: {
-      jsonrpc: '2.0',
+      jsonrpc: "2.0",
       id: (req.id as string | number | null) ?? null,
       method: req.method,
       params: req.params,
@@ -120,32 +136,46 @@ async function handleCallTool(
   tools: Map<string, ToolDefinition>,
   params: unknown,
 ): Promise<CallToolResult> {
-  if (typeof params !== 'object' || params === null) {
-    return { content: [{ type: 'text', text: 'Invalid params: expected object with "name"' }], isError: true };
+  if (typeof params !== "object" || params === null) {
+    return {
+      content: [{ type: "text", text: 'Invalid params: expected object with "name"' }],
+      isError: true,
+    };
   }
 
   const callParams = params as ToolCallParams;
-  if (typeof callParams.name !== 'string' || callParams.name.length === 0) {
-    return { content: [{ type: 'text', text: 'Invalid params: "name" must be a non-empty string' }], isError: true };
+  if (typeof callParams.name !== "string" || callParams.name.length === 0) {
+    return {
+      content: [{ type: "text", text: 'Invalid params: "name" must be a non-empty string' }],
+      isError: true,
+    };
   }
 
   const tool = tools.get(callParams.name);
   if (!tool) {
-    const names = Array.from(tools.keys()).join(', ');
-    return { content: [{ type: 'text', text: `Tool not found: '${callParams.name}'. Available: ${names || '(none)'}` }], isError: true };
+    const names = Array.from(tools.keys()).join(", ");
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Tool not found: '${callParams.name}'. Available: ${names || "(none)"}`,
+        },
+      ],
+      isError: true,
+    };
   }
 
   const args = callParams.arguments ?? {};
   const schemaErr = validateAgainstSchema(args, tool.inputSchema);
   if (schemaErr) {
-    return { content: [{ type: 'text', text: schemaErr }], isError: true };
+    return { content: [{ type: "text", text: schemaErr }], isError: true };
   }
 
   try {
     return await tool.handler(args);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: 'text', text: `Tool error: ${msg}` }], isError: true };
+    return { content: [{ type: "text", text: `Tool error: ${msg}` }], isError: true };
   }
 }
 
@@ -156,14 +186,15 @@ export async function handleRequest(
   tools: Map<string, ToolDefinition>,
 ): Promise<JsonRpcResponse> {
   const { req, error: parseError } = parseBody(rawBody);
-  if (parseError || !req) return parseError!;
+  if (parseError) return parseError;
+  if (!req) throw new Error("parseBody returned neither req nor error");
 
   const { id, method } = req;
 
   switch (method) {
     case MCP_INITIALIZE:
       return makeResult(id, {
-        protocolVersion: '2024-11-05',
+        protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
         serverInfo: { name: pkg.name, version: pkg.version },
       });

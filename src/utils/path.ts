@@ -1,5 +1,5 @@
-import * as vscode from 'vscode';
-import * as path from 'path';
+import * as path from "node:path";
+import * as vscode from "vscode";
 
 /**
  * Resolve a file path argument against a specific workspace folder or the first one.
@@ -19,7 +19,11 @@ import * as path from 'path';
  * @throws If the resolved path escapes all open workspace folders (unless
  *         `allowOutsideWorkspace` is true).
  */
-export function resolvePath(input: string, folderName?: string, allowOutsideWorkspace = false): vscode.Uri {
+export function resolvePath(
+  input: string,
+  folderName?: string,
+  allowOutsideWorkspace = false,
+): vscode.Uri {
   let resolved: string;
   const inputWasAbsolute = path.isAbsolute(input);
 
@@ -29,11 +33,11 @@ export function resolvePath(input: string, folderName?: string, allowOutsideWork
     const folders = vscode.workspace.workspaceFolders;
     if (folders && folders.length > 0) {
       if (folderName) {
-        const folder = folders.find(f => f.name === folderName);
+        const folder = folders.find((f) => f.name === folderName);
         if (!folder) {
-          const names = folders.map(f => f.name).join(', ');
+          const names = folders.map((f) => f.name).join(", ");
           throw new Error(
-            `Workspace folder '${folderName}' not found. Available folders: ${names || '(none)'}`,
+            `Workspace folder '${folderName}' not found. Available folders: ${names || "(none)"}`,
           );
         }
         resolved = path.join(folder.uri.fsPath, input);
@@ -56,12 +60,14 @@ export function resolvePath(input: string, folderName?: string, allowOutsideWork
   const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length > 0 && (!allowOutsideWorkspace || !inputWasAbsolute)) {
     const normalized = path.normalize(resolved);
-    const inWorkspace = folders.some(f => {
+    const inWorkspace = folders.some((f) => {
       const wsPath = path.normalize(f.uri.fsPath);
       return normalized === wsPath || normalized.startsWith(wsPath + path.sep);
     });
     if (!inWorkspace) {
-      throw new Error(`Path '${input}' resolves outside the workspace. Only workspace files are accessible.`);
+      throw new Error(
+        `Path '${input}' resolves outside the workspace. Only workspace files are accessible.`,
+      );
     }
   }
 
