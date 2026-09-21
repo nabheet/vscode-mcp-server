@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
-import { McpServer } from '../server';
+import { ToolRegistrar } from './index';
 import { defineTool } from './index';
 
-export function registerCommandsTools(server: McpServer): void {
+export function registerCommandsTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       'execute_command',

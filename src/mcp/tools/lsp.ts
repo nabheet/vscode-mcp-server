@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { McpServer } from '../server';
+import { ToolRegistrar } from './index';
 import { defineTool } from './index';
 import { withTimeout } from '../../utils/timeout';
 
@@ -39,7 +39,7 @@ function normaliseLocation(loc: any): NormalisedLocation {
   throw new Error('Unexpected location format from language server: ' + JSON.stringify(loc).slice(0, 200));
 }
 
-export function registerLspTools(server: McpServer): void {
+export function registerLspTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       'find_references',

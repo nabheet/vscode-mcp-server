@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { McpServer } from '../server';
+import { ToolRegistrar } from './index';
 import { defineTool } from './index';
 
 /** Platform default VS Code logs directory (non-Insiders + Insiders). */
@@ -105,7 +105,7 @@ async function tailLogFile(filePath: string, maxLines: number, grep?: string): P
   return filtered.slice(-maxLines).join('\n');
 }
 
-export function registerLogsTools(server: McpServer, context: vscode.ExtensionContext): void {
+export function registerLogsTools(server: ToolRegistrar, context: vscode.ExtensionContext): void {
   server.registerTool(
     defineTool(
       'list_logs',

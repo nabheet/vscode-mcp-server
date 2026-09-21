@@ -2,16 +2,42 @@ import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
-import { handleRequest } from './transport';
-import { ToolDefinition, JsonRpcResponse } from '../utils/types';
-import { withTimeout } from '../utils/timeout';
+import { ToolExecutor, BusyError } from './executor';
+import { ToolDefinition, JsonRpcResponse, ToolListItem } from '../utils/types';
 import { Metrics } from '../utils/metrics';
 import { ServerLog } from '../utils/serverLog';
+
+export { BusyError };
+
+/** Health-check signature used by the cluster to recognize a live Master. */
+export const HEALTH_SERVICE_NAME = 'vscode-mcp-server';
 
 interface SseSession {
   id: string;
   res: http.ServerResponse;
   sendEvent: (event: string, data: string) => void;
+}
+
+/**
+ * Result of the cluster routing hook. When `workerId` is set the response
+ * was already produced by proxying to that worker; otherwise the request is
+ * executed locally using `body` (which may have had the routing-only
+ * `workspace` argument stripped). `null` means "route normally, use the
+ * original body".
+ */
+export interface McpRouterResult {
+  body: string;
+  response?: JsonRpcResponse;
+}
+
+/**
+ * Optional cluster hook invoked at the single dispatch chokepoint (covers
+ * both direct POST /mcp and SSE session messages). Lets the Master route a
+ * request to the Worker whose workspace it targets instead of executing it
+ * in the Master's own extension host.
+ */
+export interface McpRouter {
+  route(rawBody: string): Promise<McpRouterResult | null>;
 }
 
 export interface McpServerOptions {
@@ -33,24 +59,22 @@ export interface McpServerOptions {
   metrics?: Metrics;
   /** JSON-lines file logger (survives process death — hot reload). */
   logger?: ServerLog;
-}
-
-/** Thrown when the concurrency cap is exceeded. */
-export class BusyError extends Error {
-  constructor(public readonly current: number, public readonly max: number) {
-    super(`Server busy: ${current} tool calls in flight (max ${max})`);
-    this.name = 'BusyError';
-  }
+  /** Cluster routing hook (Master only). */
+  router?: McpRouter;
+  /**
+   * Shared tool executor (single instance per process, created in
+   * extension.ts and reused by the Master's server, the Master's router,
+   * and any Worker coordinator). When omitted the server creates its own
+   * private executor with no tools registered — only useful for tests.
+   */
+  executor?: ToolExecutor;
 }
 
 const SSE_KEEPALIVE_MS = 15_000;
-const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_CONCURRENT = 10;
 const LAG_INTERVAL_MS = 1_000;
 
 export class McpServer {
   private server: http.Server | https.Server | null = null;
-  private tools: Map<string, ToolDefinition> = new Map();
   private activeRequests = 0;
   private shuttingDown = false;
   private options: McpServerOptions;
@@ -59,29 +83,47 @@ export class McpServer {
   private sessions = new Map<string, SseSession>();
   private metrics: Metrics;
   private readonly fileLog?: ServerLog;
-  private readonly maxConcurrent: number;
-  private inFlight = 0;
   private lagMs = 0;
   private lastLagSample = Date.now();
   private lagTimer: NodeJS.Timeout | null = null;
+  private readonly executor: ToolExecutor;
 
   constructor(options: McpServerOptions) {
     this.options = options;
     this.useTls = !!(options.tlsCertPath && options.tlsKeyPath);
     this.metrics = options.metrics ?? new Metrics();
-    this.maxConcurrent = options.maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT;
     this.fileLog = options.logger;
+    this.executor = options.executor ?? new ToolExecutor({
+      toolTimeoutMs: options.toolTimeoutMs,
+      maxConcurrentRequests: options.maxConcurrentRequests,
+      metrics: this.metrics,
+      logger: options.logger,
+    });
     if (options.authToken && !this.useTls) {
       console.warn('[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.');
     }
   }
 
   registerTool(def: ToolDefinition): void {
-    this.tools.set(def.name, def);
+    this.executor.registerTool(def);
   }
 
   setOnListen(cb: (url: string) => void): void {
     this.onListen = cb;
+  }
+
+  get toolCount(): number {
+    return this.executor.toolCount;
+  }
+
+  listTools(): ToolListItem[] {
+    return this.executor.listTools();
+  }
+
+  /** Public entry for the cluster router to execute a body locally (or via
+   *  the configured router hook). Used by the Master's proxy fallback. */
+  async handleRawBody(rawBody: string): Promise<JsonRpcResponse> {
+    return this.dispatch(rawBody);
   }
 
   start(): Promise<void> {
@@ -229,61 +271,38 @@ export class McpServer {
     this.metrics.gauge('vscode_mcp_memory_rss_bytes', mem.rss, 'Resident set size (bytes)');
     this.metrics.gauge('vscode_mcp_memory_heap_used_bytes', mem.heapUsed, 'Heap used (bytes)');
     this.metrics.gauge('vscode_mcp_event_loop_lag_ms', this.lagMs, 'Event loop lag (ms), sampled each second');
-    this.metrics.gauge('vscode_mcp_inflight_requests', this.inFlight, 'Tool calls currently in flight');
+    this.metrics.gauge('vscode_mcp_inflight_requests', this.executor.inflight, 'Tool calls currently in flight');
     this.metrics.gauge('vscode_mcp_sse_sessions', this.sessions.size, 'Open SSE sessions');
-    this.metrics.gauge('vscode_mcp_max_concurrent', this.maxConcurrent, 'Concurrency cap');
+    this.metrics.gauge('vscode_mcp_max_concurrent', this.executor.maxConcurrent, 'Concurrency cap');
   }
 
-  /** Run a JSON-RPC request under the concurrency cap; time it; record
-   *  metrics and a durable log line per request. Throws BusyError when
-   *  over the cap, and rethrows tool errors after recording them. */
+  /**
+   * Execute a JSON-RPC body. When a cluster router is configured it gets
+   * first shot: a worker-routed call returns a pre-built response, otherwise
+   * the (possibly re-serialized) body runs against the local executor.
+   */
   private async dispatch(rawBody: string): Promise<JsonRpcResponse> {
-    if (this.inFlight >= this.maxConcurrent) {
-      throw new BusyError(this.inFlight, this.maxConcurrent);
-    }
-    this.inFlight++;
-    const started = Date.now();
-    const toolName = extractToolName(rawBody);
-    try {
-      const toolDef = this.tools.get(toolName);
-      const timeoutMs = this.options.toolTimeoutMs ?? toolDef?.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
-      const response = await withTimeout(
-        handleRequest(rawBody, this.tools),
-        timeoutMs,
-        `Tool call timed out after ${timeoutMs}ms (VS Code/DAP unresponsive)`,
-      );
-      const durMs = Date.now() - started;
-      this.metrics.histogram('vscode_mcp_tool_duration_seconds', 'Tool call duration (seconds)')
-        .observe(durMs / 1000);
-      this.metrics.counterInc('vscode_mcp_tool_total', 'Total tool calls dispatched');
-      if (response.error) {
-        const msg = response.error.message || ('code ' + response.error.code);
-        this.metrics.recordError(toolName, msg);
-        this.metrics.counterInc('vscode_mcp_tool_errors', 'Tool calls that returned an error');
-        this.fileLog?.log({ type: 'tool', tool: toolName, ok: false, durMs, error: msg });
-      } else {
-        this.fileLog?.log({ type: 'tool', tool: toolName, ok: true, durMs });
+    let body = rawBody;
+    const router = this.options.router;
+    if (router) {
+      const routed = await router.route(rawBody);
+      if (routed) {
+        body = routed.body;
+        if (routed.response) return routed.response;
       }
-      return response;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.metrics.counterInc('vscode_mcp_tool_errors', 'Tool calls that threw');
-      this.metrics.recordError(toolName, msg);
-      this.fileLog?.log({ type: 'tool', tool: toolName, ok: false, durMs: Date.now() - started, error: msg, threw: true });
-      throw err;
-    } finally {
-      this.inFlight--;
     }
+    return this.executor.dispatch(body);
   }
 
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const origin = req.headers['origin'] as string | undefined;
     const pathname = (req.url || '').split('?')[0];
 
-    // Health check
+    // Health check — carries the cluster signature so other instances can
+    // recognize this process as a valid Master (see cluster/election.ts).
     if (req.method === 'GET' && pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+      res.end(JSON.stringify({ service: HEALTH_SERVICE_NAME, status: 'ok', uptime: process.uptime() }));
       return;
     }
 
@@ -518,16 +537,4 @@ export class McpServer {
 
     req.on('error', () => { activeRequestDone(); });
   }
-}
-
-/** Best-effort extraction of the MCP method / tool name for metrics and logs. */
-function extractToolName(rawBody: string): string {
-  try {
-    const parsed = JSON.parse(rawBody) as { method?: string; params?: { name?: string } };
-    if (parsed?.method === 'tools/call' && typeof parsed.params?.name === 'string') {
-      return parsed.params.name;
-    }
-    if (typeof parsed?.method === 'string') return parsed.method;
-  } catch { /* fall through */ }
-  return '<unparseable>';
 }

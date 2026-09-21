@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { McpServer } from '../server';
+import { ToolRegistrar } from './index';
 import { defineTool } from './index';
 import { resolvePath } from '../../utils/path';
 import { parseJsonc } from '../../utils/jsonc';
@@ -176,7 +176,7 @@ async function launchCompound(
   return { started, failed };
 }
 
-export function registerDebugTools(server: McpServer): void {
+export function registerDebugTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       'start_debugging',

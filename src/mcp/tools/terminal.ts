@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { McpServer } from '../server';
+import { ToolRegistrar } from './index';
 import { defineTool } from './index';
 
 /**
@@ -99,7 +99,7 @@ function getOrCreateTerminal(name: string): vscode.Terminal {
   return term;
 }
 
-export function registerTerminalTools(server: McpServer, context: vscode.ExtensionContext): void {
+export function registerTerminalTools(server: ToolRegistrar, context: vscode.ExtensionContext): void {
   ensureOutputCapture(context);
 
   server.registerTool(
