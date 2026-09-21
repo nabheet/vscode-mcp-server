@@ -23,12 +23,7 @@ import {
   REGISTER_TIMEOUT_MS,
 } from "./constants";
 import { connectIpc } from "./ipc";
-import {
-  createDecoder,
-  encodeMessage,
-  type IpcMessage,
-  type WindowState,
-} from "./protocol";
+import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
 
 export interface WorkerOptions {
   ipcPath?: string;
