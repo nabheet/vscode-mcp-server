@@ -1,28 +1,40 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import { McpServer, type McpServerOptions } from "./mcp/server";
+import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
+import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
 import { Metrics } from "./utils/metrics";
 import { ServerLog } from "./utils/serverLog";
 
 const OUTPUT_CHANNEL_NAME = "VS Code MCP Server";
-let server: McpServer | null = null;
+const DEFAULT_PORT = 6010;
+
 let outputChannel: vscode.OutputChannel | null = null;
+let member: ClusterMember | null = null;
+let statusBar: vscode.StatusBarItem | null = null;
+let electing = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
-  outputChannel.appendLine("[mcp] Activating vscode-mcp-server...");
+  outputChannel.appendLine("[mcp] Activating vscode-mcp-server (cluster mode)...");
 
   // Observability: shared metrics registry + rotating JSON-lines file log.
-  // The file log lives in context.logUri, so records survive the hot-reload
-  // crashes this server is hardened against (see /metrics, /diagnostics).
   const metrics = new Metrics();
   const logDir = context.logUri?.scheme === "file" ? context.logUri.fsPath : undefined;
   const fileLog = logDir ? new ServerLog(logDir) : undefined;
-  metrics.gauge("vscode_mcp_max_concurrent", 10, "Concurrency cap");
+  if (fileLog) {
+    outputChannel.appendLine("[mcp] JSON log: " + logDir);
+    fileLog.log({
+      type: "lifecycle",
+      event: "activate",
+      version: vscode.version,
+      remote: vscode.env.remoteName ?? "local",
+    });
+  }
 
   // Read config (VS Code settings with env fallbacks)
   const config = vscode.workspace.getConfiguration("vscode-mcp-server");
-  const port = config.get<number>("port") || Number(process.env.MCP_PORT) || 9876;
+  const port = config.get<number>("port") || Number(process.env.MCP_PORT) || DEFAULT_PORT;
   const authToken = config.get<string>("authToken") || process.env.MCP_AUTH_TOKEN || "";
   const tlsCertPath = config.get<string>("tlsCertPath") || process.env.MCP_TLS_CERT_PATH || "";
   const tlsKeyPath = config.get<string>("tlsKeyPath") || process.env.MCP_TLS_KEY_PATH || "";
@@ -44,67 +56,56 @@ export function activate(context: vscode.ExtensionContext): void {
 
   if (isRemoteContainer) {
     outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
-    outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
+    outputChannel.appendLine(
+      '[mcp] Ensure devcontainer.json includes: "forwardPorts": [' + port + "]",
+    );
   }
-
   if (authToken) {
     outputChannel.appendLine(
       "[mcp] Auth token configured — clients must send Authorization: Bearer <token>",
     );
   }
-
   if (useTls) {
-    outputChannel.appendLine(`[mcp] TLS enabled — using cert: ${tlsCertPath}`);
+    outputChannel.appendLine("[mcp] TLS enabled — using cert: " + tlsCertPath);
   }
 
-  if (fileLog) {
-    outputChannel.appendLine(`[mcp] JSON log: ${logDir}`);
-    fileLog.log({
-      type: "lifecycle",
-      event: "activate",
-      version: vscode.version,
-      remote: vscode.env.remoteName ?? "local",
-    });
-  }
+  // This window's cluster identity. The id must be unique per window (even
+  // for two windows on the same folder) — the pid disambiguates.
+  const workspaceFolders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+  const workspaceId =
+    workspaceFolders.length > 0 ? `${workspaceFolders[0]}:${process.pid}` : `empty:${process.pid}`;
+  const displayName =
+    vscode.workspace.name ?? (workspaceFolders.length > 0 ? workspaceFolders[0] : "No Folder");
 
-  // Build server options
-  const opts: McpServerOptions = {
-    port,
-    host,
-    ...(authToken ? { authToken } : {}),
-    ...(useTls ? { tlsCertPath, tlsKeyPath } : {}),
-    metrics,
-    ...(fileLog ? { logger: fileLog } : {}),
-  };
+  // Wire-level instance identity: a stable per-window UUID + human-readable
+  // name surfaced in initialize serverInfo and list_workspaces so MCP clients
+  // can tell which VS Code window they are talking to.
+  const instanceId = randomUUID();
+  const instanceName = vscode.workspace.name ?? "Untitled";
 
-  server = new McpServer(opts);
-  registerAllTools(server, context);
+  // Shared execution engine: one instance per process, reused by the Master's
+  // HTTP server, the Master's router, and Worker forwarded calls, so every
+  // cluster member runs the identical tool set with identical limits.
+  const executor = new ToolExecutor({ metrics, logger: fileLog, instanceId, instanceName });
+  registerAllTools(executor, context);
 
-  // Connection info callback
-  server.setOnListen((url: string) => {
-    let msg = `MCP server listening on ${url}`;
-    if (isRemoteContainer) {
-      msg += " (remote container — use forwarded port)";
-    }
-    if (authToken) {
-      msg += " [auth enabled]";
-    }
-    outputChannel?.appendLine(`[mcp] ${msg}`);
-    console.log(`[vscode-mcp-server] ${msg}`);
-  });
-
-  // Start server with port retry
-  startServerWithRetry(
-    port,
+  // Elect a role (master = own the port; worker = join the existing master).
+  void startCluster({
+    basePort: port,
     host,
     authToken,
-    tlsCertPath,
-    tlsKeyPath,
-    context,
+    tlsCertPath: useTls ? tlsCertPath : undefined,
+    tlsKeyPath: useTls ? tlsKeyPath : undefined,
+    executor,
     metrics,
-    fileLog,
-  ).catch((err) => {
-    outputChannel?.appendLine(`[mcp] FATAL: ${err.message}`);
+    logger: fileLog,
+    workspaceId,
+    workspacePaths: workspaceFolders,
+    displayName,
+    instanceId,
+    instanceName,
+    isRemoteContainer,
+    log: (msg: string) => outputChannel?.appendLine("[mcp] " + msg),
   });
 
   // Listen for config changes
@@ -121,72 +122,99 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   outputChannel?.appendLine("[mcp] Shutting down...");
-  if (server) {
-    server.stop(5000).catch(() => {
+  if (member) {
+    const m = member;
+    member = null;
+    m.stop(3000).catch(() => {
       /* ignore shutdown errors */
     });
-    server = null;
   }
   outputChannel?.appendLine("[mcp] Shutdown complete");
 }
 
-async function startServerWithRetry(
-  basePort: number,
-  host: string,
-  authToken: string,
-  tlsCertPath: string,
-  tlsKeyPath: string,
-  context: vscode.ExtensionContext,
-  metrics: Metrics,
-  fileLog: ServerLog | undefined,
-): Promise<void> {
-  let currentPort = basePort;
-  const useTls = !!(tlsCertPath && tlsKeyPath);
-  const maxRetries = Number(process.env.MCP_SERVER_MAX_RETRIES) || 3;
+interface ClusterStartOptions {
+  basePort: number;
+  host: string;
+  authToken: string;
+  tlsCertPath?: string;
+  tlsKeyPath?: string;
+  executor: ToolExecutor;
+  metrics: Metrics;
+  logger?: ServerLog;
+  workspaceId: string;
+  workspacePaths: string[];
+  displayName: string;
+  instanceId: string;
+  instanceName: string;
+  isRemoteContainer: boolean;
+  log: (msg: string) => void;
+}
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    currentPort = basePort + attempt;
-    const opts: McpServerOptions = {
-      port: currentPort,
-      host,
-      ...(authToken ? { authToken } : {}),
-      ...(useTls ? { tlsCertPath, tlsKeyPath } : {}),
-      metrics,
-      ...(fileLog ? { logger: fileLog } : {}),
-    };
+/** Elect a role and wire re-election. Re-runs whenever the Master is lost. */
+async function startCluster(opts: ClusterStartOptions): Promise<void> {
+  if (electing) return;
+  electing = true;
+  try {
+    const newMember = await bootstrapCluster({
+      basePort: opts.basePort,
+      host: opts.host,
+      ...(opts.authToken ? { authToken: opts.authToken } : {}),
+      ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
+      executor: opts.executor,
+      metrics: opts.metrics,
+      logger: opts.logger,
+      workspaceId: opts.workspaceId,
+      workspacePaths: opts.workspacePaths,
+      displayName: opts.displayName,
+      instanceId: opts.instanceId,
+      instanceName: opts.instanceName,
+      log: opts.log,
+    });
 
-    const srv = new McpServer(opts);
-    registerAllTools(srv, context);
-    server = srv;
-
-    try {
-      // Re-set the onListen since we created a new server
-      srv.setOnListen((url: string) => {
-        let msg = `MCP server listening on ${url}`;
-        if (
-          vscode.env.remoteName === "dev-container" ||
-          vscode.env.remoteName === "attached-container"
-        ) {
-          msg += " (remote container — use forwarded port)";
-        }
-        if (authToken) msg += " [auth enabled]";
-        outputChannel?.appendLine(`[mcp] ${msg}`);
-        console.log(`[vscode-mcp-server] ${msg}`);
-      });
-
-      await srv.start();
-      return;
-    } catch (err) {
-      const e = err as { code?: string; message?: string };
-      if (
-        (e.code === "EADDRINUSE" || e.message?.includes("already in use")) &&
-        attempt < maxRetries - 1
-      ) {
-        outputChannel?.appendLine(`[mcp] Port ${currentPort} in use, trying ${currentPort + 1}...`);
-        continue;
-      }
-      throw err;
+    // Stop the previous member (a worker that lost its master; idempotent).
+    if (member && member !== newMember) {
+      const old = member;
+      member = null;
+      await old.stop(500).catch(() => {});
     }
+    member = newMember;
+
+    if (newMember.role === "worker") {
+      newMember.setOnLostMaster((reason: string) => {
+        opts.log(`Lost master (${reason}) — re-electing...`);
+        void startCluster(opts);
+      });
+    } else {
+      newMember.setOnListen((url: string) => {
+        let msg = "MCP server listening on " + url;
+        if (opts.isRemoteContainer) msg += " (remote container — use forwarded port)";
+        if (opts.authToken) msg += " [auth enabled]";
+        opts.log(msg);
+        console.log("[vscode-mcp-server] " + msg);
+      });
+    }
+    updateStatusBar(newMember);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    opts.log("FATAL cluster startup: " + msg);
+  } finally {
+    electing = false;
   }
-  throw new Error(`Could not find available port after ${maxRetries} attempts`);
+}
+
+function updateStatusBar(m: ClusterMember): void {
+  if (!statusBar) {
+    statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBar.name = "MCP Server";
+    statusBar.show();
+  }
+  if (m.role === "master") {
+    statusBar.text = `$(server) MCP :${m.port}`;
+    statusBar.tooltip = "MCP cluster master — serving " + m.port;
+    statusBar.backgroundColor = undefined;
+  } else {
+    statusBar.text = "$(plug) MCP worker";
+    statusBar.tooltip = "MCP cluster worker (master in another window)";
+    statusBar.backgroundColor = undefined;
+  }
 }

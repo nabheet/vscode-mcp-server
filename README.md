@@ -14,7 +14,9 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
    [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp)
    or install a `.vsix` from the [latest release](https://github.com/nabheet/vscode-mcp-server/releases).
 
-2. **Reload VS Code** — the extension starts automatically on startup, listening on `http://127.0.0.1:9876`.
+2. **Reload VS Code** — the extension starts automatically on startup. The first window becomes the
+   **master** and listens on `http://127.0.0.1:6010`; additional windows join as **workers** over an
+   IPC socket and share the same port (the MCP client targets a window via a `workspace` argument).
 
 3. **Configure your AI tool** (e.g., opencode) to connect via SSE:
 
@@ -22,7 +24,7 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
    {
      "vscode-mcp": {
        "type": "remote",
-       "url": "http://127.0.0.1:9876/mcp"
+       "url": "http://127.0.0.1:6010/mcp"
      }
    }
    ```
@@ -30,7 +32,7 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 4. **Verify** the server is running:
 
    ```bash
-   curl -s -X POST http://127.0.0.1:9876/mcp \
+   curl -s -X POST http://127.0.0.1:6010/mcp \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
    ```
@@ -39,11 +41,21 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ```text
 VS Code Extension (onStartupFinished)
-  └─ src/extension.ts          — Lifecycle: activation, tool registration, deactivation
+  └─ src/extension.ts          — Lifecycle: activation, cluster election, re-election,
+                                  tool registration, deactivation
   └─ src/config.ts             — Settings (port, auth, TLS) from VS Code + env fallbacks
   └─ src/mcp/
+       ├─ executor.ts          — Shared tool executor: registration, dispatch, concurrency cap, timeouts
        ├─ server.ts            — HTTP server: CORS, auth, TLS, SSE transport, JSON-RPC dispatch
        ├─ transport.ts         — JSON-RPC 2.0 handler + MCP protocol lifecycle
+       ├─ cluster/
+       │    ├─ election.ts     — Port probing (/health + IPC liveness) → valid | free | foreign | zombie
+       │    ├─ master.ts       — MasterCoordinator: owns the HTTP port, routes tools/call
+│    │                    to workers, list_workspaces
+       │    ├─ worker.ts       — WorkerCoordinator: joins master via IPC, heartbeat failover + re-election
+       │    ├─ bootstrap.ts    — Bounded retry loop: promote (master) or join (worker), with backoff
+       │    ├─ protocol.ts     — Length-prefixed JSON framing for the IPC pipe
+       │    └─ ipc.ts          — Unix-socket helpers (stale-socket recovery, liveness checks)
        └─ tools/
             ├─ commands.ts     — Execute/catalog VS Code commands, get code actions
             ├─ navigation.ts   — Open files, jump to line/col, select, reveal, close editors
@@ -80,6 +92,7 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
+| `list_workspaces` | cluster | List all VS Code windows in the cluster (each worker) |
 | `add_workspace_folder` | workspace | Add a folder to the workspace (multi-root) |
 | `update_workspace_folder` | workspace | Rename/change a workspace folder's path (multi-root) |
 | `remove_workspace_folder` | workspace | Remove a folder from the workspace (multi-root) |
@@ -123,7 +136,7 @@ Add to your `opencode.global.jsonc` or `opencode.json`:
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "http://127.0.0.1:9876/mcp"
+      "url": "http://127.0.0.1:6010/mcp"
     }
   }
 }
@@ -143,7 +156,7 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "http://127.0.0.1:9876/mcp"
+      "url": "http://127.0.0.1:6010/mcp"
     }
   }
 }
@@ -175,7 +188,7 @@ In Cursor Settings → Features → MCP Servers → Add new MCP server:
 ```text
 Name: vscode-mcp
 Type: remote
-URL: http://127.0.0.1:9876/mcp
+URL: http://127.0.0.1:6010/mcp
 ```
 
 ### Windsurf / Continue.dev / Any MCP-compatible tool
@@ -183,7 +196,7 @@ URL: http://127.0.0.1:9876/mcp
 Add a `type: "remote"` MCP server pointing to:
 
 ```text
-http://127.0.0.1:9876/mcp
+http://127.0.0.1:6010/mcp
 ```
 
 The server uses **SSE transport** (the standard MCP HTTP transport). If the tool
@@ -197,7 +210,7 @@ write a thin wrapper.
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-async with sse_client("http://127.0.0.1:9876/mcp") as transport:
+async with sse_client("http://127.0.0.1:6010/mcp") as transport:
     async with ClientSession(transport) as session:
         result = await session.list_tools()
         for tool in result.tools:
@@ -209,7 +222,7 @@ async with sse_client("http://127.0.0.1:9876/mcp") as transport:
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
-const transport = new SSEClientTransport(new URL("http://127.0.0.1:9876/mcp"));
+const transport = new SSEClientTransport(new URL("http://127.0.0.1:6010/mcp"));
 const client = new Client({ name: "my-agent", version: "1.0.0" });
 await client.connect(transport);
 const tools = await client.listTools();
@@ -233,7 +246,7 @@ update your client URL and headers accordingly.
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "https://127.0.0.1:9876/mcp",   // https, not http
+      "url": "https://127.0.0.1:6010/mcp",   // https, not http
       "headers": {
         "Authorization": "Bearer <your-token>"
       }
@@ -249,7 +262,7 @@ update your client URL and headers accordingly.
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "https://127.0.0.1:9876/mcp",
+      "url": "https://127.0.0.1:6010/mcp",
       "headers": {
         "Authorization": "Bearer <your-token>"
       }
@@ -265,7 +278,7 @@ In Cursor Settings → Features → MCP Servers:
 ```text
 Name: vscode-mcp
 Type: remote
-URL: https://127.0.0.1:9876/mcp
+URL: https://127.0.0.1:6010/mcp
 Headers: { "Authorization": "Bearer <your-token>" }
 ```
 
@@ -276,7 +289,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 
 async with sse_client(
-    "https://127.0.0.1:9876/mcp",
+    "https://127.0.0.1:6010/mcp",
     headers={"Authorization": "Bearer <your-token>"},
 ) as transport:
     async with ClientSession(transport) as session:
@@ -290,7 +303,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
 const transport = new SSEClientTransport(
-  new URL("https://127.0.0.1:9876/mcp"),
+  new URL("https://127.0.0.1:6010/mcp"),
   { headers: { Authorization: "Bearer <your-token>" } }
 );
 const client = new Client({ name: "my-agent", version: "1.0.0" });
@@ -301,13 +314,13 @@ await client.connect(transport);
 
 ```bash
 # With TLS
-curl -sk https://127.0.0.1:9876/mcp \
+curl -sk https://127.0.0.1:6010/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <your-token>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # With TLS + auth, direct POST
-curl -sk -X POST https://127.0.0.1:9876/mcp \
+curl -sk -X POST https://127.0.0.1:6010/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <your-token>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -341,7 +354,7 @@ match an allowed loopback address, the server rejects the request with
 
 ```bash
 # Verify the server is running
-curl -s -X POST http://127.0.0.1:9876/mcp \
+curl -s -X POST http://127.0.0.1:6010/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -416,7 +429,7 @@ Full MCP protocol lifecycle implemented:
 
 ### Port Retry
 
-If the default port (9876) is busy, the server tries up to 5 consecutive ports
+If the default port (6010) is busy, the server tries up to 5 consecutive ports
 (±1 each try). If all fail, the extension logs an error and deactivates.
 
 ## Configuration
@@ -425,7 +438,7 @@ All settings under `vscode-mcp-server.*`:
 
 | Setting | Default | Description |
 | --------- | --------- | ------------- |
-| `port` | `9876` | HTTP server port (auto-retries if busy) |
+| `port` | `6010` | HTTP server port (auto-retries if busy) |
 | `authToken` | `""` | Bearer token (empty = no auth). Warns if set without TLS |
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
@@ -434,7 +447,7 @@ Settings fall back to environment variables:
 
 | Env var | Overrides | Default |
 | --------- | ----------- | --------- |
-| `MCP_PORT` | `port` | `9876` |
+| `MCP_PORT` | `port` | `6010` |
 | `MCP_AUTH_TOKEN` | `authToken` | (none) |
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
 | `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
@@ -501,7 +514,7 @@ npm test           # 75 tests across 3 suites (server, transport, tools)
 
 1. Press F5 in VS Code (uses `.vscode/launch.json` "Run Extension" config)
 2. A new Extension Development Host window opens
-3. The MCP server starts automatically on port 9876
+3. The MCP server starts automatically on port 6010
 4. Set breakpoints in `src/` to debug tool handlers
 5. The `npm: watch` task auto-compiles on save
 
