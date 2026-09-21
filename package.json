@@ -76,6 +76,9 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "typecheck": "tsc --noEmit",
+    "lint": "biome check . && markdownlint-cli2",
+    "lint:fix": "biome check --write . && markdownlint-cli2 --fix",
+    "check": "npm run typecheck && npm run lint",
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -83,10 +86,12 @@
     "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.ts"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
     "@types/node": "^26.2.0",
     "@types/vscode": "^1.134.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
+    "markdownlint-cli2": "^0.23.3",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
   }
