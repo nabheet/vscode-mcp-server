@@ -1,6 +1,6 @@
 // ── JSON-RPC 2.0 Types ──────────────────────────────────────────────
 export interface JsonRpcRequest {
-  jsonrpc: '2.0';
+  jsonrpc: "2.0";
   id: number | string | null;
   method: string;
   params?: unknown;
@@ -13,7 +13,7 @@ export interface JsonRpcError {
 }
 
 export interface JsonRpcResponse {
-  jsonrpc: '2.0';
+  jsonrpc: "2.0";
   id: number | string | null;
   result?: unknown;
   error?: JsonRpcError;
@@ -37,7 +37,7 @@ export interface ToolDefinition {
 }
 
 export interface TextContent {
-  type: 'text';
+  type: "text";
   text: string;
 }
 
@@ -47,10 +47,10 @@ export interface CallToolResult {
 }
 
 // ── MCP Method Names ─────────────────────────────────────────────────
-export const MCP_TOOLS_LIST = 'tools/list' as const;
-export const MCP_TOOLS_CALL = 'tools/call' as const;
-export const MCP_INITIALIZE = 'initialize' as const;
-export const MCP_NOTIFICATION_INITIALIZED = 'notifications/initialized' as const;
+export const MCP_TOOLS_LIST = "tools/list" as const;
+export const MCP_TOOLS_CALL = "tools/call" as const;
+export const MCP_INITIALIZE = "initialize" as const;
+export const MCP_NOTIFICATION_INITIALIZED = "notifications/initialized" as const;
 export type McpMethod = typeof MCP_TOOLS_LIST | typeof MCP_TOOLS_CALL | typeof MCP_INITIALIZE;
 
 // ── Error Codes (JSON-RPC 2.0 standard + MCP range) ─────────────────

@@ -11,14 +11,14 @@ export function parseJsonc<T = unknown>(text: string): T {
   let inString = false;
   let inLineComment = false;
   let inBlockComment = false;
-  let out = '';
+  let out = "";
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     const next = text[i + 1];
 
     if (inLineComment) {
-      if (ch === '\n') {
+      if (ch === "\n") {
         inLineComment = false;
         out += ch;
       }
@@ -26,7 +26,7 @@ export function parseJsonc<T = unknown>(text: string): T {
     }
 
     if (inBlockComment) {
-      if (ch === '*' && next === '/') {
+      if (ch === "*" && next === "/") {
         inBlockComment = false;
         i++;
       }
@@ -35,7 +35,7 @@ export function parseJsonc<T = unknown>(text: string): T {
 
     if (inString) {
       out += ch;
-      if (ch === '\\' && next !== undefined) {
+      if (ch === "\\" && next !== undefined) {
         out += next;
         i++;
       } else if (ch === '"') {
@@ -50,23 +50,23 @@ export function parseJsonc<T = unknown>(text: string): T {
       continue;
     }
 
-    if (ch === '/' && next === '/') {
+    if (ch === "/" && next === "/") {
       inLineComment = true;
       i++;
       continue;
     }
 
-    if (ch === '/' && next === '*') {
+    if (ch === "/" && next === "*") {
       inBlockComment = true;
       i++;
       continue;
     }
 
     // Strip trailing commas (only outside strings): `,` directly before `}`/`]`
-    if (ch === ',') {
+    if (ch === ",") {
       let j = i + 1;
       while (j < text.length && /\s/.test(text[j])) j++;
-      if (text[j] === '}' || text[j] === ']') {
+      if (text[j] === "}" || text[j] === "]") {
         i = j - 1; // skip the comma; the closing bracket is emitted next
         continue;
       }

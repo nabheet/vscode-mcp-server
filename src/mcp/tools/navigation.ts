@@ -1,7 +1,7 @@
-import * as vscode from 'vscode';
-import { McpServer } from '../server';
-import { defineTool } from './index';
-import { resolvePath } from '../../utils/path';
+import * as vscode from "vscode";
+import { resolvePath } from "../../utils/path";
+import type { McpServer } from "../server";
+import { defineTool } from "./index";
 
 /** Ensure a text editor is open for the given URI, return it */
 async function openEditor(uri: vscode.Uri): Promise<vscode.TextEditor> {
@@ -12,23 +12,49 @@ async function openEditor(uri: vscode.Uri): Promise<vscode.TextEditor> {
 export function registerNavigationTools(server: McpServer): void {
   server.registerTool(
     defineTool(
-      'open_file',
-      'Open a file in the editor.',
+      "open_file",
+      "Open a file in the editor.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path'],
+        required: ["path"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         try {
           const editor = await openEditor(uri);
-          return { content: [{ type: 'text', text: `Opened ${uri.fsPath} at line ${editor.selection.active.line + 1}` }], isError: false };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Opened ${uri.fsPath} at line ${editor.selection.active.line + 1}`,
+              },
+            ],
+            isError: false,
+          };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed to open file: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to open file: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -36,28 +62,46 @@ export function registerNavigationTools(server: McpServer): void {
 
   server.registerTool(
     defineTool(
-      'open_file_at_line',
-      'Open a file and jump to a specific line.',
+      "open_file_at_line",
+      "Open a file and jump to a specific line.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          line: { type: 'integer', description: 'Line number (1-indexed)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          line: { type: "integer", description: "Line number (1-indexed)" },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path', 'line'],
+        required: ["path", "line"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         const line = Math.max(0, Number(args.line) - 1); // convert to 0-indexed
         try {
           const editor = await openEditor(uri);
           const pos = new vscode.Position(line, 0);
           editor.selection = new vscode.Selection(pos, pos);
           editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
-          return { content: [{ type: 'text', text: `Opened ${uri.fsPath} at line ${args.line}` }], isError: false };
+          return {
+            content: [{ type: "text", text: `Opened ${uri.fsPath} at line ${args.line}` }],
+            isError: false,
+          };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              { type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -65,20 +109,30 @@ export function registerNavigationTools(server: McpServer): void {
 
   server.registerTool(
     defineTool(
-      'open_file_at_position',
-      'Open a file and jump to a specific line and column.',
+      "open_file_at_position",
+      "Open a file and jump to a specific line and column.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          line: { type: 'integer', description: 'Line number (1-indexed)' },
-          column: { type: 'integer', description: 'Column number (1-indexed)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          line: { type: "integer", description: "Line number (1-indexed)" },
+          column: { type: "integer", description: "Column number (1-indexed)" },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path', 'line', 'column'],
+        required: ["path", "line", "column"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         const line = Math.max(0, Number(args.line) - 1);
         const col = Math.max(0, Number(args.column) - 1);
         try {
@@ -86,9 +140,22 @@ export function registerNavigationTools(server: McpServer): void {
           const pos = new vscode.Position(line, col);
           editor.selection = new vscode.Selection(pos, pos);
           editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
-          return { content: [{ type: 'text', text: `Opened ${uri.fsPath} at line ${args.line}, column ${args.column}` }], isError: false };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Opened ${uri.fsPath} at line ${args.line}, column ${args.column}`,
+              },
+            ],
+            isError: false,
+          };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              { type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -96,51 +163,79 @@ export function registerNavigationTools(server: McpServer): void {
 
   server.registerTool(
     defineTool(
-      'select_lines',
-      'Select a range of lines in the active editor.',
+      "select_lines",
+      "Select a range of lines in the active editor.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          startLine: { type: 'integer', description: 'Start line (1-indexed)' },
-          endLine: { type: 'integer', description: 'End line (1-indexed, inclusive)' },
+          startLine: { type: "integer", description: "Start line (1-indexed)" },
+          endLine: { type: "integer", description: "End line (1-indexed, inclusive)" },
         },
-        required: ['startLine', 'endLine'],
+        required: ["startLine", "endLine"],
       },
       async (args) => {
         const editor = vscode.window.activeTextEditor;
-        if (!editor) return { content: [{ type: 'text', text: 'No active editor' }], isError: true };
+        if (!editor)
+          return { content: [{ type: "text", text: "No active editor" }], isError: true };
 
         const start = Math.max(0, Number(args.startLine) - 1);
-        const end = Math.min(Math.max(start, Number(args.endLine) - 1), editor.document.lineCount - 1);
+        const end = Math.min(
+          Math.max(start, Number(args.endLine) - 1),
+          editor.document.lineCount - 1,
+        );
         editor.selection = new vscode.Selection(
           new vscode.Position(start, 0),
           new vscode.Position(end, editor.document.lineAt(end).text.length),
         );
-        editor.revealRange(new vscode.Range(start, 0, end, 0), vscode.TextEditorRevealType.InCenter);
-        return { content: [{ type: 'text', text: `Selected lines ${args.startLine}-${args.endLine}` }], isError: false };
+        editor.revealRange(
+          new vscode.Range(start, 0, end, 0),
+          vscode.TextEditorRevealType.InCenter,
+        );
+        return {
+          content: [{ type: "text", text: `Selected lines ${args.startLine}-${args.endLine}` }],
+          isError: false,
+        };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'reveal_in_explorer',
-      'Reveal a file in the VS Code Explorer sidebar.',
+      "reveal_in_explorer",
+      "Reveal a file in the VS Code Explorer sidebar.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path'],
+        required: ["path"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         try {
-          await vscode.commands.executeCommand('revealInExplorer', uri);
-          return { content: [{ type: 'text', text: `Revealed ${uri.fsPath} in explorer` }], isError: false };
+          await vscode.commands.executeCommand("revealInExplorer", uri);
+          return {
+            content: [{ type: "text", text: `Revealed ${uri.fsPath} in explorer` }],
+            isError: false,
+          };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              { type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -148,45 +243,45 @@ export function registerNavigationTools(server: McpServer): void {
 
   server.registerTool(
     defineTool(
-      'focus_editor',
-      'Focus the active editor group.',
+      "focus_editor",
+      "Focus the active editor group.",
       {
-        type: 'object',
+        type: "object",
         properties: {},
       },
       async () => {
-        await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
-        return { content: [{ type: 'text', text: 'Focused editor' }], isError: false };
+        await vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup");
+        return { content: [{ type: "text", text: "Focused editor" }], isError: false };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'close_editor',
-      'Close the active editor tab.',
+      "close_editor",
+      "Close the active editor tab.",
       {
-        type: 'object',
+        type: "object",
         properties: {},
       },
       async () => {
-        await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
-        return { content: [{ type: 'text', text: 'Closed active editor' }], isError: false };
+        await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+        return { content: [{ type: "text", text: "Closed active editor" }], isError: false };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'close_all_editors',
-      'Close all open editor tabs.',
+      "close_all_editors",
+      "Close all open editor tabs.",
       {
-        type: 'object',
+        type: "object",
         properties: {},
       },
       async () => {
-        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
-        return { content: [{ type: 'text', text: 'Closed all editors' }], isError: false };
+        await vscode.commands.executeCommand("workbench.action.closeAllEditors");
+        return { content: [{ type: "text", text: "Closed all editors" }], isError: false };
       },
     ),
   );

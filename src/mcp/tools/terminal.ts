@@ -1,6 +1,6 @@
-import * as vscode from 'vscode';
-import { McpServer } from '../server';
-import { defineTool } from './index';
+import * as vscode from "vscode";
+import type { McpServer } from "../server";
+import { defineTool } from "./index";
 
 /**
  * Buffer for terminal output captured via shell integration.
@@ -48,7 +48,7 @@ function ensureOutputCapture(context: vscode.ExtensionContext): void {
       const idx = managedOrder.indexOf(terminal.name);
       if (idx >= 0) managedOrder.splice(idx, 1);
       terminalBuffers.delete(terminal.name);
-    })
+    }),
   );
 
   const disposable = vscode.window.onDidStartTerminalShellExecution(async (event) => {
@@ -59,7 +59,7 @@ function ensureOutputCapture(context: vscode.ExtensionContext): void {
 
     const capture = (async () => {
       for await (const data of event.execution.read()) {
-        const existing = terminalBuffers.get(termName) || '';
+        const existing = terminalBuffers.get(termName) || "";
         const updated = existing + data;
         // Keep last ~100 KB
         terminalBuffers.set(termName, updated.length > 100_000 ? updated.slice(-100_000) : updated);
@@ -93,7 +93,7 @@ function getOrCreateTerminal(name: string): vscode.Terminal {
     term = vscode.window.createTerminal(name);
     managedTerminals.add(name);
     managedOrder.push(name);
-    terminalBuffers.set(name, '');
+    terminalBuffers.set(name, "");
     enforceTerminalCap();
   }
   return term;
@@ -104,19 +104,22 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
 
   server.registerTool(
     defineTool(
-      'execute_in_terminal',
-      'Execute a shell command in a VS Code integrated terminal. Uses shell integration when available for output capture.',
+      "execute_in_terminal",
+      "Execute a shell command in a VS Code integrated terminal. Uses shell integration when available for output capture.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          command: { type: 'string', description: 'Shell command to execute' },
-          name: { type: 'string', description: 'Terminal name (optional, creates new if not exists)' },
+          command: { type: "string", description: "Shell command to execute" },
+          name: {
+            type: "string",
+            description: "Terminal name (optional, creates new if not exists)",
+          },
         },
-        required: ['command'],
+        required: ["command"],
       },
       async (args) => {
         const cmd = String(args.command);
-        const termName = String(args.name || 'mcp-' + Date.now());
+        const termName = String(args.name || `mcp-${Date.now()}`);
         const term = getOrCreateTerminal(termName);
 
         term.show();
@@ -129,7 +132,7 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
         }
 
         return {
-          content: [{ type: 'text', text: 'Executed command in terminal "' + termName + '"' }],
+          content: [{ type: "text", text: `Executed command in terminal "${termName}"` }],
           isError: false,
         };
       },
@@ -138,15 +141,15 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
 
   server.registerTool(
     defineTool(
-      'get_terminal_output',
-      'Get the recent output from a terminal. Only terminals created via execute_in_terminal with shell integration are fully captured.',
+      "get_terminal_output",
+      "Get the recent output from a terminal. Only terminals created via execute_in_terminal with shell integration are fully captured.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          name: { type: 'string', description: 'Terminal name' },
-          maxChars: { type: 'integer', description: 'Max characters to return (default: 5000)' },
+          name: { type: "string", description: "Terminal name" },
+          maxChars: { type: "integer", description: "Max characters to return (default: 5000)" },
         },
-        required: ['name'],
+        required: ["name"],
       },
       async (args) => {
         const name = String(args.name);
@@ -155,20 +158,37 @@ export function registerTerminalTools(server: McpServer, context: vscode.Extensi
 
         if (!managedTerminals.has(name)) {
           return {
-            content: [{ type: 'text', text: 'Terminal "' + name + '" was not created by this extension. Output capture is only available for terminals created via execute_in_terminal.' }],
+            content: [
+              {
+                type: "text",
+                text:
+                  'Terminal "' +
+                  name +
+                  '" was not created by this extension. Output capture is only available for terminals created via execute_in_terminal.',
+              },
+            ],
             isError: false,
           };
         }
 
         if (!buffer || buffer.length === 0) {
           return {
-            content: [{ type: 'text', text: 'No output captured yet for terminal "' + name + '". Output capture requires shell integration. Try running a command first.' }],
+            content: [
+              {
+                type: "text",
+                text:
+                  'No output captured yet for terminal "' +
+                  name +
+                  '". Output capture requires shell integration. Try running a command first.',
+              },
+            ],
             isError: false,
           };
         }
 
-        const text = buffer.length > maxChars ? '...(truncated)\n' + buffer.slice(-maxChars) : buffer;
-        return { content: [{ type: 'text', text }], isError: false };
+        const text =
+          buffer.length > maxChars ? `...(truncated)\n${buffer.slice(-maxChars)}` : buffer;
+        return { content: [{ type: "text", text }], isError: false };
       },
     ),
   );

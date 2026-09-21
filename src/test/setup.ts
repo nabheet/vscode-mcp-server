@@ -1,17 +1,22 @@
-import { vi } from 'vitest';
+import { vi } from "vitest";
 
 /**
  * Minimal mock for the `vscode` module.
  * Add stubs as needed for new tests.
  */
 const mockUri = {
-  file: (path: string) => ({ fsPath: path, scheme: 'file', path, toString: () => path }),
-  parse: (uri: string) => ({ fsPath: uri.replace('file://', ''), scheme: 'file', path: uri, toString: () => uri }),
+  file: (path: string) => ({ fsPath: path, scheme: "file", path, toString: () => path }),
+  parse: (uri: string) => ({
+    fsPath: uri.replace("file://", ""),
+    scheme: "file",
+    path: uri,
+    toString: () => uri,
+  }),
   joinPath: (uri: { fsPath?: string; scheme?: string; path?: string }, ...paths: string[]) => ({
-    fsPath: [uri.fsPath, ...paths].join('/'),
-    scheme: uri.scheme ?? 'file',
-    path: [uri.path ?? uri.fsPath, ...paths].join('/'),
-    toString: () => [uri.fsPath, ...paths].join('/'),
+    fsPath: [uri.fsPath, ...paths].join("/"),
+    scheme: uri.scheme ?? "file",
+    path: [uri.path ?? uri.fsPath, ...paths].join("/"),
+    toString: () => [uri.fsPath, ...paths].join("/"),
   }),
 };
 
@@ -41,7 +46,7 @@ const mockWindow = {
   }),
   showInformationMessage: vi.fn(),
   showErrorMessage: vi.fn(),
-  activeTextEditor: undefined as any,
+  activeTextEditor: undefined as unknown,
   onDidChangeActiveTextEditor: vi.fn().mockReturnValue({ dispose: vi.fn() }),
   onDidChangeTextEditorSelection: vi.fn().mockReturnValue({ dispose: vi.fn() }),
   onDidOpenTextDocument: vi.fn().mockReturnValue({ dispose: vi.fn() }),
@@ -53,20 +58,20 @@ const mockEnv = {
 };
 
 const mockDebug = {
-  activeDebugSession: undefined as any,
+  activeDebugSession: undefined as unknown,
   stopDebugging: vi.fn(),
   startDebugging: vi.fn(),
-  addBreakpoints: vi.fn((bps: any[]) => {
-    (mockDebug.breakpoints as any[]).push(...bps);
+  addBreakpoints: vi.fn((bps: unknown[]) => {
+    (mockDebug.breakpoints as unknown[]).push(...bps);
   }),
-  removeBreakpoints: vi.fn((bps: any[]) => {
-    const arr = mockDebug.breakpoints as any[];
+  removeBreakpoints: vi.fn((bps: unknown[]) => {
+    const arr = mockDebug.breakpoints as unknown[];
     for (const bp of bps) {
       const idx = arr.indexOf(bp);
       if (idx >= 0) arr.splice(idx, 1);
     }
   }),
-  breakpoints: [] as any[],
+  breakpoints: [] as unknown[],
   onDidChangeActiveDebugSession: vi.fn().mockReturnValue({ dispose: vi.fn() }),
   onDidTerminateDebugSession: vi.fn().mockReturnValue({ dispose: vi.fn() }),
   onDidChangeBreakpoints: vi.fn().mockReturnValue({ dispose: vi.fn() }),
@@ -74,14 +79,17 @@ const mockDebug = {
 
 const mockCommands = {
   executeCommand: vi.fn(),
-  getCommands: vi.fn().mockResolvedValue(['cmd1', 'cmd2']),
+  getCommands: vi.fn().mockResolvedValue(["cmd1", "cmd2"]),
 };
 
 // Build the mock vscode module
 const mockVscode = {
   Uri: mockUri,
   RelativePattern: class {
-    constructor(public base: any, public pattern: string) {}
+    constructor(
+      public base: unknown,
+      public pattern: string,
+    ) {}
   },
   workspace: mockWorkspace,
   window: mockWindow,
@@ -94,7 +102,10 @@ const mockVscode = {
   },
   // Placeholder for types used but not called during unit tests
   Position: class {
-    constructor(public line: number, public character: number) {}
+    constructor(
+      public line: number,
+      public character: number,
+    ) {}
   },
   Range: class {
     constructor(
@@ -103,28 +114,32 @@ const mockVscode = {
     ) {}
   },
   Location: class {
-    constructor(uri: any, rangeOrPosition: any) {
+    constructor(uri: unknown, rangeOrPosition: unknown) {
       this.uri = uri;
       // Normalize: if given a Position, create a zero-length Range
-      this.range = rangeOrPosition?.line !== undefined
-        ? { start: rangeOrPosition, end: rangeOrPosition }
-        : rangeOrPosition;
+      this.range =
+        (rangeOrPosition as { line?: number } | null)?.line !== undefined
+          ? { start: rangeOrPosition, end: rangeOrPosition }
+          : rangeOrPosition;
     }
-    uri: any;
-    range: any;
+    uri: unknown;
+    range: unknown;
   },
   SourceBreakpoint: class {
     constructor(
-      public location: any,
+      public location: unknown,
       public enabled: boolean,
       public condition?: string,
       public hitCondition?: string,
     ) {}
   },
   Selection: class {
-    constructor(public start: any, public end: any) {}
+    constructor(
+      public start: unknown,
+      public end: unknown,
+    ) {}
   },
   TextEditorRevealType: { InCenter: 0 },
 };
 
-vi.mock('vscode', () => mockVscode);
+vi.mock("vscode", () => mockVscode);

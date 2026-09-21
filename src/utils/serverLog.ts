@@ -6,8 +6,8 @@
  * Logging failures are swallowed — the log must never crash the server.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export interface LogEntry {
   ts?: string;
@@ -26,7 +26,7 @@ export class ServerLog {
 
   constructor(logDir: string) {
     this.dir = logDir;
-    this.base = path.join(logDir, 'mcp.log');
+    this.base = path.join(logDir, "mcp.log");
     try {
       fs.mkdirSync(logDir, { recursive: true });
       this.bytes = fs.existsSync(this.base) ? fs.statSync(this.base).size : 0;
@@ -41,7 +41,7 @@ export class ServerLog {
 
   log(entry: LogEntry): void {
     this.seq++;
-    const line = JSON.stringify({ ...entry, ts: entry.ts ?? new Date().toISOString(), seq: this.seq }) + '\n';
+    const line = `${JSON.stringify({ ...entry, ts: entry.ts ?? new Date().toISOString(), seq: this.seq })}\n`;
     const size = Buffer.byteLength(line);
     if (this.bytes + size > MAX_LOG_BYTES) this.rotate();
     try {
@@ -60,7 +60,7 @@ export class ServerLog {
         const to = path.join(this.dir, `mcp.log.${i + 1}`);
         if (fs.existsSync(from)) fs.renameSync(from, to);
       }
-      const first = path.join(this.dir, 'mcp.log.1');
+      const first = path.join(this.dir, "mcp.log.1");
       if (fs.existsSync(this.base)) fs.renameSync(this.base, first);
       this.bytes = 0;
     } catch {

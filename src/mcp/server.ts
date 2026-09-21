@@ -1,12 +1,12 @@
-import * as http from 'http';
-import * as https from 'https';
-import * as fs from 'fs';
-import * as crypto from 'crypto';
-import { handleRequest } from './transport';
-import { ToolDefinition, JsonRpcResponse } from '../utils/types';
-import { withTimeout } from '../utils/timeout';
-import { Metrics } from '../utils/metrics';
-import { ServerLog } from '../utils/serverLog';
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as https from "node:https";
+import { Metrics } from "../utils/metrics";
+import type { ServerLog } from "../utils/serverLog";
+import { withTimeout } from "../utils/timeout";
+import type { JsonRpcResponse, ToolDefinition } from "../utils/types";
+import { handleRequest } from "./transport";
 
 interface SseSession {
   id: string;
@@ -37,9 +37,12 @@ export interface McpServerOptions {
 
 /** Thrown when the concurrency cap is exceeded. */
 export class BusyError extends Error {
-  constructor(public readonly current: number, public readonly max: number) {
+  constructor(
+    public readonly current: number,
+    public readonly max: number,
+  ) {
     super(`Server busy: ${current} tool calls in flight (max ${max})`);
-    this.name = 'BusyError';
+    this.name = "BusyError";
   }
 }
 
@@ -51,6 +54,7 @@ const LAG_INTERVAL_MS = 1_000;
 export class McpServer {
   private server: http.Server | https.Server | null = null;
   private tools: Map<string, ToolDefinition> = new Map();
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: false positive: ++/-- is usage
   private activeRequests = 0;
   private shuttingDown = false;
   private options: McpServerOptions;
@@ -72,7 +76,9 @@ export class McpServer {
     this.maxConcurrent = options.maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT;
     this.fileLog = options.logger;
     if (options.authToken && !this.useTls) {
-      console.warn('[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.');
+      console.warn(
+        "[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.",
+      );
     }
   }
 
@@ -87,32 +93,41 @@ export class McpServer {
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.useTls) {
+        const certPath = this.options.tlsCertPath;
+        const keyPath = this.options.tlsKeyPath;
+        if (!certPath || !keyPath) {
+          throw new Error("TLS enabled but tlsCertPath/tlsKeyPath not configured");
+        }
         try {
           const tlsOpts: https.ServerOptions = {
-            cert: fs.readFileSync(this.options.tlsCertPath!, 'utf-8'),
-            key: fs.readFileSync(this.options.tlsKeyPath!, 'utf-8'),
-            minVersion: 'TLSv1.2',
+            cert: fs.readFileSync(certPath, "utf-8"),
+            key: fs.readFileSync(keyPath, "utf-8"),
+            minVersion: "TLSv1.2",
           };
           this.server = https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
         } catch (err) {
-          reject(new Error('Failed to load TLS cert/key: ' + (err instanceof Error ? err.message : String(err))));
+          reject(
+            new Error(
+              `Failed to load TLS cert/key: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
           return;
         }
       } else {
         this.server = http.createServer((req, res) => this.onRequest(req, res));
       }
 
-      this.server.on('error', (err: NodeJS.ErrnoException) => {
-        if (err.code === 'EADDRINUSE') {
-          reject(new Error('Port ' + this.options.port + ' is already in use'));
+      this.server.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE") {
+          reject(new Error(`Port ${this.options.port} is already in use`));
         } else {
           reject(err);
         }
       });
 
       this.server.listen(this.options.port, this.options.host, () => {
-        const scheme = this.useTls ? 'https' : 'http';
-        this.onListen?.(scheme + '://' + this.options.host + ':' + this.options.port + '/mcp');
+        const scheme = this.useTls ? "https" : "http";
+        this.onListen?.(`${scheme}://${this.options.host}:${this.options.port}/mcp`);
         this.startLagMonitor();
         resolve();
       });
@@ -154,12 +169,12 @@ export class McpServer {
         finish();
       }, timeoutMs);
 
-      this.server!.once('close', () => {
+      this.server?.once("close", () => {
         clearTimeout(timer);
         finish();
       });
 
-      this.server!.close();
+      this.server?.close();
     });
   }
 
@@ -167,8 +182,8 @@ export class McpServer {
 
   /** Get the base URL for the server (scheme + host + port). */
   private getServerBase(): string {
-    const scheme = this.useTls ? 'https' : 'http';
-    return scheme + '://' + this.options.host + ':' + this.options.port;
+    const scheme = this.useTls ? "https" : "http";
+    return `${scheme}://${this.options.host}:${this.options.port}`;
   }
 
   /** Check if a request origin is allowed. Only loopback origins are valid. */
@@ -191,20 +206,20 @@ export class McpServer {
   private writeCorsHeaders(res: http.ServerResponse, origin?: string): void {
     const fallback = `http://127.0.0.1:${this.options.port}`;
     const allowed = origin && this.isValidOrigin(origin) ? origin : fallback;
-    res.setHeader('Access-Control-Allow-Origin', allowed);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader("Access-Control-Allow-Origin", allowed);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   }
 
   /** Verify bearer token using timing-safe comparison. */
   private authFailed(req: http.IncomingMessage, res: http.ServerResponse): boolean {
     if (!this.options.authToken) return false;
-    const auth = req.headers['authorization'] || '';
-    const origin = req.headers['origin'] as string | undefined;
-    if (!auth.startsWith('Bearer ')) {
+    const auth = req.headers.authorization || "";
+    const origin = req.headers.origin as string | undefined;
+    if (!auth.startsWith("Bearer ")) {
       this.writeCorsHeaders(res, origin);
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized: invalid or missing bearer token" }));
       return true;
     }
     const token = auth.slice(7);
@@ -214,8 +229,8 @@ export class McpServer {
     const match = bufToken.length === bufValid.length && crypto.timingSafeEqual(bufToken, bufValid);
     if (!match) {
       this.writeCorsHeaders(res, origin);
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing bearer token' }));
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized: invalid or missing bearer token" }));
       return true;
     }
     return false;
@@ -226,12 +241,20 @@ export class McpServer {
   /** Refresh process-level gauges before serving /metrics or /diagnostics. */
   private updateGauges(): void {
     const mem = process.memoryUsage();
-    this.metrics.gauge('vscode_mcp_memory_rss_bytes', mem.rss, 'Resident set size (bytes)');
-    this.metrics.gauge('vscode_mcp_memory_heap_used_bytes', mem.heapUsed, 'Heap used (bytes)');
-    this.metrics.gauge('vscode_mcp_event_loop_lag_ms', this.lagMs, 'Event loop lag (ms), sampled each second');
-    this.metrics.gauge('vscode_mcp_inflight_requests', this.inFlight, 'Tool calls currently in flight');
-    this.metrics.gauge('vscode_mcp_sse_sessions', this.sessions.size, 'Open SSE sessions');
-    this.metrics.gauge('vscode_mcp_max_concurrent', this.maxConcurrent, 'Concurrency cap');
+    this.metrics.gauge("vscode_mcp_memory_rss_bytes", mem.rss, "Resident set size (bytes)");
+    this.metrics.gauge("vscode_mcp_memory_heap_used_bytes", mem.heapUsed, "Heap used (bytes)");
+    this.metrics.gauge(
+      "vscode_mcp_event_loop_lag_ms",
+      this.lagMs,
+      "Event loop lag (ms), sampled each second",
+    );
+    this.metrics.gauge(
+      "vscode_mcp_inflight_requests",
+      this.inFlight,
+      "Tool calls currently in flight",
+    );
+    this.metrics.gauge("vscode_mcp_sse_sessions", this.sessions.size, "Open SSE sessions");
+    this.metrics.gauge("vscode_mcp_max_concurrent", this.maxConcurrent, "Concurrency cap");
   }
 
   /** Run a JSON-RPC request under the concurrency cap; time it; record
@@ -253,23 +276,31 @@ export class McpServer {
         `Tool call timed out after ${timeoutMs}ms (VS Code/DAP unresponsive)`,
       );
       const durMs = Date.now() - started;
-      this.metrics.histogram('vscode_mcp_tool_duration_seconds', 'Tool call duration (seconds)')
+      this.metrics
+        .histogram("vscode_mcp_tool_duration_seconds", "Tool call duration (seconds)")
         .observe(durMs / 1000);
-      this.metrics.counterInc('vscode_mcp_tool_total', 'Total tool calls dispatched');
+      this.metrics.counterInc("vscode_mcp_tool_total", "Total tool calls dispatched");
       if (response.error) {
-        const msg = response.error.message || ('code ' + response.error.code);
+        const msg = response.error.message || `code ${response.error.code}`;
         this.metrics.recordError(toolName, msg);
-        this.metrics.counterInc('vscode_mcp_tool_errors', 'Tool calls that returned an error');
-        this.fileLog?.log({ type: 'tool', tool: toolName, ok: false, durMs, error: msg });
+        this.metrics.counterInc("vscode_mcp_tool_errors", "Tool calls that returned an error");
+        this.fileLog?.log({ type: "tool", tool: toolName, ok: false, durMs, error: msg });
       } else {
-        this.fileLog?.log({ type: 'tool', tool: toolName, ok: true, durMs });
+        this.fileLog?.log({ type: "tool", tool: toolName, ok: true, durMs });
       }
       return response;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.metrics.counterInc('vscode_mcp_tool_errors', 'Tool calls that threw');
+      this.metrics.counterInc("vscode_mcp_tool_errors", "Tool calls that threw");
       this.metrics.recordError(toolName, msg);
-      this.fileLog?.log({ type: 'tool', tool: toolName, ok: false, durMs: Date.now() - started, error: msg, threw: true });
+      this.fileLog?.log({
+        type: "tool",
+        tool: toolName,
+        ok: false,
+        durMs: Date.now() - started,
+        error: msg,
+        threw: true,
+      });
       throw err;
     } finally {
       this.inFlight--;
@@ -277,47 +308,47 @@ export class McpServer {
   }
 
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const origin = req.headers['origin'] as string | undefined;
-    const pathname = (req.url || '').split('?')[0];
+    const origin = req.headers.origin as string | undefined;
+    const pathname = (req.url || "").split("?")[0];
 
     // Health check
-    if (req.method === 'GET' && pathname === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+    if (req.method === "GET" && pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
       return;
     }
 
     // Metrics — Prometheus text format
-    if (req.method === 'GET' && pathname === '/metrics') {
+    if (req.method === "GET" && pathname === "/metrics") {
       this.updateGauges();
-      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+      res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(this.metrics.text());
       return;
     }
 
     // Diagnostics — human-readable JSON snapshot
-    if (req.method === 'GET' && pathname === '/diagnostics') {
+    if (req.method === "GET" && pathname === "/diagnostics") {
       this.updateGauges();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(this.metrics.diagnostics(), null, 2));
       return;
     }
 
     // ── SSE: MCP HTTP transport (GET /mcp) ───────────────────────────
-    if (req.method === 'GET' && pathname === '/mcp') {
+    if (req.method === "GET" && pathname === "/mcp") {
       this.handleSseConnection(req, res);
       return;
     }
 
     // ── SSE: Message handler (POST /mcp/session/:id/message) ────────
     const msgMatch = pathname.match(/^\/mcp\/session\/([a-f0-9-]+)\/message$/);
-    if (req.method === 'POST' && msgMatch) {
+    if (req.method === "POST" && msgMatch) {
       this.handleSseMessage(req, res, msgMatch[1]);
       return;
     }
 
     // CORS preflight — validate origin
-    if (req.method === 'OPTIONS') {
+    if (req.method === "OPTIONS") {
       if (!this.isValidOrigin(origin)) {
         res.writeHead(403);
         res.end();
@@ -330,15 +361,15 @@ export class McpServer {
     }
 
     // Direct JSON-RPC (POST /mcp) — backward compat with mcp_client.py
-    if (req.method === 'POST' && pathname === '/mcp') {
+    if (req.method === "POST" && pathname === "/mcp") {
       this.handleDirectPost(req, res, origin);
       return;
     }
 
     // ── 404 catch-all ─────────────────────────────────────────────────
     this.writeCorsHeaders(res, origin);
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found. Use GET /mcp (SSE) or POST /mcp (direct)' }));
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found. Use GET /mcp (SSE) or POST /mcp (direct)" }));
   }
 
   /** SSE connection — open event stream and send endpoint URL. */
@@ -350,39 +381,51 @@ export class McpServer {
     const endpoint = `/mcp/session/${sessionId}/message`;
 
     res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
     });
 
     const sendEvent = (event: string, data: string) => {
-      try { res.write(`event: ${event}\ndata: ${data}\n\n`); } catch { /* closed */ }
+      try {
+        res.write(`event: ${event}\ndata: ${data}\n\n`);
+      } catch {
+        /* closed */
+      }
     };
 
     const session: SseSession = { id: sessionId, res, sendEvent };
     this.sessions.set(sessionId, session);
 
     // Tell client where to POST JSON-RPC messages
-    sendEvent('endpoint', endpoint);
+    sendEvent("endpoint", endpoint);
 
     // Keep-alive to prevent proxy timeouts
     const keepAlive = setInterval(() => {
-      try { res.write(': keepalive\n\n'); } catch { clearInterval(keepAlive); }
+      try {
+        res.write(": keepalive\n\n");
+      } catch {
+        clearInterval(keepAlive);
+      }
     }, SSE_KEEPALIVE_MS);
 
-    req.on('close', () => {
+    req.on("close", () => {
       clearInterval(keepAlive);
       this.sessions.delete(sessionId);
     });
   }
 
   /** Handle a message POSTed to an SSE session endpoint. */
-  private handleSseMessage(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void {
+  private handleSseMessage(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    sessionId: string,
+  ): void {
     const session = this.sessions.get(sessionId);
     if (!session) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Session not found' }));
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Session not found" }));
       return;
     }
 
@@ -390,59 +433,70 @@ export class McpServer {
     let bodySize = 0;
     const MAX_BODY = 10 * 1024 * 1024;
 
-    req.on('data', (chunk: Buffer) => {
+    req.on("data", (chunk: Buffer) => {
       bodySize += chunk.length;
       if (bodySize > MAX_BODY) return;
       chunks.push(chunk);
     });
 
-    req.on('end', async () => {
+    req.on("end", async () => {
       if (bodySize > MAX_BODY) {
-        res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Payload Too Large: max 10 MB' }));
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload Too Large: max 10 MB" }));
         return;
       }
 
-      const rawBody = Buffer.concat(chunks).toString('utf-8');
+      const rawBody = Buffer.concat(chunks).toString("utf-8");
 
       // Acknowledge the POST immediately — response goes over SSE
-      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.writeHead(202, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ accepted: true }));
 
       try {
         const response = await this.dispatch(rawBody);
         if (response) {
-          session.sendEvent('message', JSON.stringify(response));
+          session.sendEvent("message", JSON.stringify(response));
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const code = err instanceof BusyError ? -32050 : -32603;
-        const message = err instanceof BusyError ? msg : 'Internal error: ' + msg;
-        session.sendEvent('message', JSON.stringify({
-          jsonrpc: '2.0', id: null, error: { code, message },
-        }));
+        const message = err instanceof BusyError ? msg : `Internal error: ${msg}`;
+        session.sendEvent(
+          "message",
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code, message },
+          }),
+        );
       }
     });
 
-    req.on('error', () => {});
+    req.on("error", () => {});
   }
 
   /** Direct POST /mcp — inline JSON-RPC response (backward compat). */
-  private handleDirectPost(req: http.IncomingMessage, res: http.ServerResponse, origin: string | undefined): void {
+  private handleDirectPost(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    origin: string | undefined,
+  ): void {
     // CORS: reject non-loopback origins
     if (!this.isValidOrigin(origin)) {
       this.writeCorsHeaders(res, origin);
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Forbidden: CORS requests from this origin are not allowed' }));
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ error: "Forbidden: CORS requests from this origin are not allowed" }),
+      );
       return;
     }
 
     // Content-Type check
-    const ctype = req.headers['content-type'] || '';
-    if (!ctype.includes('application/json')) {
+    const ctype = req.headers["content-type"] || "";
+    if (!ctype.includes("application/json")) {
       this.writeCorsHeaders(res, origin);
-      res.writeHead(415, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unsupported Media Type: expected application/json' }));
+      res.writeHead(415, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unsupported Media Type: expected application/json" }));
       return;
     }
 
@@ -451,8 +505,8 @@ export class McpServer {
 
     if (this.shuttingDown) {
       this.writeCorsHeaders(res, origin);
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Server shutting down' }));
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Server shutting down" }));
       return;
     }
 
@@ -468,22 +522,22 @@ export class McpServer {
     let bodySize = 0;
     const MAX_BODY = 10 * 1024 * 1024;
 
-    req.on('data', (chunk: Buffer) => {
+    req.on("data", (chunk: Buffer) => {
       bodySize += chunk.length;
       if (bodySize > MAX_BODY) return;
       chunks.push(chunk);
     });
 
-    req.on('end', async () => {
+    req.on("end", async () => {
       if (bodySize > MAX_BODY) {
         this.writeCorsHeaders(res, origin);
-        res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Payload Too Large: max 10 MB' }));
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload Too Large: max 10 MB" }));
         activeRequestDone();
         return;
       }
 
-      const rawBody = Buffer.concat(chunks).toString('utf-8');
+      const rawBody = Buffer.concat(chunks).toString("utf-8");
 
       try {
         const response = await this.dispatch(rawBody);
@@ -493,30 +547,52 @@ export class McpServer {
         let status = 200;
         if (response.error) {
           switch (response.error.code) {
-            case -32700: case -32600: case -32602: status = 400; break;
-            case -32601: status = 404; break;
-            case -32603: status = 500; break;
+            case -32700:
+            case -32600:
+            case -32602:
+              status = 400;
+              break;
+            case -32601:
+              status = 404;
+              break;
+            case -32603:
+              status = 500;
+              break;
           }
         }
 
-        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.writeHead(status, { "Content-Type": "application/json" });
         res.end(body);
       } catch (err) {
         this.writeCorsHeaders(res, origin);
         if (err instanceof BusyError) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32050, message: err.message } }));
+          res.writeHead(429, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: -32050, message: err.message },
+            }),
+          );
           return;
         }
-        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.writeHead(500, { "Content-Type": "application/json" });
         const msg = err instanceof Error ? err.message : String(err);
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error: ' + msg } }));
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32603, message: `Internal error: ${msg}` },
+          }),
+        );
       } finally {
         activeRequestDone();
       }
     });
 
-    req.on('error', () => { activeRequestDone(); });
+    req.on("error", () => {
+      activeRequestDone();
+    });
   }
 }
 
@@ -524,10 +600,12 @@ export class McpServer {
 function extractToolName(rawBody: string): string {
   try {
     const parsed = JSON.parse(rawBody) as { method?: string; params?: { name?: string } };
-    if (parsed?.method === 'tools/call' && typeof parsed.params?.name === 'string') {
+    if (parsed?.method === "tools/call" && typeof parsed.params?.name === "string") {
       return parsed.params.name;
     }
-    if (typeof parsed?.method === 'string') return parsed.method;
-  } catch { /* fall through */ }
-  return '<unparseable>';
+    if (typeof parsed?.method === "string") return parsed.method;
+  } catch {
+    /* fall through */
+  }
+  return "<unparseable>";
 }

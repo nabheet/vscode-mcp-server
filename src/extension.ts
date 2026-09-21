@@ -1,60 +1,70 @@
-import * as vscode from 'vscode';
-import { McpServer, McpServerOptions } from './mcp/server';
-import { registerAllTools } from './mcp/tools/index';
-import { Metrics } from './utils/metrics';
-import { ServerLog } from './utils/serverLog';
+import * as vscode from "vscode";
+import { McpServer, type McpServerOptions } from "./mcp/server";
+import { registerAllTools } from "./mcp/tools/index";
+import { Metrics } from "./utils/metrics";
+import { ServerLog } from "./utils/serverLog";
 
-const OUTPUT_CHANNEL_NAME = 'VS Code MCP Server';
+const OUTPUT_CHANNEL_NAME = "VS Code MCP Server";
 let server: McpServer | null = null;
 let outputChannel: vscode.OutputChannel | null = null;
 
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
-  outputChannel.appendLine('[mcp] Activating vscode-mcp-server...');
+  outputChannel.appendLine("[mcp] Activating vscode-mcp-server...");
 
   // Observability: shared metrics registry + rotating JSON-lines file log.
   // The file log lives in context.logUri, so records survive the hot-reload
   // crashes this server is hardened against (see /metrics, /diagnostics).
   const metrics = new Metrics();
-  const logDir = context.logUri?.scheme === 'file' ? context.logUri.fsPath : undefined;
+  const logDir = context.logUri?.scheme === "file" ? context.logUri.fsPath : undefined;
   const fileLog = logDir ? new ServerLog(logDir) : undefined;
-  metrics.gauge('vscode_mcp_max_concurrent', 10, 'Concurrency cap');
+  metrics.gauge("vscode_mcp_max_concurrent", 10, "Concurrency cap");
 
   // Read config (VS Code settings with env fallbacks)
-  const config = vscode.workspace.getConfiguration('vscode-mcp-server');
-  const port = config.get<number>('port') || Number(process.env.MCP_PORT) || 9876;
-  const authToken = config.get<string>('authToken') || process.env.MCP_AUTH_TOKEN || '';
-  const tlsCertPath = config.get<string>('tlsCertPath') || process.env.MCP_TLS_CERT_PATH || '';
-  const tlsKeyPath = config.get<string>('tlsKeyPath') || process.env.MCP_TLS_KEY_PATH || '';
+  const config = vscode.workspace.getConfiguration("vscode-mcp-server");
+  const port = config.get<number>("port") || Number(process.env.MCP_PORT) || 9876;
+  const authToken = config.get<string>("authToken") || process.env.MCP_AUTH_TOKEN || "";
+  const tlsCertPath = config.get<string>("tlsCertPath") || process.env.MCP_TLS_CERT_PATH || "";
+  const tlsKeyPath = config.get<string>("tlsKeyPath") || process.env.MCP_TLS_KEY_PATH || "";
 
   // Detect remote container
-  const isRemoteContainer = vscode.env.remoteName === 'dev-container'
-    || vscode.env.remoteName === 'attached-container'
-    || false;
-  const host = isRemoteContainer ? '0.0.0.0' : '127.0.0.1';
+  const isRemoteContainer =
+    vscode.env.remoteName === "dev-container" ||
+    vscode.env.remoteName === "attached-container" ||
+    false;
+  const host = isRemoteContainer ? "0.0.0.0" : "127.0.0.1";
 
   // Validate TLS config
   const useTls = !!(tlsCertPath && tlsKeyPath);
   if ((tlsCertPath && !tlsKeyPath) || (!tlsCertPath && tlsKeyPath)) {
-    outputChannel.appendLine('[mcp] WARNING: Both tlsCertPath and tlsKeyPath must be set for HTTPS. Falling back to HTTP.');
+    outputChannel.appendLine(
+      "[mcp] WARNING: Both tlsCertPath and tlsKeyPath must be set for HTTPS. Falling back to HTTP.",
+    );
   }
 
   if (isRemoteContainer) {
-    outputChannel.appendLine('[mcp] Remote container detected — binding to 0.0.0.0');
-    outputChannel.appendLine('[mcp] Ensure devcontainer.json includes: "forwardPorts": [' + port + ']');
+    outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
+    outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
   }
 
   if (authToken) {
-    outputChannel.appendLine('[mcp] Auth token configured — clients must send Authorization: Bearer <token>');
+    outputChannel.appendLine(
+      "[mcp] Auth token configured — clients must send Authorization: Bearer <token>",
+    );
   }
 
   if (useTls) {
-    outputChannel.appendLine('[mcp] TLS enabled — using cert: ' + tlsCertPath);
+    outputChannel.appendLine(`[mcp] TLS enabled — using cert: ${tlsCertPath}`);
   }
 
   if (fileLog) {
-    outputChannel.appendLine('[mcp] JSON log: ' + logDir);
-    fileLog.log({ type: 'lifecycle', event: 'activate', version: vscode.version, remote: vscode.env.remoteName ?? 'local' });
+    outputChannel.appendLine(`[mcp] JSON log: ${logDir}`);
+    fileLog.log({
+      type: "lifecycle",
+      event: "activate",
+      version: vscode.version,
+      remote: vscode.env.remoteName ?? "local",
+    });
   }
 
   // Build server options
@@ -72,41 +82,52 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Connection info callback
   server.setOnListen((url: string) => {
-    let msg = 'MCP server listening on ' + url;
+    let msg = `MCP server listening on ${url}`;
     if (isRemoteContainer) {
-      msg += ' (remote container — use forwarded port)';
+      msg += " (remote container — use forwarded port)";
     }
     if (authToken) {
-      msg += ' [auth enabled]';
+      msg += " [auth enabled]";
     }
-    outputChannel?.appendLine('[mcp] ' + msg);
-    console.log('[vscode-mcp-server] ' + msg);
+    outputChannel?.appendLine(`[mcp] ${msg}`);
+    console.log(`[vscode-mcp-server] ${msg}`);
   });
 
   // Start server with port retry
-  startServerWithRetry(port, host, authToken, tlsCertPath, tlsKeyPath, context, metrics, fileLog).catch((err) => {
-    outputChannel?.appendLine('[mcp] FATAL: ' + err.message);
+  startServerWithRetry(
+    port,
+    host,
+    authToken,
+    tlsCertPath,
+    tlsKeyPath,
+    context,
+    metrics,
+    fileLog,
+  ).catch((err) => {
+    outputChannel?.appendLine(`[mcp] FATAL: ${err.message}`);
   });
 
   // Listen for config changes
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('vscode-mcp-server')) {
-        outputChannel?.appendLine('[mcp] Config changed — restart VS Code to apply changes');
+      if (e.affectsConfiguration("vscode-mcp-server")) {
+        outputChannel?.appendLine("[mcp] Config changed — restart VS Code to apply changes");
       }
     }),
   );
 
-  outputChannel.appendLine('[mcp] Activation complete');
+  outputChannel.appendLine("[mcp] Activation complete");
 }
 
 export function deactivate(): void {
-  outputChannel?.appendLine('[mcp] Shutting down...');
+  outputChannel?.appendLine("[mcp] Shutting down...");
   if (server) {
-    server.stop(5000).catch(() => { /* ignore shutdown errors */ });
+    server.stop(5000).catch(() => {
+      /* ignore shutdown errors */
+    });
     server = null;
   }
-  outputChannel?.appendLine('[mcp] Shutdown complete');
+  outputChannel?.appendLine("[mcp] Shutdown complete");
 }
 
 async function startServerWithRetry(
@@ -141,24 +162,31 @@ async function startServerWithRetry(
     try {
       // Re-set the onListen since we created a new server
       srv.setOnListen((url: string) => {
-        let msg = 'MCP server listening on ' + url;
-        if (vscode.env.remoteName === 'dev-container' || vscode.env.remoteName === 'attached-container') {
-          msg += ' (remote container — use forwarded port)';
+        let msg = `MCP server listening on ${url}`;
+        if (
+          vscode.env.remoteName === "dev-container" ||
+          vscode.env.remoteName === "attached-container"
+        ) {
+          msg += " (remote container — use forwarded port)";
         }
-        if (authToken) msg += ' [auth enabled]';
-        outputChannel?.appendLine('[mcp] ' + msg);
-        console.log('[vscode-mcp-server] ' + msg);
+        if (authToken) msg += " [auth enabled]";
+        outputChannel?.appendLine(`[mcp] ${msg}`);
+        console.log(`[vscode-mcp-server] ${msg}`);
       });
 
       await srv.start();
       return;
-    } catch (err: any) {
-      if ((err.code === 'EADDRINUSE' || (err.message && err.message.includes('already in use'))) && attempt < maxRetries - 1) {
-        outputChannel?.appendLine('[mcp] Port ' + currentPort + ' in use, trying ' + (currentPort + 1) + '...');
+    } catch (err) {
+      const e = err as { code?: string; message?: string };
+      if (
+        (e.code === "EADDRINUSE" || e.message?.includes("already in use")) &&
+        attempt < maxRetries - 1
+      ) {
+        outputChannel?.appendLine(`[mcp] Port ${currentPort} in use, trying ${currentPort + 1}...`);
         continue;
       }
       throw err;
     }
   }
-  throw new Error('Could not find available port after ' + maxRetries + ' attempts');
+  throw new Error(`Could not find available port after ${maxRetries} attempts`);
 }

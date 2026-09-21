@@ -3,15 +3,21 @@
 [![CI](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/nabheet/vscode-mcp-server/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Let AI agents read, write, debug, and execute commands in VS Code — just like a human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server exposes 40+ VS Code tools (debugger, terminal, LSP, file ops, commands) over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
+Let AI agents read, write, debug, and execute commands in VS Code — just like a
+human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
+server exposes 40+ VS Code tools (debugger, terminal, LSP, file ops, commands)
+over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ## Quick Start
 
-1. **Install the extension** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp) or install a `.vsix` from the [latest release](https://github.com/nabheet/vscode-mcp-server/releases).
+1. **Install the extension** from the
+   [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp)
+   or install a `.vsix` from the [latest release](https://github.com/nabheet/vscode-mcp-server/releases).
 
 2. **Reload VS Code** — the extension starts automatically on startup, listening on `http://127.0.0.1:9876`.
 
 3. **Configure your AI tool** (e.g., opencode) to connect via SSE:
+
    ```json
    {
      "vscode-mcp": {
@@ -22,6 +28,7 @@ Let AI agents read, write, debug, and execute commands in VS Code — just like 
    ```
 
 4. **Verify** the server is running:
+
    ```bash
    curl -s -X POST http://127.0.0.1:9876/mcp \
      -H 'Content-Type: application/json' \
@@ -30,23 +37,22 @@ Let AI agents read, write, debug, and execute commands in VS Code — just like 
 
 ## Architecture
 
-```
+```text
 VS Code Extension (onStartupFinished)
   └─ src/extension.ts          — Lifecycle: activation, tool registration, deactivation
   └─ src/config.ts             — Settings (port, auth, TLS) from VS Code + env fallbacks
   └─ src/mcp/
        ├─ server.ts            — HTTP server: CORS, auth, TLS, SSE transport, JSON-RPC dispatch
-       ├─ transport.ts         — JSON-RPC 2.0 handler + MCP protocol lifecycle (initialize, tools/list, tools/call)
+       ├─ transport.ts         — JSON-RPC 2.0 handler + MCP protocol lifecycle
        └─ tools/
-            ├─ commands.ts     — Execute any VS Code command, list commands, get code actions
-            ├─ navigation.ts   — Open files, line/column jump, select lines, explorer reveal, close editors
-├─ workspace.ts    — Read/write/create/delete files, glob search, workspace folder CRUD
-             ├─ debug.ts        — Start/stop debugging, breakpoints (add/remove/list), step/continue,
-             │                    stack trace, variables, frame-scoped evaluate
-             ├─ terminal.ts     — Execute commands in integrated terminal, capture output (30s timeout)
-             ├─ search.ts       — Full-text content search across workspace folders (grep)
-             └─ lsp.ts          — Diagnostics (200-line cap), hover, references, definitions, symbols,
-                                  completions, code actions, call hierarchy, rename
+            ├─ commands.ts     — Execute/catalog VS Code commands, get code actions
+            ├─ navigation.ts   — Open files, jump to line/col, select, reveal, close editors
+            ├─ workspace.ts    — Read/write/delete files, glob search, folder CRUD
+            ├─ debug.ts        — Debug lifecycle, breakpoints, stepping, stack/vars/evaluate
+            ├─ terminal.ts     — Run commands in integrated terminal, capture output (30s)
+            ├─ search.ts       — Full-text content search across workspace folders (grep)
+            └─ lsp.ts          — Diagnostics (200-line cap), hover, references, definitions,
+                                  symbols, completions, code actions, call hierarchy, rename
   └─ src/utils/
        ├─ types.ts             — MCP method constants, type definitions
        └─ path.ts              — Workspace-root-aware path resolution
@@ -55,7 +61,7 @@ VS Code Extension (onStartupFinished)
 ## Tools
 
 | Tool | Module | Description |
-|------|--------|-------------|
+| ------ | -------- | ------------- |
 | `execute_command` | commands | Execute any VS Code command by ID |
 | `list_commands` | commands | List all available VS Code commands (optionally internal) |
 | `get_code_actions` | commands | Get available refactors/quick fixes at a line |
@@ -75,12 +81,12 @@ VS Code Extension (onStartupFinished)
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
 | `add_workspace_folder` | workspace | Add a folder to the workspace (multi-root) |
-| `update_workspace_folder` | workspace | Rename and/or change the path of a workspace folder (multi-root) |
+| `update_workspace_folder` | workspace | Rename/change a workspace folder's path (multi-root) |
 | `remove_workspace_folder` | workspace | Remove a folder from the workspace (multi-root) |
-| `search_files` | search | Grep file contents across the workspace (regex, case sensitivity, globs, context lines) |
+| `search_files` | search | Grep file contents across the workspace (regex, case-insensitive) |
 | `list_logs` | logs | List VS Code log sessions and files |
 | `read_log` | logs | Tail a VS Code log file (with optional grep filter) |
-| `start_debugging` | debug | Start a debug session from a launch config (`launch.json` or workspace file) |
+| `start_debugging` | debug | Start a debug session from a folder/workspace launch config |
 | `stop_debugging` | debug | Stop the active debug session |
 | `step_over` | debug | Step over current line |
 | `step_into` | debug | Step into function |
@@ -91,8 +97,8 @@ VS Code Extension (onStartupFinished)
 | `list_breakpoints` | debug | List all breakpoints |
 | `get_debug_variables` | debug | Get frame-local variables from paused session |
 | `get_stack_trace` | debug | Get call stack frames |
-| `evaluate_in_debug_console` | debug | **Frame-scoped** evaluate — can read locals like `pre`, `self`, `t` |
-| `execute_in_terminal` | terminal | Execute command in integrated terminal (30s output capture timeout) |
+| `evaluate_in_debug_console` | debug | **Frame-scoped** evaluate — reads paused-session locals |
+| `execute_in_terminal` | terminal | Execute command in integrated terminal (30s output timeout) |
 | `get_terminal_output` | terminal | Get terminal output buffer |
 | `find_references` | lsp | Find all references to symbol at cursor |
 | `go_to_definition` | lsp | Navigate to symbol definition |
@@ -125,7 +131,10 @@ Add to your `opencode.global.jsonc` or `opencode.json`:
 
 ### Claude Desktop / Claude Code
 
-**Claude Code** uses the [Streamable HTTP transport](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/) (MCP 2025-03-26). The server supports this via direct `POST /mcp` — no SSE preamble needed.
+**Claude Code** uses the [Streamable HTTP transport](
+https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/)
+(MCP 2025-03-26). The server supports this via direct `POST /mcp` — no SSE
+preamble needed.
 
 Add to `claude_desktop_config.json`:
 
@@ -140,7 +149,11 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-> **Troubleshooting**: If Claude Code fails to connect, check that it's not sending an incompatible `Origin` header. The server accepts `http://127.0.0.1:<port>`, `http://localhost:<port>`, and `http://0.0.0.0:<port>`. See [Origin header troubleshooting](#origin-header-troubleshooting) below.
+> **Troubleshooting**: If Claude Code fails to connect, check that it's not
+> sending an incompatible `Origin` header. The server accepts
+> `http://127.0.0.1:<port>`, `http://localhost:<port>`, and
+> `http://0.0.0.0:<port>`. See
+> [Origin header troubleshooting](#origin-header-troubleshooting) below.
 
 Or via stdio if you prefer a managed subprocess:
 
@@ -159,7 +172,7 @@ Or via stdio if you prefer a managed subprocess:
 
 In Cursor Settings → Features → MCP Servers → Add new MCP server:
 
-```
+```text
 Name: vscode-mcp
 Type: remote
 URL: http://127.0.0.1:9876/mcp
@@ -169,11 +182,13 @@ URL: http://127.0.0.1:9876/mcp
 
 Add a `type: "remote"` MCP server pointing to:
 
-```
+```text
 http://127.0.0.1:9876/mcp
 ```
 
-The server uses **SSE transport** (the standard MCP HTTP transport). If the tool only supports stdio, you can use an SSE-to-stdio bridge like `mcp-remote` or write a thin wrapper.
+The server uses **SSE transport** (the standard MCP HTTP transport). If the tool
+only supports stdio, you can use an SSE-to-stdio bridge like `mcp-remote` or
+write a thin wrapper.
 
 ### Connecting programmatically
 
@@ -202,16 +217,16 @@ const tools = await client.listTools();
 
 ### With TLS and authentication
 
-Enable TLS and/or auth via VS Code settings or environment variables, then update your client URL and headers accordingly.
+Enable TLS and/or auth via VS Code settings or environment variables, then
+update your client URL and headers accordingly.
 
 **Server-side setup:**
 
-| Method | Setting |
-|--------|---------|
-| VS Code settings | `vscode-mcp-server.tlsCertPath`, `vscode-mcp-server.tlsKeyPath`, `vscode-mcp-server.authToken` |
-| Env vars | `MCP_TLS_CERT_PATH`, `MCP_TLS_KEY_PATH`, `MCP_AUTH_TOKEN` |
+- **VS Code settings** — `vscode-mcp-server.tlsCertPath`,
+  `vscode-mcp-server.tlsKeyPath`, `vscode-mcp-server.authToken`
+- **Env vars** — `MCP_TLS_CERT_PATH`, `MCP_TLS_KEY_PATH`, `MCP_AUTH_TOKEN`
 
-#### opencode
+#### opencode (TLS)
 
 ```jsonc
 {
@@ -227,7 +242,7 @@ Enable TLS and/or auth via VS Code settings or environment variables, then updat
 }
 ```
 
-#### Claude Desktop / Claude Code
+#### Claude Desktop / Claude Code (TLS)
 
 ```json
 {
@@ -243,11 +258,11 @@ Enable TLS and/or auth via VS Code settings or environment variables, then updat
 }
 ```
 
-#### Cursor
+#### Cursor (TLS)
 
 In Cursor Settings → Features → MCP Servers:
 
-```
+```text
 Name: vscode-mcp
 Type: remote
 URL: https://127.0.0.1:9876/mcp
@@ -298,18 +313,23 @@ curl -sk -X POST https://127.0.0.1:9876/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-> ⚠️ **Security note**: When auth token is set without TLS, the server logs a warning. Bearer tokens over plain HTTP can be intercepted on the local network. Use TLS for any non-loopback access.
+> ⚠️ **Security note**: When auth token is set without TLS, the server logs a
+> warning. Bearer tokens over plain HTTP can be intercepted on the local
+> network. Use TLS for any non-loopback access.
 
 ## Troubleshooting
 
 ### Origin header troubleshooting
 
-Some MCP clients (including recent Claude Code versions) send an `Origin` HTTP header when connecting via Streamable HTTP (`POST /mcp`). If the origin doesn't match an allowed loopback address, the server rejects the request with `403 Forbidden`.
+Some MCP clients (including recent Claude Code versions) send an `Origin` HTTP
+header when connecting via Streamable HTTP (`POST /mcp`). If the origin doesn't
+match an allowed loopback address, the server rejects the request with
+`403 Forbidden`.
 
 **Allowed origins** (configurable via the server's `host` setting):
 
 | Origin | Default? |
-|--------|----------|
+| -------- | ---------- |
 | `http://127.0.0.1:<port>` | ✅ Always accepted |
 | `http://localhost:<port>` | ✅ Always accepted |
 | `http://0.0.0.0:<port>` | ✅ Always accepted |
@@ -326,28 +346,43 @@ curl -s -X POST http://127.0.0.1:9876/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-If `curl` works but your client doesn't, the client is likely sending an `Origin` header that doesn't match. Check your client's MCP transport configuration — some allow setting custom headers.
+If `curl` works but your client doesn't, the client is likely sending an
+`Origin` header that doesn't match. Check your client's MCP transport
+configuration — some allow setting custom headers.
 
 ### SSE transport deprecation
 
-The old MCP SSE transport (`GET /mcp` → SSE stream → `endpoint` event → `POST /mcp/session/:id/message`) is **deprecated** as of the MCP 2025-03-26 specification. The new standard is **Streamable HTTP** transport (`POST /mcp` with direct JSON-RPC response).
+The old MCP SSE transport (`GET /mcp` → SSE stream → `endpoint` event →
+`POST /mcp/session/:id/message`) is **deprecated** as of the MCP 2025-03-26
+specification. The new standard is **Streamable HTTP** transport (`POST /mcp`
+with direct JSON-RPC response).
 
-This server supports **both** transports transparently — no configuration change needed. Just use `POST /mcp` as the endpoint and the server handles everything synchronously.
+This server supports **both** transports transparently — no configuration
+change needed. Just use `POST /mcp` as the endpoint and the server handles
+everything synchronously.
 
 ### Example: tool list (49 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
-| Category | Tools |
-|----------|-------|
-| **Editor** | `open_file`, `open_file_at_line`, `open_file_at_position`, `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`, `close_all_editors` |
-| **Workspace** | `read_file`, `read_files`, `write_file`, `create_file`, `delete_file`, `list_files`, `get_workspace_folders`, `add_workspace_folder`, `update_workspace_folder`, `remove_workspace_folder` |
-| **Search** | `search_files` |
-| **Debug** | `start_debugging`, `stop_debugging`, `step_over`, `step_into`, `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`, `list_breakpoints`, `get_debug_variables`, `get_stack_trace`, `evaluate_in_debug_console` |
-| **Terminal** | `execute_in_terminal`, `get_terminal_output` |
-| **Logs** | `list_logs`, `read_log` |
-| **LSP** | `find_references`, `go_to_definition`, `go_to_type_definition`, `go_to_implementation`, `get_hover`, `get_diagnostics`, `get_document_symbols`, `get_workspace_symbols`, `get_call_hierarchy`, `rename_symbol`, `get_completions`, `get_code_actions` |
-| **Commands** | `execute_command`, `list_commands` |
+- **Editor** — `open_file`, `open_file_at_line`, `open_file_at_position`,
+  `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`,
+  `close_all_editors`
+- **Workspace** — `read_file`, `read_files`, `write_file`, `create_file`,
+  `delete_file`, `list_files`, `get_workspace_folders`,
+  `add_workspace_folder`, `update_workspace_folder`, `remove_workspace_folder`
+- **Search** — `search_files`
+- **Debug** — `start_debugging`, `stop_debugging`, `step_over`, `step_into`,
+  `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`,
+  `list_breakpoints`, `get_debug_variables`, `get_stack_trace`,
+  `evaluate_in_debug_console`
+- **Terminal** — `execute_in_terminal`, `get_terminal_output`
+- **Logs** — `list_logs`, `read_log`
+- **LSP** — `find_references`, `go_to_definition`, `go_to_type_definition`,
+  `go_to_implementation`, `get_hover`, `get_diagnostics`,
+  `get_document_symbols`, `get_workspace_symbols`, `get_call_hierarchy`,
+  `rename_symbol`, `get_completions`, `get_code_actions`
+- **Commands** — `execute_command`, `list_commands`
 
 ## MCP Protocol
 
@@ -355,40 +390,50 @@ When connected, `tools/list` returns schemas for all tools. Key categories:
 
 Supports three transport modes:
 
-**1. Streamable HTTP (recommended, MCP 2025-03-26)** — `POST /mcp` with JSON-RPC body. Synchronous request/response. This is the new standard transport used by Claude Code and recent MCP SDK clients. No session setup or SSE handshake needed.
+**1. Streamable HTTP (recommended, MCP 2025-03-26)** — `POST /mcp` with
+   JSON-RPC body. Synchronous request/response. This is the new standard
+   transport used by Claude Code and recent MCP SDK clients. No session setup
+   or SSE handshake needed.
 
-**2. SSE (legacy)** — `GET /mcp` opens an SSE stream, server sends an `endpoint` event with a session-specific POST URL. Client sends JSON-RPC messages to `POST /mcp/session/:id/message`, responses arrive via SSE `message` events. Deprecated in favor of Streamable HTTP but still supported.
+**2. SSE (legacy)** — `GET /mcp` opens an SSE stream, server sends an
+   `endpoint` event with a session-specific POST URL. Client sends JSON-RPC
+   messages to `POST /mcp/session/:id/message`, responses arrive via SSE
+   `message` events. Deprecated in favor of Streamable HTTP but still supported.
 
-**3. Direct POST (backward compat)** — `POST /mcp` with JSON-RPC body. Synchronous request/response. This is identical to Streamable HTTP at the wire level.
+**3. Direct POST (backward compat)** — `POST /mcp` with JSON-RPC body.
+   Synchronous request/response. This is identical to Streamable HTTP at the
+   wire level.
 
 ### Lifecycle
 
 Full MCP protocol lifecycle implemented:
 
-1. **Client sends `initialize`** — server responds with protocol version (`2024-11-05`), capabilities (`tools`), and server info
+1. **Client sends `initialize`** — server responds with protocol version
+   (`2024-11-05`), capabilities (`tools`), and server info
 2. **Client sends `notifications/initialized`** — acknowledges readiness (no response expected)
 3. **`tools/list`** — returns all tool definitions with JSON schemas
 4. **`tools/call`** — invokes a tool by name with arguments
 
 ### Port Retry
 
-If the default port (9876) is busy, the server tries up to 5 consecutive ports (±1 each try). If all fail, the extension logs an error and deactivates.
+If the default port (9876) is busy, the server tries up to 5 consecutive ports
+(±1 each try). If all fail, the extension logs an error and deactivates.
 
 ## Configuration
 
 All settings under `vscode-mcp-server.*`:
 
 | Setting | Default | Description |
-|---------|---------|-------------|
+| --------- | --------- | ------------- |
 | `port` | `9876` | HTTP server port (auto-retries if busy) |
-| `authToken` | `""` | Bearer token (empty = no auth). ⚠️ If set without TLS, a warning is logged (cleartext risk) |
+| `authToken` | `""` | Bearer token (empty = no auth). Warns if set without TLS |
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
 
 Settings fall back to environment variables:
 
 | Env var | Overrides | Default |
-|---------|-----------|---------|
+| --------- | ----------- | --------- |
 | `MCP_PORT` | `port` | `9876` |
 | `MCP_AUTH_TOKEN` | `authToken` | (none) |
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
@@ -408,9 +453,12 @@ VS Code settings take priority over env vars.
 ## Debug Tips
 
 ### Frame-Scoped Evaluation
-`evaluate_in_debug_console` automatically resolves the top stack frame's `frameId` and passes it to the DAP `evaluate` request. This means you can read local variables directly:
 
-```
+`evaluate_in_debug_console` automatically resolves the top stack frame's
+`frameId` and passes it to the DAP `evaluate` request. This means you can read
+local variables directly:
+
+```text
 evaluate_in_debug_console("pre")   → 69.75
 evaluate_in_debug_console("self")  → Order(order_id='ORD-001', ...)
 ```
@@ -418,6 +466,7 @@ evaluate_in_debug_console("self")  → Order(order_id='ORD-001', ...)
 Without a paused debug session, it falls back to global-scope evaluation.
 
 ### Debug Workflow
+
 1. Open target file: `open_file("src/main.py")`
 2. Set breakpoints: `add_breakpoint("src/main.py", 42)`
 3. Start debugging: `start_debugging("Launch Config Name")`
@@ -427,12 +476,17 @@ Without a paused debug session, it falls back to global-scope evaluation.
 7. Stop: `stop_debugging()`
 
 ### Launch Config Locations
+
 `start_debugging` finds a config by name in two places, preferring folder-level configs:
 
-1. A folder's `.vscode/launch.json` — pass `folder` to target a specific workspace folder (defaults to the first)
-2. The workspace file (`*.code-workspace`) `launch` section — available in multi-root workspaces opened via a `.code-workspace` file
+1. A folder's `.vscode/launch.json` — pass `folder` to target a specific
+   workspace folder (defaults to the first)
+2. The workspace file (`*.code-workspace`) `launch` section — available in
+   multi-root workspaces opened via a `.code-workspace` file
 
-For workspace-file configs, the extension reads the config from the workspace file and starts it directly, which also works around a VS Code quirk where name-based lookup with an undefined folder fails.
+For workspace-file configs, the extension reads the config from the workspace
+file and starts it directly, which also works around a VS Code quirk where
+name-based lookup with an undefined folder fails.
 
 ## Development
 
@@ -478,8 +532,17 @@ See `RELEASE.md` for details.
 
 ## Notes
 
-- Workspace file operations target the first workspace root by default. In multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`, `read_files`, `write_file`, `create_file`, `delete_file`, `list_files`, `open_file`, `open_file_at_line`, `open_file_at_position`, `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a specific folder
-- Debug tools require an active debug configuration — either in a folder's `.vscode/launch.json` or in the workspace file (`*.code-workspace`). `start_debugging` checks both, preferring folder-level configs
-- Terminal tools create integrated terminals in VS Code; output capture has a 30-second timeout to prevent resource leaks
-- LSP tools query the active language server; diagnostics are capped at 200 lines with `... and N more` suffix
+- Workspace file operations target the first workspace root by default. In
+  multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`,
+  `read_files`, `write_file`, `create_file`, `delete_file`, `list_files`,
+  `open_file`, `open_file_at_line`, `open_file_at_position`,
+  `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a
+  specific folder
+- Debug tools require an active debug configuration — either in a folder's
+  `.vscode/launch.json` or in the workspace file (`*.code-workspace`).
+  `start_debugging` checks both, preferring folder-level configs
+- Terminal tools create integrated terminals in VS Code; output capture has a
+  30-second timeout to prevent resource leaks
+- LSP tools query the active language server; diagnostics are capped at 200
+  lines with `... and N more` suffix
 - `sourceMap: true` is enabled — breakpoints work in the debugger when developing the extension itself
