@@ -12,26 +12,26 @@
  * Pure Node (no vscode API): workspace identity and the tool executor are
  * injected by extension.ts, which keeps this layer unit-testable.
  */
-import * as net from 'net';
-import { randomUUID } from 'crypto';
-import {
-  McpServer,
-  McpRouter,
-  McpRouterResult,
-} from '../server';
-import { ToolExecutor } from '../executor';
-import { JsonRpcResponse } from '../../utils/types';
-import { Metrics } from '../../utils/metrics';
-import { ServerLog } from '../../utils/serverLog';
-import { defineTool } from '../tools/index';
-import { encodeMessage, createDecoder, IpcMessage } from './protocol';
-import { createIpcServer, closeIpcServer, unlinkStaleSocketFile } from './ipc';
-import { MSG, getIpcPath, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from './constants';
+
+import { randomUUID } from "crypto";
+import type * as net from "net";
+import type { Metrics } from "../../utils/metrics";
+import type { ServerLog } from "../../utils/serverLog";
+import type { JsonRpcResponse } from "../../utils/types";
+import type { ToolExecutor } from "../executor";
+import { type McpRouter, type McpRouterResult, McpServer } from "../server";
+import { defineTool } from "../tools/index";
+import { getIpcPath, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
+import { closeIpcServer, createIpcServer, unlinkStaleSocketFile } from "./ipc";
+import { createDecoder, encodeMessage, type IpcMessage } from "./protocol";
 
 interface WorkerEntry {
   id: string;
   workspacePaths: string[];
   displayName: string;
+  /** Stable per-window UUID sent in REGISTER (wire-level identity). */
+  instanceId?: string;
+  instanceName?: string;
   socket: net.Socket;
 }
 
@@ -55,16 +55,16 @@ export interface MasterOptions {
   workspaceId: string;
   workspacePaths: string[];
   displayName: string;
+  /** Stable per-window UUID for the master's own list_workspaces row. */
+  instanceId?: string;
+  instanceName?: string;
   log?: (msg: string) => void;
 }
 
-type Target =
-  | 'local'
-  | { workerId: string }
-  | { error: JsonRpcResponse };
+type Target = "local" | { workerId: string } | { error: JsonRpcResponse };
 
 export class MasterCoordinator implements McpRouter {
-  readonly role = 'master' as const;
+  readonly role = "master" as const;
   private readonly opts: MasterOptions;
   private readonly ipcPath: string;
   private server: McpServer;
@@ -84,7 +84,9 @@ export class MasterCoordinator implements McpRouter {
       port: opts.port,
       host: opts.host,
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
-      ...(opts.tlsCertPath && opts.tlsKeyPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath } : {}),
+      ...(opts.tlsCertPath && opts.tlsKeyPath
+        ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath }
+        : {}),
       metrics: opts.metrics,
       logger: opts.logger,
       executor: opts.executor,
@@ -93,32 +95,41 @@ export class MasterCoordinator implements McpRouter {
 
     // Discovery tool: lets MCP clients enumerate the windows in the cluster
     // and target a specific one via the `workspace` argument on tools/call.
-    opts.executor.registerTool(defineTool(
-      'list_workspaces',
-      'List all VS Code windows/workspaces served by this MCP endpoint. Each entry has an id, display name, and workspace folders. Pass the id or a folder path as the `workspace` argument to tools/call or tools/list to target that window.',
-      { type: 'object', properties: {} },
-      async () => {
-        const rows = [
-          {
-            id: opts.workspaceId,
-            displayName: opts.displayName,
-            folders: opts.workspacePaths,
-            role: 'master',
-          },
-          ...Array.from(this.workers.values()).map((w) => ({
-            id: w.id,
-            displayName: w.displayName,
-            folders: w.workspacePaths,
-            role: 'worker',
-          })),
-        ];
-        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }], isError: false };
-      },
-    ));
+    opts.executor.registerTool(
+      defineTool(
+        "list_workspaces",
+        "List all VS Code windows/workspaces served by this MCP endpoint. Each entry has an id, display name, and workspace folders. Pass the id or a folder path as the `workspace` argument to tools/call or tools/list to target that window.",
+        { type: "object", properties: {} },
+        async () => {
+          const rows = [
+            {
+              id: opts.workspaceId,
+              instanceId: opts.instanceId,
+              instanceName: opts.instanceName,
+              displayName: opts.displayName,
+              folders: opts.workspacePaths,
+              role: "master",
+            },
+            ...Array.from(this.workers.values()).map((w) => ({
+              id: w.id,
+              instanceId: w.instanceId,
+              instanceName: w.instanceName,
+              displayName: w.displayName,
+              folders: w.workspacePaths,
+              role: "worker",
+            })),
+          ];
+          return {
+            content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
+            isError: false,
+          };
+        },
+      ),
+    );
   }
 
   get url(): string {
-    const scheme = this.opts.tlsCertPath && this.opts.tlsKeyPath ? 'https' : 'http';
+    const scheme = this.opts.tlsCertPath && this.opts.tlsKeyPath ? "https" : "http";
     return `${scheme}://${this.opts.host}:${this.opts.port}/mcp`;
   }
 
@@ -135,7 +146,7 @@ export class MasterCoordinator implements McpRouter {
     // Pre-clean crash leftovers (createIpcServer also re-checks under race).
     unlinkStaleSocketFile(this.ipcPath);
     this.ipcServer = await createIpcServer(this.ipcPath);
-    this.ipcServer.on('connection', (socket) => this.onIpcConnection(socket));
+    this.ipcServer.on("connection", (socket) => this.onIpcConnection(socket));
     try {
       await this.server.start();
     } catch (err) {
@@ -153,7 +164,7 @@ export class MasterCoordinator implements McpRouter {
     this.stopped = true;
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.reject(new Error('Master shutting down'));
+      p.reject(new Error("Master shutting down"));
     }
     this.pending.clear();
     await this.server.stop(timeoutMs);
@@ -162,7 +173,7 @@ export class MasterCoordinator implements McpRouter {
       this.ipcServer = null;
     }
     this.workers.clear();
-    if (process.platform !== 'win32') {
+    if (process.platform !== "win32") {
       unlinkStaleSocketFile(this.ipcPath);
     }
   }
@@ -173,50 +184,61 @@ export class MasterCoordinator implements McpRouter {
     const parsed = parseBodyLight(rawBody);
     if (!parsed) return null;
     const { id, method, params } = parsed;
-    if (method !== 'tools/call' && method !== 'tools/list') return null;
+    if (method !== "tools/call" && method !== "tools/list") return null;
 
     const target = this.resolveTarget(id, method, params);
-    if (target === 'local') {
+    if (target === "local") {
       const body = stripWorkspaceArg(rawBody, params);
       return body ? { body } : null;
     }
-    if ('error' in target) {
+    if ("error" in target) {
       return { body: rawBody, response: target.error };
     }
     const body = stripWorkspaceArg(rawBody, params) ?? rawBody;
     const response = await this.proxyCall(target.workerId, body).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`[master] proxy to worker ${target.workerId} failed: ${msg}`);
-      return { jsonrpc: '2.0', id, error: { code: -32603, message: 'Worker execution failed: ' + msg } } as JsonRpcResponse;
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: "Worker execution failed: " + msg },
+      } as JsonRpcResponse;
     });
     return { body, response };
   }
 
-  private resolveTarget(id: number | string | null, method: string, params: Record<string, unknown> | undefined): Target {
-    const workspaceRef = typeof params?.workspace === 'string' ? params.workspace : undefined;
+  private resolveTarget(
+    id: number | string | null,
+    method: string,
+    params: Record<string, unknown> | undefined,
+  ): Target {
+    const workspaceRef = typeof params?.workspace === "string" ? params.workspace : undefined;
     if (workspaceRef) {
       const t = this.resolveWorkspaceRef(workspaceRef);
-      if (t === 'local') return 'local';
+      if (t === "local") return "local";
       if (t) return { workerId: t };
       return {
         error: {
-          jsonrpc: '2.0',
+          jsonrpc: "2.0",
           id,
-          error: { code: -32602, message: `Workspace '${workspaceRef}' not found. Use list_workspaces to enumerate available windows.` },
+          error: {
+            code: -32602,
+            message: `Workspace '${workspaceRef}' not found. Use list_workspaces to enumerate available windows.`,
+          },
         },
       };
     }
-    if (method === 'tools/list') return 'local';
+    if (method === "tools/list") return "local";
     const inferred = this.inferWorker(params);
-    return inferred ? { workerId: inferred } : 'local';
+    return inferred ? { workerId: inferred } : "local";
   }
 
   /** Resolve a `workspace` argument: id, exact folder path, or folder name. */
-  private resolveWorkspaceRef(ref: string): 'local' | string | null {
-    if (ref === this.opts.workspaceId) return 'local';
-    if (this.opts.workspacePaths.some((p) => p === ref || basename(p) === ref)) return 'local';
+  private resolveWorkspaceRef(ref: string): "local" | string | null {
+    if (ref === this.opts.workspaceId || ref === this.opts.instanceId) return "local";
+    if (this.opts.workspacePaths.some((p) => p === ref || basename(p) === ref)) return "local";
     for (const w of this.workers.values()) {
-      if (w.id === ref || w.displayName === ref) return w.id;
+      if (w.id === ref || w.displayName === ref || w.instanceId === ref) return w.id;
       if (w.workspacePaths.some((p) => p === ref || basename(p) === ref)) return w.id;
     }
     return null;
@@ -230,15 +252,18 @@ export class MasterCoordinator implements McpRouter {
    * default when nothing matches.
    */
   private inferWorker(params: Record<string, unknown> | undefined): string | null {
-    const args = params && typeof params.arguments === 'object' && params.arguments !== null
-      ? params.arguments as Record<string, unknown>
-      : {};
+    const args =
+      params && typeof params.arguments === "object" && params.arguments !== null
+        ? (params.arguments as Record<string, unknown>)
+        : {};
     const candidates = collectPathCandidates(args);
     if (candidates.length === 0) return null;
 
     const all = [
-      { id: 'local', path: '' },
-      ...Array.from(this.workers.values()).flatMap((w) => w.workspacePaths.map((p) => ({ id: w.id, path: p }))),
+      { id: "local", path: "" },
+      ...Array.from(this.workers.values()).flatMap((w) =>
+        w.workspacePaths.map((p) => ({ id: w.id, path: p })),
+      ),
     ].filter((e) => e.path.length > 0);
 
     let best: { id: string; len: number } | null = null;
@@ -248,10 +273,10 @@ export class MasterCoordinator implements McpRouter {
       for (const e of all) {
         const ws = normalize(e.path);
         if (!ws) continue;
-        if (norm === ws || norm.startsWith(ws + '/') || norm.startsWith(ws + '\\')) {
+        if (norm === ws || norm.startsWith(ws + "/") || norm.startsWith(ws + "\\")) {
           if (!best || ws.length > best.len) {
             best = { id: e.id, len: ws.length };
-          } else if (ws.length === best.len && best.id !== 'local' && e.id === 'local') {
+          } else if (ws.length === best.len && best.id !== "local" && e.id === "local") {
             // Equal-length match (same folder open in two windows):
             // the Master wins the tie — it is the explicit default target.
             best = { id: e.id, len: ws.length };
@@ -259,7 +284,7 @@ export class MasterCoordinator implements McpRouter {
         }
       }
     }
-    return best && best.id !== 'local' ? best.id : null;
+    return best && best.id !== "local" ? best.id : null;
   }
 
   private proxyCall(workerId: string, body: string): Promise<JsonRpcResponse> {
@@ -271,7 +296,7 @@ export class MasterCoordinator implements McpRouter {
     return new Promise<JsonRpcResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(callId);
-        reject(new Error('Worker timed out'));
+        reject(new Error("Worker timed out"));
       }, PROXY_TIMEOUT_MS);
       this.pending.set(callId, { workerId, resolve, reject, timer });
       try {
@@ -293,45 +318,52 @@ export class MasterCoordinator implements McpRouter {
     const state = { registered: false, entryId: null as string | null };
     this.ipcPeer.set(socket, state);
     const decode = createDecoder((msg) => {
-      try { this.onIpcMessage(socket, msg); } catch (err) {
-        this.log('[master] IPC handler error: ' + (err instanceof Error ? err.message : String(err)));
+      try {
+        this.onIpcMessage(socket, msg);
+      } catch (err) {
+        this.log(
+          "[master] IPC handler error: " + (err instanceof Error ? err.message : String(err)),
+        );
         socket.destroy();
       }
     });
 
     const regTimer = setTimeout(() => {
       if (!state.registered) {
-        this.log('[master] IPC peer did not REGISTER in time — closing');
+        this.log("[master] IPC peer did not REGISTER in time — closing");
         socket.destroy();
       }
     }, REGISTER_TIMEOUT_MS);
 
-    socket.on('data', (chunk: Buffer) => {
+    socket.on("data", (chunk: Buffer) => {
       try {
         decode(chunk);
       } catch {
         socket.destroy(); // corrupt framing — drop the peer
       }
     });
-    socket.on('close', () => {
+    socket.on("close", () => {
       clearTimeout(regTimer);
       this.ipcPeer.delete(socket);
       this.sockets.delete(socket);
       if (state.entryId) this.dropWorker(state.entryId);
     });
-    socket.on('error', () => { /* close handler cleans up */ });
+    socket.on("error", () => {
+      /* close handler cleans up */
+    });
   }
 
   private onIpcMessage(socket: net.Socket, msg: IpcMessage): void {
     switch (msg.type) {
       case MSG.REGISTER: {
-        const id = typeof msg.id === 'string' ? msg.id : undefined;
+        const id = typeof msg.id === "string" ? msg.id : undefined;
         const paths = Array.isArray(msg.workspacePaths)
-          ? msg.workspacePaths.filter((p): p is string => typeof p === 'string')
+          ? msg.workspacePaths.filter((p): p is string => typeof p === "string")
           : [];
-        const displayName = typeof msg.displayName === 'string' ? msg.displayName : id ?? 'unknown';
+        const displayName =
+          typeof msg.displayName === "string" ? msg.displayName : (id ?? "unknown");
         if (!id) {
-          this.log('[master] REGISTER without id — closing peer');
+          this.log("[master] REGISTER without id — closing peer");
           socket.destroy();
           return;
         }
@@ -342,22 +374,35 @@ export class MasterCoordinator implements McpRouter {
           existing.socket.destroy();
         }
         this.dropWorker(id);
-        this.workers.set(id, { id, workspacePaths: paths, displayName, socket });
+        this.workers.set(id, {
+          id,
+          workspacePaths: paths,
+          displayName,
+          instanceId: typeof msg.instanceId === "string" ? msg.instanceId : undefined,
+          instanceName: typeof msg.instanceName === "string" ? msg.instanceName : undefined,
+          socket,
+        });
         const state = this.ipcPeer.get(socket);
         if (state) {
           state.registered = true;
           state.entryId = id;
         }
         socket.write(encodeMessage({ type: MSG.WELCOME, masterId: this.opts.workspaceId }));
-        this.log(`[master] worker registered: ${displayName} (${paths.join(', ') || 'no workspace'})`);
+        this.log(
+          `[master] worker registered: ${displayName} (${paths.join(", ") || "no workspace"})`,
+        );
         break;
       }
       case MSG.PING: {
-        try { socket.write(encodeMessage({ type: MSG.PONG })); } catch { /* peer gone */ }
+        try {
+          socket.write(encodeMessage({ type: MSG.PONG }));
+        } catch {
+          /* peer gone */
+        }
         break;
       }
       case MSG.RESULT: {
-        const callId = typeof msg.callId === 'string' ? msg.callId : undefined;
+        const callId = typeof msg.callId === "string" ? msg.callId : undefined;
         if (callId) {
           const pending = this.pending.get(callId);
           if (pending) {
@@ -383,7 +428,7 @@ export class MasterCoordinator implements McpRouter {
       if (p.workerId === workerId) {
         clearTimeout(p.timer);
         this.pending.delete(callId);
-        p.reject(new Error('Worker disconnected'));
+        p.reject(new Error("Worker disconnected"));
       }
     }
   }
@@ -404,13 +449,16 @@ interface LightRequest {
 function parseBodyLight(rawBody: string): LightRequest | null {
   try {
     const parsed = JSON.parse(rawBody) as Record<string, unknown>;
-    if (typeof parsed !== 'object' || parsed === null) return null;
-    if (typeof parsed.method !== 'string') return null;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    if (typeof parsed.method !== "string") return null;
     const params = parsed.params;
     return {
       id: (parsed.id as number | string | null) ?? null,
       method: parsed.method,
-      params: typeof params === 'object' && params !== null ? params as Record<string, unknown> : undefined,
+      params:
+        typeof params === "object" && params !== null
+          ? (params as Record<string, unknown>)
+          : undefined,
     };
   } catch {
     return null;
@@ -418,13 +466,16 @@ function parseBodyLight(rawBody: string): LightRequest | null {
 }
 
 /** Remove the routing-only `workspace` argument before local/worker dispatch. */
-function stripWorkspaceArg(rawBody: string, params: Record<string, unknown> | undefined): string | null {
-  if (!params || !('workspace' in params)) return null;
+function stripWorkspaceArg(
+  rawBody: string,
+  params: Record<string, unknown> | undefined,
+): string | null {
+  if (!params || !("workspace" in params)) return null;
   const parsed = JSON.parse(rawBody) as Record<string, unknown>;
   const newParams: Record<string, unknown> = { ...params };
   delete newParams.workspace;
   return JSON.stringify({
-    jsonrpc: '2.0',
+    jsonrpc: "2.0",
     id: parsed.id,
     method: parsed.method,
     ...(Object.keys(newParams).length > 0 ? { params: newParams } : {}),
@@ -437,7 +488,7 @@ const ABS_RE = /^(\/|[a-zA-Z]:[\\/])/;
 function collectPathCandidates(args: Record<string, unknown>): string[] {
   const out: string[] = [];
   for (const [key, value] of Object.entries(args)) {
-    if (typeof value !== 'string' || value.length === 0) continue;
+    if (typeof value !== "string" || value.length === 0) continue;
     if (PATH_KEY_RE.test(key) || ABS_RE.test(value)) {
       out.push(value);
     }
@@ -446,7 +497,7 @@ function collectPathCandidates(args: Record<string, unknown>): string[] {
 }
 
 function normalize(p: string): string {
-  return p.replace(/[\\/]+$/, '');
+  return p.replace(/[\\/]+$/, "");
 }
 
 function basename(p: string): string {

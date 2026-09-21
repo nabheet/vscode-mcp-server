@@ -11,12 +11,11 @@
 export const DEFAULT_PORT = 6010;
 
 /** /health response signature that identifies a valid Master. */
-export const HEALTH_SERVICE = 'vscode-mcp-server';
+export const HEALTH_SERVICE = "vscode-mcp-server";
 
 /** Well-known IPC path (POSIX socket or Windows named pipe). */
-export const DEFAULT_IPC_PATH = process.platform === 'win32'
-  ? '\\\\.\\pipe\\vscode-mcp-ipc'
-  : '/tmp/vscode-mcp-ipc.sock';
+export const DEFAULT_IPC_PATH =
+  process.platform === "win32" ? "\\\\.\\pipe\\vscode-mcp-ipc" : "/tmp/vscode-mcp-ipc.sock";
 
 /** Env override so tests can use per-suite socket paths. */
 export function getIpcPath(): string {
@@ -59,10 +58,12 @@ export const MAX_FRAME_BYTES = 256 * 1024 * 1024;
 
 /** IPC message types. */
 export const MSG = {
-  REGISTER: 'REGISTER',
-  WELCOME: 'WELCOME',
-  CALL: 'CALL',
-  RESULT: 'RESULT',
-  PING: 'PING',
-  PONG: 'PONG',
+  REGISTER: "REGISTER",
+  WELCOME: "WELCOME",
+  CALL: "CALL",
+  RESULT: "RESULT",
+  PING: "PING",
+  PONG: "PONG",
+  /** Worker → Master: window state changed (active file / open editors). */
+  UPDATE: "UPDATE",
 } as const;

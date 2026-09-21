@@ -1,35 +1,49 @@
-import * as vscode from 'vscode';
-import * as path from 'path';
-import { ToolRegistrar } from './index';
-import { defineTool } from './index';
-import { resolvePath } from '../../utils/path';
+import * as path from "path";
+import * as vscode from "vscode";
+import { resolvePath } from "../../utils/path";
+import { defineTool, type ToolRegistrar } from "./index";
 
 export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
-      'list_files',
-      'List files and directories in a workspace path using glob pattern.',
+      "list_files",
+      "List files and directories in a workspace path using glob pattern.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          pattern: { type: 'string', description: 'Glob pattern (default: "**/*")' },
-          path: { type: 'string', description: 'Root directory relative to workspace (default: workspace root)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          pattern: { type: "string", description: 'Glob pattern (default: "**/*")' },
+          path: {
+            type: "string",
+            description: "Root directory relative to workspace (default: workspace root)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
       },
       async (args) => {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
-          return { content: [{ type: 'text', text: 'No workspace folder open' }], isError: true };
+          return { content: [{ type: "text", text: "No workspace folder open" }], isError: true };
         }
 
         // Resolve target folder
         let rootUri: vscode.Uri;
         if (args.workspaceFolder) {
-          const folder = folders.find(f => f.name === args.workspaceFolder);
+          const folder = folders.find((f) => f.name === args.workspaceFolder);
           if (!folder) {
-            const names = folders.map(f => f.name).join(', ');
-            return { content: [{ type: 'text', text: `Workspace folder '${args.workspaceFolder}' not found. Available folders: ${names}` }], isError: true };
+            const names = folders.map((f) => f.name).join(", ");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Workspace folder '${args.workspaceFolder}' not found. Available folders: ${names}`,
+                },
+              ],
+              isError: true,
+            };
           }
           rootUri = folder.uri;
         } else {
@@ -41,17 +55,25 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           rootUri = vscode.Uri.file(path.join(rootUri.fsPath, String(args.path)));
         }
 
-        const pattern = String(args.pattern || '**/*');
+        const pattern = String(args.pattern || "**/*");
         try {
           const files = await vscode.workspace.findFiles(
             new vscode.RelativePattern(rootUri, pattern),
-            '**/node_modules/**',
+            "**/node_modules/**",
             1000,
           );
           const lines = files.map((f) => f.fsPath).sort();
-          return { content: [{ type: 'text', text: lines.join('\n') || '(no files found)' }], isError: false };
+          return {
+            content: [{ type: "text", text: lines.join("\n") || "(no files found)" }],
+            isError: false,
+          };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              { type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -59,24 +81,42 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
   server.registerTool(
     defineTool(
-      'read_file',
-      'Read the contents of a file.',
+      "read_file",
+      "Read the contents of a file.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path'],
+        required: ["path"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         try {
           const bytes = await vscode.workspace.fs.readFile(uri);
-          const text = Buffer.from(bytes).toString('utf-8');
-          return { content: [{ type: 'text', text }], isError: false };
+          const text = Buffer.from(bytes).toString("utf-8");
+          return { content: [{ type: "text", text }], isError: false };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed to read file: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to read file: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -84,24 +124,31 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
   server.registerTool(
     defineTool(
-      'read_files',
+      "read_files",
       'Read the contents of multiple files in one call. Each result is prefixed with a "=== <path> ===" marker. Missing/unreadable files are reported inline without aborting the batch.',
       {
-        type: 'object',
+        type: "object",
         properties: {
           paths: {
-            type: 'array',
-            items: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-            description: 'File paths to read (absolute or relative to workspace root)',
+            type: "array",
+            items: {
+              type: "string",
+              description: "File path (absolute or relative to workspace root)",
+            },
+            description: "File paths to read (absolute or relative to workspace root)",
           },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['paths'],
+        required: ["paths"],
       },
       async (args) => {
         const paths: string[] = Array.isArray(args.paths) ? args.paths.map(String) : [];
         if (paths.length === 0) {
-          return { content: [{ type: 'text', text: 'No paths provided' }], isError: true };
+          return { content: [{ type: "text", text: "No paths provided" }], isError: true };
         }
         const folderName = args.workspaceFolder ? String(args.workspaceFolder) : undefined;
         const parts: string[] = [];
@@ -110,43 +157,71 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           try {
             const uri = resolvePath(p, folderName);
             const bytes = await vscode.workspace.fs.readFile(uri);
-            const text = Buffer.from(bytes).toString('utf-8');
+            const text = Buffer.from(bytes).toString("utf-8");
             parts.push(`=== ${uri.fsPath} ===\n${text}`);
           } catch (err) {
             failures++;
-            parts.push(`=== ${p} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`);
+            parts.push(
+              `=== ${p} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`,
+            );
           }
         }
-        return { content: [{ type: 'text', text: parts.join('\n\n') }], isError: failures > 0 };
+        return { content: [{ type: "text", text: parts.join("\n\n") }], isError: failures > 0 };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'write_file',
-      'Write content to a file (creates or overwrites).',
+      "write_file",
+      "Write content to a file (creates or overwrites).",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          content: { type: 'string', description: 'File content' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          content: { type: "string", description: "File content" },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path', 'content'],
+        required: ["path", "content"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         const content = String(args.content);
         const MAX_WRITE_SIZE = 1 * 1024 * 1024; // 1 MB
         if (content.length > MAX_WRITE_SIZE) {
-          return { content: [{ type: 'text', text: `Content too large: ${content.length} bytes (max ${MAX_WRITE_SIZE})` }], isError: true };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Content too large: ${content.length} bytes (max ${MAX_WRITE_SIZE})`,
+              },
+            ],
+            isError: true,
+          };
         }
         try {
-          await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
-          return { content: [{ type: 'text', text: `Written ${uri.fsPath}` }], isError: false };
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf-8"));
+          return { content: [{ type: "text", text: `Written ${uri.fsPath}` }], isError: false };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed to write: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to write: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -154,33 +229,58 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
   server.registerTool(
     defineTool(
-      'create_file',
-      'Create a new empty file.',
+      "create_file",
+      "Create a new empty file.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path'],
+        required: ["path"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         try {
           // Check if file already exists
           try {
             await vscode.workspace.fs.stat(uri);
-            return { content: [{ type: 'text', text: `File already exists: ${uri.fsPath}` }], isError: true };
-          } catch { /* stat fails → file doesn't exist, proceed */ }
+            return {
+              content: [{ type: "text", text: `File already exists: ${uri.fsPath}` }],
+              isError: true,
+            };
+          } catch {
+            /* stat fails → file doesn't exist, proceed */
+          }
           // Ensure parent directory exists
           const parent = vscode.Uri.file(path.dirname(uri.fsPath));
           try {
             await vscode.workspace.fs.createDirectory(parent);
-          } catch { /* may already exist */ }
+          } catch {
+            /* may already exist */
+          }
           await vscode.workspace.fs.writeFile(uri, new Uint8Array());
-          return { content: [{ type: 'text', text: `Created ${uri.fsPath}` }], isError: false };
+          return { content: [{ type: "text", text: `Created ${uri.fsPath}` }], isError: false };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed to create: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to create: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -188,27 +288,56 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
   server.registerTool(
     defineTool(
-      'delete_file',
-      'Delete a file or directory.',
+      "delete_file",
+      "Delete a file or directory.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'File path (absolute or relative to workspace root)' },
-          useTrash: { type: 'boolean', description: 'Move to trash instead of permanent delete (default: true)' },
-          recursive: { type: 'boolean', description: 'Recursively delete directories (default: false)' },
-          workspaceFolder: { type: 'string', description: 'Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.' },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to workspace root)",
+          },
+          useTrash: {
+            type: "boolean",
+            description: "Move to trash instead of permanent delete (default: true)",
+          },
+          recursive: {
+            type: "boolean",
+            description: "Recursively delete directories (default: false)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
         },
-        required: ['path'],
+        required: ["path"],
       },
       async (args) => {
-        const uri = resolvePath(String(args.path), args.workspaceFolder ? String(args.workspaceFolder) : undefined);
+        const uri = resolvePath(
+          String(args.path),
+          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+        );
         const useTrash = args.useTrash !== false;
         const recursive = args.recursive === true;
         try {
           await vscode.workspace.fs.delete(uri, { recursive, useTrash });
-          return { content: [{ type: 'text', text: `Deleted ${uri.fsPath}${useTrash ? ' (moved to trash)' : ''}` }], isError: false };
+          return {
+            content: [
+              { type: "text", text: `Deleted ${uri.fsPath}${useTrash ? " (moved to trash)" : ""}` },
+            ],
+            isError: false,
+          };
         } catch (err) {
-          return { content: [{ type: 'text', text: `Failed to delete: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to delete: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+            isError: true,
+          };
         }
       },
     ),
@@ -216,143 +345,230 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
   server.registerTool(
     defineTool(
-      'get_workspace_folders',
-      'Get the list of open workspace folders.',
+      "get_workspace_folders",
+      "Get the list of open workspace folders.",
       {
-        type: 'object',
+        type: "object",
         properties: {},
       },
       async () => {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
-          return { content: [{ type: 'text', text: 'No workspace folders open' }], isError: false };
+          return { content: [{ type: "text", text: "No workspace folders open" }], isError: false };
         }
         const lines = folders.map((f) => `${f.name}: ${f.uri.fsPath}`);
-        return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
+        return { content: [{ type: "text", text: lines.join("\n") }], isError: false };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'add_workspace_folder',
-      'Add a folder to the workspace (multi-root only). Path is absolute or relative to the workspace file; name defaults to the folder basename.',
+      "add_workspace_folder",
+      "Add a folder to the workspace (multi-root only). Path is absolute or relative to the workspace file; name defaults to the folder basename.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          path: { type: 'string', description: 'Folder path (absolute or relative to the workspace file)' },
-          name: { type: 'string', description: 'Optional folder name (default: basename of the path)' },
+          path: {
+            type: "string",
+            description: "Folder path (absolute or relative to the workspace file)",
+          },
+          name: {
+            type: "string",
+            description: "Optional folder name (default: basename of the path)",
+          },
         },
-        required: ['path'],
+        required: ["path"],
       },
       async (args) => {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
-          return { content: [{ type: 'text', text: 'No workspace open — open a workspace before adding folders' }], isError: true };
+          return {
+            content: [
+              { type: "text", text: "No workspace open — open a workspace before adding folders" },
+            ],
+            isError: true,
+          };
         }
         const resolved = resolveFolderPath(String(args.path));
         const uri = vscode.Uri.file(resolved);
         const name = args.name ? String(args.name) : path.basename(resolved);
         if (folders.some((f) => f.name === name)) {
-          return { content: [{ type: 'text', text: `Workspace folder '${name}' already exists` }], isError: true };
-        }
-        if (folders.some((f) => f.uri.fsPath === resolved)) {
-          return { content: [{ type: 'text', text: `Path already open: ${resolved}` }], isError: true };
-        }
-        const ok = await callWhenWorkspaceFoldersConfirmed(() => vscode.workspace.updateWorkspaceFolders(folders.length, 0, { uri, name }));
-        if (!ok) {
           return {
-            content: [{ type: 'text', text: 'Failed to add workspace folder — adding folders requires a multi-root workspace opened from a .code-workspace file (open the folder with a workspace file first)' }],
+            content: [{ type: "text", text: `Workspace folder '${name}' already exists` }],
             isError: true,
           };
         }
-        return { content: [{ type: 'text', text: `Added workspace folder '${name}' (${resolved}).\n\nCurrent folders:\n${formatWorkspaceFolders()}` }], isError: false };
+        if (folders.some((f) => f.uri.fsPath === resolved)) {
+          return {
+            content: [{ type: "text", text: `Path already open: ${resolved}` }],
+            isError: true,
+          };
+        }
+        const ok = await callWhenWorkspaceFoldersConfirmed(() =>
+          vscode.workspace.updateWorkspaceFolders(folders.length, 0, { uri, name }),
+        );
+        if (!ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Failed to add workspace folder — adding folders requires a multi-root workspace opened from a .code-workspace file (open the folder with a workspace file first)",
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Added workspace folder '${name}' (${resolved}).\n\nCurrent folders:\n${formatWorkspaceFolders()}`,
+            },
+          ],
+          isError: false,
+        };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'update_workspace_folder',
-      'Update a workspace folder (rename and/or change its path). Multi-root only. At least one of path/newName is required.',
+      "update_workspace_folder",
+      "Update a workspace folder (rename and/or change its path). Multi-root only. At least one of path/newName is required.",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          name: { type: 'string', description: 'Name of the workspace folder to update' },
-          path: { type: 'string', description: 'New folder path (absolute or relative to the workspace file)' },
-          newName: { type: 'string', description: 'New folder name' },
+          name: { type: "string", description: "Name of the workspace folder to update" },
+          path: {
+            type: "string",
+            description: "New folder path (absolute or relative to the workspace file)",
+          },
+          newName: { type: "string", description: "New folder name" },
         },
-        required: ['name'],
+        required: ["name"],
       },
       async (args) => {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
-          return { content: [{ type: 'text', text: 'No workspace folders open' }], isError: true };
+          return { content: [{ type: "text", text: "No workspace folders open" }], isError: true };
         }
         const idx = folders.findIndex((f) => f.name === String(args.name));
         if (idx === -1) {
           return {
-            content: [{ type: 'text', text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => f.name).join(', ')}` }],
+            content: [
+              {
+                type: "text",
+                text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => f.name).join(", ")}`,
+              },
+            ],
             isError: true,
           };
         }
         if (!args.path && !args.newName) {
-          return { content: [{ type: 'text', text: 'Provide at least one of `path` or `newName` to update' }], isError: true };
+          return {
+            content: [
+              { type: "text", text: "Provide at least one of `path` or `newName` to update" },
+            ],
+            isError: true,
+          };
         }
         const current = folders[idx];
         const resolved = args.path ? resolveFolderPath(String(args.path)) : current.uri.fsPath;
         const newName = args.newName ? String(args.newName) : current.name;
         const others = folders.filter((_, i) => i !== idx);
         if (others.some((f) => f.name === newName)) {
-          return { content: [{ type: 'text', text: `Workspace folder '${newName}' already exists` }], isError: true };
-        }
-        if (others.some((f) => f.uri.fsPath === resolved)) {
-          return { content: [{ type: 'text', text: `Path already open: ${resolved}` }], isError: true };
-        }
-        const ok = await replaceWorkspaceFolder(idx, { uri: vscode.Uri.file(resolved), name: newName });
-        if (!ok) {
           return {
-            content: [{ type: 'text', text: 'Failed to update workspace folder — updating folders requires a multi-root workspace opened from a .code-workspace file' }],
+            content: [{ type: "text", text: `Workspace folder '${newName}' already exists` }],
             isError: true,
           };
         }
-        return { content: [{ type: 'text', text: `Updated workspace folder '${args.name}' → '${newName}' (${resolved}).\n\nCurrent folders:\n${formatWorkspaceFolders()}` }], isError: false };
+        if (others.some((f) => f.uri.fsPath === resolved)) {
+          return {
+            content: [{ type: "text", text: `Path already open: ${resolved}` }],
+            isError: true,
+          };
+        }
+        const ok = await replaceWorkspaceFolder(idx, {
+          uri: vscode.Uri.file(resolved),
+          name: newName,
+        });
+        if (!ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Failed to update workspace folder — updating folders requires a multi-root workspace opened from a .code-workspace file",
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Updated workspace folder '${args.name}' → '${newName}' (${resolved}).\n\nCurrent folders:\n${formatWorkspaceFolders()}`,
+            },
+          ],
+          isError: false,
+        };
       },
     ),
   );
 
   server.registerTool(
     defineTool(
-      'remove_workspace_folder',
-      'Remove a folder from the workspace (multi-root only).',
+      "remove_workspace_folder",
+      "Remove a folder from the workspace (multi-root only).",
       {
-        type: 'object',
+        type: "object",
         properties: {
-          name: { type: 'string', description: 'Name of the workspace folder to remove' },
+          name: { type: "string", description: "Name of the workspace folder to remove" },
         },
-        required: ['name'],
+        required: ["name"],
       },
       async (args) => {
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
-          return { content: [{ type: 'text', text: 'No workspace folders open' }], isError: true };
+          return { content: [{ type: "text", text: "No workspace folders open" }], isError: true };
         }
         const idx = folders.findIndex((f) => f.name === String(args.name));
         if (idx === -1) {
           return {
-            content: [{ type: 'text', text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => f.name).join(', ')}` }],
+            content: [
+              {
+                type: "text",
+                text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => f.name).join(", ")}`,
+              },
+            ],
             isError: true,
           };
         }
         const removed = folders[idx];
-        const ok = await callWhenWorkspaceFoldersConfirmed(() => vscode.workspace.updateWorkspaceFolders(idx, 1));
+        const ok = await callWhenWorkspaceFoldersConfirmed(() =>
+          vscode.workspace.updateWorkspaceFolders(idx, 1),
+        );
         if (!ok) {
           return {
-            content: [{ type: 'text', text: 'Failed to remove workspace folder — removing folders requires a multi-root workspace opened from a .code-workspace file' }],
+            content: [
+              {
+                type: "text",
+                text: "Failed to remove workspace folder — removing folders requires a multi-root workspace opened from a .code-workspace file",
+              },
+            ],
             isError: true,
           };
         }
-        return { content: [{ type: 'text', text: `Removed workspace folder '${removed.name}' (${removed.uri.fsPath}).\n\nCurrent folders:\n${formatWorkspaceFolders()}` }], isError: false };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Removed workspace folder '${removed.name}' (${removed.uri.fsPath}).\n\nCurrent folders:\n${formatWorkspaceFolders()}`,
+            },
+          ],
+          isError: false,
+        };
       },
     ),
   );
@@ -366,14 +582,24 @@ async function replaceWorkspaceFolder(
   // index + URI + name), so a single replace call succeeds once the workspace
   // is confirmed. Older hosts compare by URI only and reject same-URI renames
   // — fall back to remove → wait for the change to land → add.
-  if (await callWhenWorkspaceFoldersConfirmed(() => vscode.workspace.updateWorkspaceFolders(idx, 1, replacement))) {
+  if (
+    await callWhenWorkspaceFoldersConfirmed(() =>
+      vscode.workspace.updateWorkspaceFolders(idx, 1, replacement),
+    )
+  ) {
     return true;
   }
-  if (!(await callWhenWorkspaceFoldersConfirmed(() => vscode.workspace.updateWorkspaceFolders(idx, 1)))) {
+  if (
+    !(await callWhenWorkspaceFoldersConfirmed(() =>
+      vscode.workspace.updateWorkspaceFolders(idx, 1),
+    ))
+  ) {
     return false;
   }
   await waitForWorkspaceFoldersChange(2000);
-  return callWhenWorkspaceFoldersConfirmed(() => vscode.workspace.updateWorkspaceFolders(idx, 0, replacement));
+  return callWhenWorkspaceFoldersConfirmed(() =>
+    vscode.workspace.updateWorkspaceFolders(idx, 0, replacement),
+  );
 }
 
 /**
@@ -418,17 +644,19 @@ function resolveFolderPath(input: string): string {
   if (path.isAbsolute(input)) return input;
   const wsFile = vscode.workspace.workspaceFile;
   const base =
-    wsFile && wsFile.scheme === 'file'
+    wsFile && wsFile.scheme === "file"
       ? path.dirname(wsFile.fsPath)
       : vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!base) {
-    throw new Error('Cannot resolve a relative folder path without a workspace file or workspace folder');
+    throw new Error(
+      "Cannot resolve a relative folder path without a workspace file or workspace folder",
+    );
   }
   return path.resolve(base, input);
 }
 
 function formatWorkspaceFolders(): string {
   const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) return '(no workspace folders)';
-  return folders.map((f) => `${f.name}: ${f.uri.fsPath}`).join('\n');
+  if (!folders || folders.length === 0) return "(no workspace folders)";
+  return folders.map((f) => `${f.name}: ${f.uri.fsPath}`).join("\n");
 }

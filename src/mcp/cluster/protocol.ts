@@ -7,18 +7,31 @@
  * chunks, and must not be confused with frame boundaries. The length header
  * also lets us reject corrupt/garbage frames instead of hanging.
  */
-import { MAX_FRAME_BYTES } from './constants';
+import { MAX_FRAME_BYTES } from "./constants";
 
 export interface IpcMessage {
   type: string;
   [key: string]: unknown;
 }
 
+/**
+ * Per-window UI state surfaced in `list_workspaces` so a client can
+ * distinguish two windows that share the same folder/name (e.g. "the
+ * window where file X is open"). Populated by extension.ts from the
+ * VS Code window; carried in REGISTER and refreshed via MSG.UPDATE.
+ */
+export interface WindowState {
+  /** Absolute path of the active editor's document, if any. */
+  activeFile?: string;
+  /** Absolute paths of all open editor tabs. */
+  openEditors: string[];
+}
+
 export const HEADER_BYTES = 4;
 
 /** Serialize one message into a length-prefixed frame. */
 export function encodeMessage(msg: IpcMessage): Buffer {
-  const body = Buffer.from(JSON.stringify(msg), 'utf-8');
+  const body = Buffer.from(JSON.stringify(msg), "utf-8");
   if (body.length > MAX_FRAME_BYTES) {
     throw new Error(`IPC frame too large (${body.length} bytes > ${MAX_FRAME_BYTES})`);
   }
@@ -31,7 +44,7 @@ export function encodeMessage(msg: IpcMessage): Buffer {
 export class FrameDecodeError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = 'FrameDecodeError';
+    this.name = "FrameDecodeError";
   }
 }
 
@@ -54,16 +67,20 @@ export function createDecoder(onMessage: (msg: IpcMessage) => void): (chunk: Buf
       }
       if (buffer.length < HEADER_BYTES + len) break; // wait for more data
 
-      const body = buffer.subarray(HEADER_BYTES, HEADER_BYTES + len).toString('utf-8');
+      const body = buffer.subarray(HEADER_BYTES, HEADER_BYTES + len).toString("utf-8");
       buffer = buffer.subarray(HEADER_BYTES + len);
 
       let parsed: unknown;
       try {
         parsed = JSON.parse(body);
       } catch {
-        throw new FrameDecodeError('Frame body is not valid JSON');
+        throw new FrameDecodeError("Frame body is not valid JSON");
       }
-      if (typeof parsed !== 'object' || parsed === null || typeof (parsed as IpcMessage).type !== 'string') {
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        typeof (parsed as IpcMessage).type !== "string"
+      ) {
         throw new FrameDecodeError('Frame body is not an IPC message (missing string "type")');
       }
       onMessage(parsed as IpcMessage);

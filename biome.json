@@ -27,6 +27,6 @@
     }
   },
   "files": {
-    "includes": ["**", "!node_modules", "!dist", "!.git", "!coverage"]
+    "includes": ["**", "!node_modules", "!dist", "!out", "!.git", "!coverage"]
   }
 }

@@ -3,9 +3,10 @@
  * Kept free of the vscode API so the coordination layer is unit-testable
  * with real sockets.
  */
-import * as net from 'net';
-import * as fs from 'fs';
-import { IPC_CONNECT_TIMEOUT_MS } from './constants';
+
+import * as fs from "fs";
+import * as net from "net";
+import { IPC_CONNECT_TIMEOUT_MS } from "./constants";
 
 export interface IpcConnection {
   socket: net.Socket;
@@ -26,7 +27,7 @@ export function connectIpc(path: string, timeoutMs = IPC_CONNECT_TIMEOUT_MS): Pr
       reject(new Error(`IPC connect to ${path} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    socket.once('connect', () => {
+    socket.once("connect", () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -34,7 +35,7 @@ export function connectIpc(path: string, timeoutMs = IPC_CONNECT_TIMEOUT_MS): Pr
       resolve(socket);
     });
 
-    socket.once('error', (err) => {
+    socket.once("error", (err) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -74,13 +75,15 @@ export function isIpcAlive(path: string, timeoutMs = 1500): Promise<boolean> {
  * Windows named pipes.
  */
 export function unlinkStaleSocketFile(path: string): void {
-  if (process.platform === 'win32') return;
+  if (process.platform === "win32") return;
   try {
     const stat = fs.lstatSync(path);
     if (stat.isSocket()) {
       fs.unlinkSync(path);
     }
-  } catch { /* already gone — fine */ }
+  } catch {
+    /* already gone — fine */
+  }
 }
 
 /**
@@ -95,23 +98,24 @@ export function unlinkStaleSocketFile(path: string): void {
 export function createIpcServer(path: string): Promise<net.Server> {
   const server = net.createServer();
 
-  const listen = (): Promise<net.Server> => new Promise((resolve, reject) => {
-    const onError = (err: NodeJS.ErrnoException) => {
-      server.removeListener('listening', onListening);
-      reject(err);
-    };
-    const onListening = () => {
-      server.removeListener('error', onError);
-      resolve(server);
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(path);
-  });
+  const listen = (): Promise<net.Server> =>
+    new Promise((resolve, reject) => {
+      const onError = (err: NodeJS.ErrnoException) => {
+        server.removeListener("listening", onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener("error", onError);
+        resolve(server);
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(path);
+    });
 
   return listen().catch(async (err: NodeJS.ErrnoException) => {
-    if (err.code !== 'EADDRINUSE') throw err;
-    if (process.platform === 'win32') throw err; // named pipes: EADDRINUSE = live peer
+    if (err.code !== "EADDRINUSE") throw err;
+    if (process.platform === "win32") throw err; // named pipes: EADDRINUSE = live peer
     const alive = await isIpcAlive(path, 800);
     if (alive) throw err; // live (possibly frozen) Master owns the path
     unlinkStaleSocketFile(path);

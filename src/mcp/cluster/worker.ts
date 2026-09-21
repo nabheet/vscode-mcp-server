@@ -12,18 +12,23 @@
  * Pure Node (no vscode API); workspace identity, executor, and the
  * re-election callback are injected by extension.ts.
  */
-import * as net from 'net';
-import { ToolExecutor, BusyError } from '../executor';
-import { JsonRpcResponse } from '../../utils/types';
-import { encodeMessage, createDecoder, IpcMessage } from './protocol';
-import { connectIpc } from './ipc';
+import type * as net from "net";
+import type { JsonRpcResponse } from "../../utils/types";
+import { BusyError, type ToolExecutor } from "../executor";
 import {
-  MSG,
   getIpcPath,
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MISS_LIMIT,
+  MSG,
   REGISTER_TIMEOUT_MS,
-} from './constants';
+} from "./constants";
+import { connectIpc } from "./ipc";
+import {
+  createDecoder,
+  encodeMessage,
+  type IpcMessage,
+  type WindowState,
+} from "./protocol";
 
 export interface WorkerOptions {
   ipcPath?: string;
@@ -32,11 +37,16 @@ export interface WorkerOptions {
   workspaceId: string;
   workspacePaths: string[];
   displayName: string;
+  /** Stable per-window UUID surfaced in REGISTER → master's list_workspaces. */
+  instanceId?: string;
+  instanceName?: string;
+  /** Initial window state (active file / open editors) for list_workspaces. */
+  state?: WindowState;
   log?: (msg: string) => void;
 }
 
 export class WorkerCoordinator {
-  readonly role = 'worker' as const;
+  readonly role = "worker" as const;
   private readonly opts: WorkerOptions;
   private readonly ipcPath: string;
   private lostMasterHandler: (reason: string) => void = () => {};
@@ -62,38 +72,45 @@ export class WorkerCoordinator {
     const socket = await connectIpc(this.ipcPath, this.opts.connectTimeoutMs);
     if (this.stopped) {
       socket.destroy();
-      throw new Error('Worker stopped while connecting');
+      throw new Error("Worker stopped while connecting");
     }
     this.socket = socket;
     this.lastPongAt = Date.now();
     socket.setNoDelay(true);
 
     const decode = createDecoder((msg) => this.onMessage(msg));
-    socket.on('data', (chunk: Buffer) => {
+    socket.on("data", (chunk: Buffer) => {
       try {
         decode(chunk);
       } catch {
-        this.failOver('corrupt IPC frame from master');
+        this.failOver("corrupt IPC frame from master");
       }
     });
-    socket.on('close', () => this.failOver('IPC socket closed'));
-    socket.on('error', () => this.failOver('IPC socket error'));
+    socket.on("close", () => this.failOver("IPC socket closed"));
+    socket.on("error", () => this.failOver("IPC socket error"));
 
     // Register with the Master and wait for WELCOME.
     const welcome = new Promise<void>((resolve, reject) => {
       this.welcomeResolve = resolve;
       this.welcomeReject = reject;
     });
-    socket.write(encodeMessage({
-      type: MSG.REGISTER,
-      id: this.opts.workspaceId,
-      workspacePaths: this.opts.workspacePaths,
-      displayName: this.opts.displayName,
-    }));
+    socket.write(
+      encodeMessage({
+        type: MSG.REGISTER,
+        id: this.opts.workspaceId,
+        workspacePaths: this.opts.workspacePaths,
+        displayName: this.opts.displayName,
+        instanceId: this.opts.instanceId,
+        instanceName: this.opts.instanceName,
+      }),
+    );
     await Promise.race([
       welcome,
       new Promise<never>((_, reject) => {
-        const t = setTimeout(() => reject(new Error('WELCOME from master timed out')), REGISTER_TIMEOUT_MS);
+        const t = setTimeout(
+          () => reject(new Error("WELCOME from master timed out")),
+          REGISTER_TIMEOUT_MS,
+        );
         (t as NodeJS.Timeout).unref?.();
       }),
     ]).catch((err: Error) => {
@@ -104,7 +121,9 @@ export class WorkerCoordinator {
 
     this.heartbeatTimer = setInterval(() => this.heartbeatTick(), HEARTBEAT_INTERVAL_MS);
     this.heartbeatTimer.unref?.();
-    this.opts.log?.(`[worker] registered with master on ${this.ipcPath} as ${this.opts.displayName}`);
+    this.opts.log?.(
+      `[worker] registered with master on ${this.ipcPath} as ${this.opts.displayName}`,
+    );
   }
 
   /** Wire re-election. Called by the cluster owner after every election. */
@@ -114,7 +133,7 @@ export class WorkerCoordinator {
 
   async stop(timeoutMs = 3000): Promise<void> {
     this.stopped = true;
-    this.rejectWelcome(new Error('Worker stopped'));
+    this.rejectWelcome(new Error("Worker stopped"));
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -124,7 +143,7 @@ export class WorkerCoordinator {
     if (socket && !socket.destroyed) {
       socket.destroy();
       await Promise.race([
-        new Promise<void>((resolve) => socket.once('close', () => resolve())),
+        new Promise<void>((resolve) => socket.once("close", () => resolve())),
         new Promise<void>((resolve) => setTimeout(resolve, timeoutMs).unref?.()),
       ]);
     }
@@ -135,13 +154,15 @@ export class WorkerCoordinator {
     try {
       this.socket.write(encodeMessage({ type: MSG.PING }));
     } catch {
-      this.failOver('PING write failed');
+      this.failOver("PING write failed");
       return;
     }
     if (Date.now() - this.lastPongAt > HEARTBEAT_INTERVAL_MS) {
       this.missedPongs++;
       if (this.missedPongs >= HEARTBEAT_MISS_LIMIT) {
-        this.failOver(`no PONG for ${this.missedPongs} heartbeat intervals — master event loop assumed frozen`);
+        this.failOver(
+          `no PONG for ${this.missedPongs} heartbeat intervals — master event loop assumed frozen`,
+        );
       }
     } else {
       this.missedPongs = 0;
@@ -159,8 +180,8 @@ export class WorkerCoordinator {
         this.missedPongs = 0;
         break;
       case MSG.CALL: {
-        const callId = typeof msg.callId === 'string' ? msg.callId : undefined;
-        const rawBody = typeof msg.rawBody === 'string' ? msg.rawBody : undefined;
+        const callId = typeof msg.callId === "string" ? msg.callId : undefined;
+        const rawBody = typeof msg.rawBody === "string" ? msg.rawBody : undefined;
         if (callId && rawBody) {
           void this.handleCall(callId, rawBody);
         }
@@ -179,13 +200,13 @@ export class WorkerCoordinator {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const code = err instanceof BusyError ? -32050 : -32603;
-      response = { jsonrpc: '2.0', id: extractRequestId(rawBody), error: { code, message: msg } };
+      response = { jsonrpc: "2.0", id: extractRequestId(rawBody), error: { code, message: msg } };
     }
     if (this.stopped || !this.socket || this.socket.destroyed) return;
     try {
       this.socket.write(encodeMessage({ type: MSG.RESULT, callId, response }));
     } catch {
-      this.failOver('RESULT write failed');
+      this.failOver("RESULT write failed");
     }
   }
 

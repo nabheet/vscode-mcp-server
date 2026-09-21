@@ -14,22 +14,16 @@
  *    promoted simultaneously) fall out of the loop naturally: re-probe and
  *    retry with exponential backoff + jitter.
  */
-import { ToolExecutor } from '../executor';
-import { Metrics } from '../../utils/metrics';
-import { ServerLog } from '../../utils/serverLog';
-import { probePort, sleep, jitter } from './election';
-import { MasterCoordinator } from './master';
-import { WorkerCoordinator } from './worker';
-import {
-  MAX_PORT_SCAN,
-  MAX_ELECTION_ATTEMPTS,
-  REELECT_JITTER_MS,
-  getIpcPath,
-} from './constants';
 
-export type ClusterMember =
-  | MasterCoordinator
-  | WorkerCoordinator;
+import type { Metrics } from "../../utils/metrics";
+import type { ServerLog } from "../../utils/serverLog";
+import type { ToolExecutor } from "../executor";
+import { getIpcPath, MAX_ELECTION_ATTEMPTS, MAX_PORT_SCAN, REELECT_JITTER_MS } from "./constants";
+import { jitter, probePort, sleep } from "./election";
+import { MasterCoordinator } from "./master";
+import { WorkerCoordinator } from "./worker";
+
+export type ClusterMember = MasterCoordinator | WorkerCoordinator;
 
 export interface BootstrapOptions {
   basePort: number;
@@ -44,6 +38,10 @@ export interface BootstrapOptions {
   workspaceId: string;
   workspacePaths: string[];
   displayName: string;
+  /** Stable per-window UUID for wire-level identity (defaults to workspaceId). */
+  instanceId?: string;
+  /** Human-readable window name (defaults to displayName). */
+  instanceName?: string;
   log?: (msg: string) => void;
 }
 
@@ -58,7 +56,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
       const port = base + offset;
       const probe = await probePort(port, ipcPath);
 
-      if (probe.status === 'valid') {
+      if (probe.status === "valid") {
         const worker = await tryJoin(port, opts, ipcPath);
         if (worker) {
           opts.log?.(`[mcp] Joined master on port ${port} as worker`);
@@ -67,7 +65,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         continue; // master died mid-handshake — re-probe
       }
 
-      if (probe.status === 'zombie') {
+      if (probe.status === "zombie") {
         // Frozen master: do NOT skip the port. Try to rejoin; if that fails,
         // back off and retry this port on the next attempt (it may unfreeze,
         // or die and free the port for promotion).
@@ -79,13 +77,12 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         break;
       }
 
-      if (probe.status === 'free') {
+      if (probe.status === "free") {
         const master = await tryPromote(port, opts, ipcPath);
         if (master) {
           opts.log?.(`[mcp] Promoted to master on port ${port}`);
           return master;
         }
-        continue; // lost a promotion race — re-probe (may now be valid)
       }
 
       // foreign → try next port
@@ -97,17 +94,23 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
 
   throw new Error(
     `Could not elect or join a master after ${MAX_ELECTION_ATTEMPTS} attempts ` +
-    `(ports ${base}..${base + maxPorts - 1})`,
+      `(ports ${base}..${base + maxPorts - 1})`,
   );
 }
 
-async function tryJoin(port: number, opts: BootstrapOptions, ipcPath: string): Promise<WorkerCoordinator | null> {
+async function tryJoin(
+  port: number,
+  opts: BootstrapOptions,
+  ipcPath: string,
+): Promise<WorkerCoordinator | null> {
   const worker = new WorkerCoordinator({
     ipcPath,
     executor: opts.executor,
     workspaceId: opts.workspaceId,
     workspacePaths: opts.workspacePaths,
     displayName: opts.displayName,
+    instanceId: opts.instanceId ?? opts.workspaceId,
+    instanceName: opts.instanceName ?? opts.displayName,
     log: opts.log,
     // Re-election is wired by the owner (extension.ts) after the member is
     // returned: it must stop this worker, re-run bootstrapCluster, and swap
@@ -117,32 +120,44 @@ async function tryJoin(port: number, opts: BootstrapOptions, ipcPath: string): P
     await worker.start();
     return worker;
   } catch (err) {
-    opts.log?.(`[mcp] Join on port ${port} failed: ${err instanceof Error ? err.message : String(err)}`);
+    opts.log?.(
+      `[mcp] Join on port ${port} failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
     await worker.stop(100);
     return null;
   }
 }
 
-async function tryPromote(port: number, opts: BootstrapOptions, ipcPath: string): Promise<MasterCoordinator | null> {
+async function tryPromote(
+  port: number,
+  opts: BootstrapOptions,
+  ipcPath: string,
+): Promise<MasterCoordinator | null> {
   const master = new MasterCoordinator({
     port,
     host: opts.host,
     ipcPath,
     ...(opts.authToken ? { authToken: opts.authToken } : {}),
-    ...(opts.tlsCertPath && opts.tlsKeyPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath } : {}),
+    ...(opts.tlsCertPath && opts.tlsKeyPath
+      ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath }
+      : {}),
     executor: opts.executor,
     metrics: opts.metrics,
     logger: opts.logger,
     workspaceId: opts.workspaceId,
     workspacePaths: opts.workspacePaths,
     displayName: opts.displayName,
+    instanceId: opts.instanceId ?? opts.workspaceId,
+    instanceName: opts.instanceName ?? opts.displayName,
     log: opts.log,
   });
   try {
     await master.start();
     return master;
   } catch (err) {
-    opts.log?.(`[mcp] Promotion on port ${port} failed: ${err instanceof Error ? err.message : String(err)}`);
+    opts.log?.(
+      `[mcp] Promotion on port ${port} failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
     await master.stop(100);
     return null;
   }
