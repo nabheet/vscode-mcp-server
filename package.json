@@ -82,8 +82,8 @@
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "RUN_E2E=1 vitest run --config vitest.e2e.config.ts",
-    "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.ts"
+    "test:e2e": "RUN_E2E=1 vitest run --config vitest.e2e.config.mts",
+    "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.mts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
