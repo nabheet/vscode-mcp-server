@@ -181,9 +181,21 @@ async function handleCallTool(
 
 // ── Main Dispatch ────────────────────────────────────────────────────
 
+/**
+ * Per-instance identity surfaced to MCP clients via initialize `serverInfo`.
+ * `instanceId` is a stable per-window UUID that also appears in
+ * `list_workspaces` entries, letting a client correlate the endpoint it is
+ * talking to with a specific VS Code window in the cluster.
+ */
+export interface ServerIdentity {
+  instanceId?: string;
+  instanceName?: string;
+}
+
 export async function handleRequest(
   rawBody: string,
   tools: Map<string, ToolDefinition>,
+  identity?: ServerIdentity,
 ): Promise<JsonRpcResponse> {
   const { req, error: parseError } = parseBody(rawBody);
   if (parseError) return parseError;
@@ -196,7 +208,12 @@ export async function handleRequest(
       return makeResult(id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: pkg.name, version: pkg.version },
+        serverInfo: {
+          name: pkg.name,
+          version: pkg.version,
+          ...(identity?.instanceId ? { instanceId: identity.instanceId } : {}),
+          ...(identity?.instanceName ? { instanceName: identity.instanceName } : {}),
+        },
       });
     case MCP_NOTIFICATION_INITIALIZED:
       // Notification — no response expected
