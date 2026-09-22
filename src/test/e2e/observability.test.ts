@@ -155,6 +155,7 @@ function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: 
 describe("observability endpoints + log tools (E2E)", () => {
   let vsCodeProc: ChildProcess | null = null;
   let tmpDir: string | null = null;
+  let ipcPath: string;
   let port: number;
 
   beforeAll(async () => {
@@ -171,6 +172,11 @@ describe("observability endpoints + log tools (E2E)", () => {
 
     port = await findFreePort();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-"));
+    // Short socket name — macOS Unix socket paths must stay under ~103 chars
+    // (os.tmpdir() is already long: /var/folders/...). Isolated per-suite IPC
+    // path so this suite never collides with the DEFAULT_IPC_PATH holder left
+    // behind by an earlier suite whose VS Code app survives teardown.
+    ipcPath = path.join(tmpDir, "obs.sock");
     const folder = path.join(tmpDir, "ws");
     fs.mkdirSync(path.join(folder, "src"), { recursive: true });
     fs.writeFileSync(path.join(folder, "src", "index.ts"), "// obs e2e\nconst x = 1;\n");
@@ -207,7 +213,12 @@ describe("observability endpoints + log tools (E2E)", () => {
     if (process.platform === "linux") launchArgs.push("--no-sandbox");
 
     const spawnOpts: SpawnOptions = {
-      env: { ...process.env, MCP_PORT: String(port), MCP_SERVER_MAX_RETRIES: "1" },
+      env: {
+        ...process.env,
+        MCP_PORT: String(port),
+        MCP_SERVER_MAX_RETRIES: "1",
+        VSCODE_MCP_IPC_PATH: ipcPath,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     };
     vsCodeProc = spawn(cliCmd, launchArgs, spawnOpts);
