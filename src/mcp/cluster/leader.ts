@@ -1,5 +1,5 @@
 /**
- * MasterCoordinator — the single process that owns the HTTP/SSE port.
+ * LeaderCoordinator — the single process that owns the HTTP/SSE port.
  *
  * Responsibilities:
  *  - Serve the HTTP endpoint via McpServer (health, metrics, SSE, direct
@@ -13,8 +13,8 @@
  * injected by extension.ts, which keeps this layer unit-testable.
  */
 
-import { randomUUID } from "crypto";
-import type * as net from "net";
+import { randomUUID } from "node:crypto";
+import type * as net from "node:net";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { JsonRpcResponse } from "../../utils/types";
@@ -22,8 +22,8 @@ import type { ToolExecutor } from "../executor";
 import { type McpRouter, type McpRouterResult, McpServer } from "../server";
 import { defineTool } from "../tools/index";
 import { getIpcPath, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
-import { closeIpcServer, createIpcServer, unlinkStaleSocketFile } from "./ipc";
-import { createDecoder, encodeMessage, type IpcMessage } from "./protocol";
+import { closeIpcServer, createIpcServer } from "./ipc";
+import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
 
 interface WorkerEntry {
   id: string;
@@ -32,6 +32,8 @@ interface WorkerEntry {
   /** Stable per-window UUID sent in REGISTER (wire-level identity). */
   instanceId?: string;
   instanceName?: string;
+  /** Latest window state (active file / open editors) from MSG.UPDATE. */
+  state?: WindowState;
   socket: net.Socket;
 }
 
@@ -42,7 +44,7 @@ interface PendingCall {
   timer: NodeJS.Timeout;
 }
 
-export interface MasterOptions {
+export interface LeaderOptions {
   port: number;
   host: string;
   ipcPath?: string;
@@ -55,30 +57,33 @@ export interface MasterOptions {
   workspaceId: string;
   workspacePaths: string[];
   displayName: string;
-  /** Stable per-window UUID for the master's own list_workspaces row. */
+  /** Stable per-window UUID for the leader's own list_workspaces row. */
   instanceId?: string;
   instanceName?: string;
+  /** Initial window state (active file / open editors) for the leader row. */
+  state?: WindowState;
   log?: (msg: string) => void;
 }
 
 type Target = "local" | { workerId: string } | { error: JsonRpcResponse };
 
-export class MasterCoordinator implements McpRouter {
-  readonly role = "master" as const;
-  private readonly opts: MasterOptions;
+export class LeaderCoordinator implements McpRouter {
+  readonly role = "leader" as const;
+  private readonly opts: LeaderOptions;
   private readonly ipcPath: string;
   private server: McpServer;
   private ipcServer: net.Server | null = null;
   private sockets = new Set<net.Socket>();
+  private localState: WindowState = { openEditors: [] };
   /** Per-connection state: registration status + worker id (set on REGISTER). */
   private ipcPeer = new Map<net.Socket, { registered: boolean; entryId: string | null }>();
   private workers = new Map<string, WorkerEntry>();
   private pending = new Map<string, PendingCall>();
-  private stopped = false;
 
-  constructor(opts: MasterOptions) {
+  constructor(opts: LeaderOptions) {
     this.opts = opts;
     this.ipcPath = opts.ipcPath ?? getIpcPath();
+    if (opts.state) this.localState = opts.state;
 
     this.server = new McpServer({
       port: opts.port,
@@ -108,7 +113,8 @@ export class MasterCoordinator implements McpRouter {
               instanceName: opts.instanceName,
               displayName: opts.displayName,
               folders: opts.workspacePaths,
-              role: "master",
+              role: "leader",
+              state: this.localState,
             },
             ...Array.from(this.workers.values()).map((w) => ({
               id: w.id,
@@ -117,6 +123,7 @@ export class MasterCoordinator implements McpRouter {
               displayName: w.displayName,
               folders: w.workspacePaths,
               role: "worker",
+              state: w.state ?? { openEditors: [] },
             })),
           ];
           return {
@@ -142,16 +149,17 @@ export class MasterCoordinator implements McpRouter {
   }
 
   async start(): Promise<void> {
-    this.stopped = false;
-    // Pre-clean crash leftovers (createIpcServer also re-checks under race).
-    unlinkStaleSocketFile(this.ipcPath);
+    // NOTE: no pre-unlink here. createIpcServer already recovers stale
+    // socket files safely (EADDRINUSE -> isIpcAlive -> unlink only if the
+    // holder is dead). Unlinking unconditionally would let a promoting
+    // window steal the IPC path from a LIVE leader — the split-brain bug.
     this.ipcServer = await createIpcServer(this.ipcPath);
     this.ipcServer.on("connection", (socket) => this.onIpcConnection(socket));
     try {
       await this.server.start();
     } catch (err) {
       // HTTP bind lost the race — undo the IPC server and let bootstrap
-      // re-probe (it will find the winner as a valid master and join).
+      // re-probe (it will find the winner as a valid leader and join).
       if (this.ipcServer) {
         await closeIpcServer(this.ipcServer, this.sockets);
         this.ipcServer = null;
@@ -161,10 +169,9 @@ export class MasterCoordinator implements McpRouter {
   }
 
   async stop(timeoutMs = 5000): Promise<void> {
-    this.stopped = true;
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.reject(new Error("Master shutting down"));
+      p.reject(new Error("Leader shutting down"));
     }
     this.pending.clear();
     await this.server.stop(timeoutMs);
@@ -173,9 +180,13 @@ export class MasterCoordinator implements McpRouter {
       this.ipcServer = null;
     }
     this.workers.clear();
-    if (process.platform !== "win32") {
-      unlinkStaleSocketFile(this.ipcPath);
-    }
+    // Do NOT unlink this.ipcPath here. The socket path is cluster-shared, not
+    // owned by one leader: during a split-brain two leaders can exist, and one
+    // stopping must not remove the path the other is actively serving (that
+    // strands every worker in a permanent ENOENT loop). Stale-file recovery
+    // lives in createIpcServer (EADDRINUSE -> isIpcAlive -> unlink only when
+    // the holder is dead); if this process is dying the kernel closes the
+    // socket and the next promotion reclaims the path.
   }
 
   // ── Cluster routing (McpRouter) ────────────────────────────────────
@@ -197,11 +208,11 @@ export class MasterCoordinator implements McpRouter {
     const body = stripWorkspaceArg(rawBody, params) ?? rawBody;
     const response = await this.proxyCall(target.workerId, body).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[master] proxy to worker ${target.workerId} failed: ${msg}`);
+      this.log(`[leader] proxy to worker ${target.workerId} failed: ${msg}`);
       return {
         jsonrpc: "2.0",
         id,
-        error: { code: -32603, message: "Worker execution failed: " + msg },
+        error: { code: -32603, message: `Worker execution failed: ${msg}` },
       } as JsonRpcResponse;
     });
     return { body, response };
@@ -248,7 +259,7 @@ export class MasterCoordinator implements McpRouter {
    * Path-based inference for tools/call without an explicit workspace arg.
    * Scans path-like arguments (path/uri/file/folder/dir/cwd/workspaceFolder
    * and absolute-looking strings) and routes to the Worker whose workspace
-   * path is the longest prefix of the target. Master wins ties and is the
+   * path is the longest prefix of the target. Leader wins ties and is the
    * default when nothing matches.
    */
   private inferWorker(params: Record<string, unknown> | undefined): string | null {
@@ -273,12 +284,12 @@ export class MasterCoordinator implements McpRouter {
       for (const e of all) {
         const ws = normalize(e.path);
         if (!ws) continue;
-        if (norm === ws || norm.startsWith(ws + "/") || norm.startsWith(ws + "\\")) {
+        if (norm === ws || norm.startsWith(`${ws}/`) || norm.startsWith(`${ws}\\`)) {
           if (!best || ws.length > best.len) {
             best = { id: e.id, len: ws.length };
           } else if (ws.length === best.len && best.id !== "local" && e.id === "local") {
             // Equal-length match (same folder open in two windows):
-            // the Master wins the tie — it is the explicit default target.
+            // the Leader wins the tie — it is the explicit default target.
             best = { id: e.id, len: ws.length };
           }
         }
@@ -321,16 +332,14 @@ export class MasterCoordinator implements McpRouter {
       try {
         this.onIpcMessage(socket, msg);
       } catch (err) {
-        this.log(
-          "[master] IPC handler error: " + (err instanceof Error ? err.message : String(err)),
-        );
+        this.log(`[leader] IPC handler error: ${err instanceof Error ? err.message : String(err)}`);
         socket.destroy();
       }
     });
 
     const regTimer = setTimeout(() => {
       if (!state.registered) {
-        this.log("[master] IPC peer did not REGISTER in time — closing");
+        this.log("[leader] IPC peer did not REGISTER in time — closing");
         socket.destroy();
       }
     }, REGISTER_TIMEOUT_MS);
@@ -363,11 +372,11 @@ export class MasterCoordinator implements McpRouter {
         const displayName =
           typeof msg.displayName === "string" ? msg.displayName : (id ?? "unknown");
         if (!id) {
-          this.log("[master] REGISTER without id — closing peer");
+          this.log("[leader] REGISTER without id — closing peer");
           socket.destroy();
           return;
         }
-        // Replace a stale entry for the same window (reconnect after master
+        // Replace a stale entry for the same window (reconnect after leader
         // restart) and fail any calls that were in flight to it.
         const existing = this.workers.get(id);
         if (existing && existing.socket !== socket) {
@@ -380,6 +389,7 @@ export class MasterCoordinator implements McpRouter {
           displayName,
           instanceId: typeof msg.instanceId === "string" ? msg.instanceId : undefined,
           instanceName: typeof msg.instanceName === "string" ? msg.instanceName : undefined,
+          state: this.normalizeWindowState(msg.state),
           socket,
         });
         const state = this.ipcPeer.get(socket);
@@ -387,9 +397,9 @@ export class MasterCoordinator implements McpRouter {
           state.registered = true;
           state.entryId = id;
         }
-        socket.write(encodeMessage({ type: MSG.WELCOME, masterId: this.opts.workspaceId }));
+        socket.write(encodeMessage({ type: MSG.WELCOME, leaderId: this.opts.workspaceId }));
         this.log(
-          `[master] worker registered: ${displayName} (${paths.join(", ") || "no workspace"})`,
+          `[leader] worker registered: ${displayName} (${paths.join(", ") || "no workspace"})`,
         );
         break;
       }
@@ -398,6 +408,17 @@ export class MasterCoordinator implements McpRouter {
           socket.write(encodeMessage({ type: MSG.PONG }));
         } catch {
           /* peer gone */
+        }
+        break;
+      }
+      case MSG.UPDATE: {
+        // Worker publishes window state (active file / open editors).
+        const peer = this.ipcPeer.get(socket);
+        if (peer?.entryId) {
+          const entry = this.workers.get(peer.entryId);
+          if (entry) {
+            entry.state = this.normalizeWindowState(msg.state);
+          }
         }
         break;
       }
@@ -435,6 +456,26 @@ export class MasterCoordinator implements McpRouter {
 
   private log(msg: string): void {
     this.opts.log?.(msg);
+  }
+
+  /**
+   * Publish the leader window's own state (active file / open editors).
+   * The leader row in list_workspaces reflects the latest value. No IPC
+   * message is needed — the leader already owns its row locally.
+   */
+  updateState(state: WindowState): void {
+    this.localState = state;
+  }
+
+  /** Coerce an untrusted wire value into a valid WindowState. */
+  private normalizeWindowState(value: unknown): WindowState {
+    if (typeof value !== "object" || value === null) return { openEditors: [] };
+    const v = value as Record<string, unknown>;
+    const openEditors = Array.isArray(v.openEditors)
+      ? v.openEditors.filter((p): p is string => typeof p === "string")
+      : [];
+    const activeFile = typeof v.activeFile === "string" ? v.activeFile : undefined;
+    return { openEditors, ...(activeFile !== undefined ? { activeFile } : {}) };
   }
 }
 

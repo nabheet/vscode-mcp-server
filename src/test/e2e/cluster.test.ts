@@ -179,13 +179,13 @@ function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: 
  *
  * Spawns TWO VS Code windows (distinct user-data dirs, distinct single-root
  * workspaces) sharing ONE cluster port. Election decides which becomes
- * master; the other joins over IPC. The test then:
- *  1. lists the cluster (2 rows, distinct instanceIds, one master + one worker)
+ * leader; the other joins over IPC. The test then:
+ *  1. lists the cluster (2 rows, distinct instanceIds, one leader + one worker)
  *  2. targets each window BY instanceId and proves the calls land in the
  *     right window (folder listing + file content)
- *  3. lists tools per window (worker must not expose master-only tools)
+ *  3. lists tools per window (worker must not expose leader-only tools)
  */
-describe("cluster master-worker (E2E)", () => {
+describe("cluster leader-worker (E2E)", () => {
   const procs: ChildProcess[] = [];
   let tmpDir: string | null = null;
   let ipcPath: string;
@@ -234,7 +234,7 @@ describe("cluster master-worker (E2E)", () => {
 
     // Two distinct user-data dirs = two distinct windows. BOTH windows share
     // the SAME cluster port + IPC socket — the cluster elects exactly one
-    // master; the other joins as worker. Settings carry the port (env vars
+    // leader; the other joins as worker. Settings carry the port (env vars
     // don't reliably propagate through VS Code's extension host chain).
     const spawns: Array<[string, string]> = [
       [folderA, "a"],
@@ -291,7 +291,7 @@ describe("cluster master-worker (E2E)", () => {
     // unaffected. Requires Accessibility permission; failures are ignored.
     hideVSCodeWindows(procs);
 
-    // Wait for the elected master to come up (up to 180s — two windows on
+    // Wait for the elected leader to come up (up to 180s — two windows on
     // slow CI runners). The worker joins shortly after.
     await waitForServer(port, 180000);
   }, 240000);
@@ -329,7 +329,7 @@ describe("cluster master-worker (E2E)", () => {
       }
       if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
     }
-    // Stale IPC socket may outlive the master on crash — remove defensively.
+    // Stale IPC socket may outlive the leader on crash — remove defensively.
     try {
       fs.unlinkSync(ipcPath);
     } catch {
@@ -358,6 +358,50 @@ describe("cluster master-worker (E2E)", () => {
     throw new Error(`Cluster did not reach 2 windows within ${deadlineMs}ms`);
   }
 
+  /**
+   * Assert the MCP endpoint is NOT serving — used right after killing the
+   * leader to prove the cluster is genuinely broken before self-heal.
+   * Only a leader serves the HTTP port, so any success here means the
+   * kill+block did not land.
+   */
+  async function expectServerDown(port: number, timeoutMs = 8000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const res = await mcpRequest(port, "tools/list");
+        if (res?.result) {
+          throw new Error("MCP server unexpectedly up right after leader SIGKILL");
+        }
+      } catch {
+        return; // refused / no server — exactly what we want
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error(`MCP server still responding ${timeoutMs}ms after leader SIGKILL`);
+  }
+
+  /** Poll list_workspaces until SOME window reports role "leader". */
+  async function waitForLeader(deadlineMs = 15000): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      const res = await mcpRequest(port, "tools/call", {
+        name: "list_workspaces",
+        arguments: {},
+      });
+      if (res.result && !res.result.isError) {
+        try {
+          const rows = JSON.parse(res.result.content[0].text) as Array<Record<string, unknown>>;
+          const leader = rows.find((r) => r.role === "leader");
+          if (leader) return leader;
+        } catch {
+          /* not JSON yet */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`No window reported leader within ${deadlineMs}ms after self-heal`);
+  }
+
   // ── Discovery ─────────────────────────────────────────────────────────
 
   it("list_workspaces returns both windows with distinct instanceIds", async () => {
@@ -370,11 +414,22 @@ describe("cluster master-worker (E2E)", () => {
     expect(ids[0]).toBeTruthy();
 
     const roles = rows.map((r) => r.role).sort();
-    expect(roles).toEqual(["master", "worker"]);
+    expect(roles).toEqual(["leader", "worker"]);
 
     const folders = rows.flatMap((r) => (r.folders as string[]) ?? []);
     expect(folders.some((f) => f.endsWith("alpha"))).toBe(true);
     expect(folders.some((f) => f.endsWith("beta"))).toBe(true);
+
+    // Every window must expose a state descriptor (issue #76): openEditors
+    // is always an array; activeFile is a string when an editor is active.
+    for (const row of rows) {
+      const state = row.state as { activeFile?: unknown; openEditors?: unknown } | undefined;
+      expect(state).toBeDefined();
+      expect(Array.isArray(state?.openEditors)).toBe(true);
+      if (state?.activeFile !== undefined) {
+        expect(typeof state.activeFile).toBe("string");
+      }
+    }
   });
 
   // ── Targeting by instanceId ──────────────────────────────────────────
@@ -431,7 +486,7 @@ describe("cluster master-worker (E2E)", () => {
 
   // ── Per-window tool list ─────────────────────────────────────────────
 
-  it("routes tools/list by instanceId: worker list excludes master-only list_workspaces", async () => {
+  it("routes tools/list by instanceId: worker list excludes leader-only list_workspaces", async () => {
     if (!ENABLED) return;
     const rows = await waitForTwoWindows();
     const workerIdx = rows.findIndex((r) => r.role === "worker");
@@ -448,4 +503,57 @@ describe("cluster master-worker (E2E)", () => {
     expect(names).toContain("get_workspace_folders");
     expect(names).not.toContain("list_workspaces");
   });
+
+  // ── FATAL self-heal ──────────────────────────────────────────────────
+
+  it("cluster self-heals to leader after leader death + blocked IPC socket (no reload)", async () => {
+    if (!ENABLED) return;
+
+    // Identify the elected leader so we can kill it.
+    const rows = await waitForTwoWindows();
+    const leaderIdx = rows.findIndex((r) => r.role === "leader");
+    expect(leaderIdx).toBeGreaterThanOrEqual(0);
+    const leaderFolders = (rows[leaderIdx].folders as string[]) ?? [];
+    const leaderFolder = leaderFolders.find((f) => f.endsWith("alpha") || f.endsWith("beta"));
+    expect(leaderFolder, "leader row should carry the alpha or beta folder").toBeTruthy();
+    const leaderProc = procs[leaderFolder?.endsWith("alpha") ? 0 : 1];
+    expect(leaderProc.pid, "leader process should be trackable").toBeTruthy();
+
+    // Kill the leader, then immediately block its IPC socket path with a
+    // directory: neither joining (connecting to a directory fails) nor
+    // promoting (bind fails EADDRINUSE) can succeed, so bootstrap exhausts
+    // its attempts and throws FATAL — the exact reported failure ("Could
+    // not elect or join a leader after N attempts"). Pre-fix, the window
+    // stayed dead until a manual reload.
+    leaderProc.kill("SIGKILL");
+    fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
+    fs.mkdirSync(ipcPath);
+
+    try {
+      // Leader is dead and the socket is blocked: MCP must be down.
+      await expectServerDown(port);
+
+      // Hold the block long enough for the first bootstrap to exhaust its
+      // attempts (8 attempts x up to ~5.5s backoff ≈ 28s worst case).
+      // Lost-leader detection is ≤5s (heartbeat), so by 28s the candidate
+      // has FATALed and scheduled its first retry.
+      await new Promise((r) => setTimeout(r, 28000));
+      fs.rmSync(ipcPath, { recursive: true, force: true });
+
+      // Self-heal must happen WITHOUT any reload: the retry re-runs
+      // startCluster and a leader comes back. Which window becomes leader
+      // is intentionally NOT asserted: on Linux CI the SIGKILL hits the
+      // xvfb-run wrapper, so the killed window's VS Code main survives as
+      // an orphan and VS Code auto-restarts its extension host, which hits
+      // FATAL and self-heals through the same retry path — racing the
+      // survivor's re-election. Pre-fix, every path stays dead after FATAL
+      // and the port never returns, so role=leader is the regression signal.
+      await waitForServer(port, 90000);
+      const healed = await waitForLeader(15000);
+      expect(healed.role).toBe("leader");
+    } finally {
+      // Restore the socket path so afterAll cleanup is uncomplicated.
+      fs.rmSync(ipcPath, { recursive: true, force: true });
+    }
+  }, 180000);
 });

@@ -38,7 +38,7 @@ export interface ToolExecutorOptions {
  * The tool-call execution engine shared by every cluster member.
  *
  * A VS Code extension host owns exactly one window's `vscode` API, so the
- * tools registered here execute against THIS process's workspace. The master
+ * tools registered here execute against THIS process's workspace. The leader
  * uses a ToolExecutor for local execution and the HTTP layer (McpServer);
  * each worker uses one to execute tool payloads forwarded over the IPC pipe.
  * Keeping the engine separate from the transport is what lets every member

@@ -1,14 +1,14 @@
 /**
- * Port probing and Master discovery.
+ * Port probing and Leader discovery.
  *
- * Before binding a port (or joining an existing Master), a candidate probes
+ * Before binding a port (or joining an existing Leader), a candidate probes
  * `GET /health` on the port. The four outcomes map to distinct actions:
  *
  *  - valid    → our service: join it as a Worker.
- *  - free     → nothing listening: try to promote to Master.
+ *  - free     → nothing listening: try to promote to Leader.
  *  - foreign  → an unrelated app: increment the port and retry.
  *  - zombie   → occupied, no HTTP signature, but the IPC socket is alive:
- *               this is a frozen/starting Master. Do NOT increment the port
+ *               this is a frozen/starting Leader. Do NOT increment the port
  *               (that would fragment the cluster); retry registration.
  */
 import * as http from "http";
@@ -72,7 +72,7 @@ export async function probePort(port: number, ipcPath: string): Promise<PortProb
       return { status: "foreign" };
     case "timeout": {
       // Occupied but silent. Could be an unrelated app that ignores /health
-      // OR a frozen Master. The IPC socket disambiguates.
+      // OR a frozen Leader. The IPC socket disambiguates.
       const alive = await isIpcAlive(ipcPath);
       return alive ? { status: "zombie" } : { status: "foreign" };
     }

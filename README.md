@@ -15,7 +15,7 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
    or install a `.vsix` from the [latest release](https://github.com/nabheet/vscode-mcp-server/releases).
 
 2. **Reload VS Code** — the extension starts automatically on startup. The first window becomes the
-   **master** and listens on `http://127.0.0.1:6010`; additional windows join as **workers** over an
+   **leader** and listens on `http://127.0.0.1:9876`; additional windows join as **workers** over an
    IPC socket and share the same port (the MCP client targets a window via a `workspace` argument).
 
 3. **Configure your AI tool** (e.g., opencode) to connect via SSE:
@@ -24,7 +24,7 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
    {
      "vscode-mcp": {
        "type": "remote",
-       "url": "http://127.0.0.1:6010/mcp"
+       "url": "http://127.0.0.1:9876/mcp"
      }
    }
    ```
@@ -32,7 +32,7 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 4. **Verify** the server is running:
 
    ```bash
-   curl -s -X POST http://127.0.0.1:6010/mcp \
+   curl -s -X POST http://127.0.0.1:9876/mcp \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
    ```
@@ -42,19 +42,19 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 ```text
 VS Code Extension (onStartupFinished)
   └─ src/extension.ts          — Lifecycle: activation, cluster election, re-election,
-                                  tool registration, deactivation
-  └─ src/config.ts             — Settings (port, auth, TLS) from VS Code + env fallbacks
+                                  tool registration, window-state publishing, deactivation
   └─ src/mcp/
        ├─ executor.ts          — Shared tool executor: registration, dispatch, concurrency cap, timeouts
        ├─ server.ts            — HTTP server: CORS, auth, TLS, SSE transport, JSON-RPC dispatch
        ├─ transport.ts         — JSON-RPC 2.0 handler + MCP protocol lifecycle
        ├─ cluster/
        │    ├─ election.ts     — Port probing (/health + IPC liveness) → valid | free | foreign | zombie
-       │    ├─ master.ts       — MasterCoordinator: owns the HTTP port, routes tools/call
-│    │                    to workers, list_workspaces
-       │    ├─ worker.ts       — WorkerCoordinator: joins master via IPC, heartbeat failover + re-election
-       │    ├─ bootstrap.ts    — Bounded retry loop: promote (master) or join (worker), with backoff
-       │    ├─ protocol.ts     — Length-prefixed JSON framing for the IPC pipe
+       │    ├─ constants.ts    — Port/IPC/heartbeat/timeout constants + MSG protocol types
+       │    ├─ leader.ts       — LeaderCoordinator: owns the HTTP port, routes tools/call
+       │    │                    to workers, serves list_workspaces
+       │    ├─ worker.ts       — WorkerCoordinator: joins leader via IPC, heartbeat failover + re-election
+       │    ├─ bootstrap.ts    — Bounded retry loop: promote (leader) or join (worker), with backoff
+       │    ├─ protocol.ts     — Length-prefixed JSON framing + WindowState for the IPC pipe
        │    └─ ipc.ts          — Unix-socket helpers (stale-socket recovery, liveness checks)
        └─ tools/
             ├─ commands.ts     — Execute/catalog VS Code commands, get code actions
@@ -92,7 +92,7 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
-| `list_workspaces` | cluster | List all VS Code windows in the cluster (each worker) |
+| `list_workspaces` | cluster | List windows (leader + workers): id, name, folders, role, state |
 | `add_workspace_folder` | workspace | Add a folder to the workspace (multi-root) |
 | `update_workspace_folder` | workspace | Rename/change a workspace folder's path (multi-root) |
 | `remove_workspace_folder` | workspace | Remove a folder from the workspace (multi-root) |
@@ -125,6 +125,69 @@ VS Code Extension (onStartupFinished)
 | `rename_symbol` | lsp | Rename symbol across workspace |
 | `get_completions` | lsp | Get completion items at cursor |
 
+## Cluster mode
+
+Every VS Code window runs one cluster member. Exactly one window (the
+**leader**) owns the HTTP port; every other window (a **worker**) connects to
+it over a local IPC pipe. Clients connect to the single leader port and target
+a specific window via the `workspace` argument on `tools/call` / `tools/list`
+(see below).
+
+### list_workspaces
+
+`list_workspaces` returns one row per window. Each row carries stable identity
+plus live editor state:
+
+```json
+[
+  {
+    "id": "/path/to/folder:12345",
+    "instanceId": "9f7b…uuid…",
+    "instanceName": "My Project",
+    "displayName": "My Project",
+    "folders": ["/path/to/folder"],
+    "role": "leader",
+    "state": {
+      "activeFile": "/path/to/folder/src/main.ts",
+      "openEditors": ["/path/to/folder/src/main.ts", "/path/to/folder/src/util.ts"]
+    }
+  }
+]
+```
+
+- `role` — `"leader"` (owns the port) or `"worker"` (joined over IPC).
+- `state.activeFile` — absolute path of the active editor, when one is open
+  (omitted otherwise).
+- `state.openEditors` — absolute paths of all open editor tabs; always present.
+
+State is refreshed automatically as editors open, close, or change focus
+(debounced, pushed over IPC for workers), so two windows on the same folder
+are distinguishable by which files they have open.
+
+### Targeting a window
+
+Pass `workspace` on `tools/call` / `tools/list` to route to a specific window.
+Accepted values:
+
+- a row `id` from `list_workspaces`
+- an `instanceId` (stable per-window UUID)
+- a folder path contained in that window's `folders`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "open_file",
+    "arguments": { "path": "src/main.ts" },
+    "workspace": "/path/to/folder"
+  }
+}
+```
+
+Without `workspace`, calls target the leader window.
+
 ## Connecting from other AI tools
 
 ### opencode
@@ -136,7 +199,7 @@ Add to your `opencode.global.jsonc` or `opencode.json`:
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "http://127.0.0.1:6010/mcp"
+      "url": "http://127.0.0.1:9876/mcp"
     }
   }
 }
@@ -156,7 +219,7 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "http://127.0.0.1:6010/mcp"
+      "url": "http://127.0.0.1:9876/mcp"
     }
   }
 }
@@ -188,7 +251,7 @@ In Cursor Settings → Features → MCP Servers → Add new MCP server:
 ```text
 Name: vscode-mcp
 Type: remote
-URL: http://127.0.0.1:6010/mcp
+URL: http://127.0.0.1:9876/mcp
 ```
 
 ### Windsurf / Continue.dev / Any MCP-compatible tool
@@ -196,7 +259,7 @@ URL: http://127.0.0.1:6010/mcp
 Add a `type: "remote"` MCP server pointing to:
 
 ```text
-http://127.0.0.1:6010/mcp
+http://127.0.0.1:9876/mcp
 ```
 
 The server uses **SSE transport** (the standard MCP HTTP transport). If the tool
@@ -210,7 +273,7 @@ write a thin wrapper.
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-async with sse_client("http://127.0.0.1:6010/mcp") as transport:
+async with sse_client("http://127.0.0.1:9876/mcp") as transport:
     async with ClientSession(transport) as session:
         result = await session.list_tools()
         for tool in result.tools:
@@ -222,7 +285,7 @@ async with sse_client("http://127.0.0.1:6010/mcp") as transport:
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
-const transport = new SSEClientTransport(new URL("http://127.0.0.1:6010/mcp"));
+const transport = new SSEClientTransport(new URL("http://127.0.0.1:9876/mcp"));
 const client = new Client({ name: "my-agent", version: "1.0.0" });
 await client.connect(transport);
 const tools = await client.listTools();
@@ -246,7 +309,7 @@ update your client URL and headers accordingly.
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "https://127.0.0.1:6010/mcp",   // https, not http
+      "url": "https://127.0.0.1:9876/mcp",   // https, not http
       "headers": {
         "Authorization": "Bearer <your-token>"
       }
@@ -262,7 +325,7 @@ update your client URL and headers accordingly.
   "mcpServers": {
     "vscode-mcp": {
       "type": "remote",
-      "url": "https://127.0.0.1:6010/mcp",
+      "url": "https://127.0.0.1:9876/mcp",
       "headers": {
         "Authorization": "Bearer <your-token>"
       }
@@ -278,7 +341,7 @@ In Cursor Settings → Features → MCP Servers:
 ```text
 Name: vscode-mcp
 Type: remote
-URL: https://127.0.0.1:6010/mcp
+URL: https://127.0.0.1:9876/mcp
 Headers: { "Authorization": "Bearer <your-token>" }
 ```
 
@@ -289,7 +352,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 
 async with sse_client(
-    "https://127.0.0.1:6010/mcp",
+    "https://127.0.0.1:9876/mcp",
     headers={"Authorization": "Bearer <your-token>"},
 ) as transport:
     async with ClientSession(transport) as session:
@@ -303,7 +366,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
 const transport = new SSEClientTransport(
-  new URL("https://127.0.0.1:6010/mcp"),
+  new URL("https://127.0.0.1:9876/mcp"),
   { headers: { Authorization: "Bearer <your-token>" } }
 );
 const client = new Client({ name: "my-agent", version: "1.0.0" });
@@ -314,13 +377,13 @@ await client.connect(transport);
 
 ```bash
 # With TLS
-curl -sk https://127.0.0.1:6010/mcp \
+curl -sk https://127.0.0.1:9876/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <your-token>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # With TLS + auth, direct POST
-curl -sk -X POST https://127.0.0.1:6010/mcp \
+curl -sk -X POST https://127.0.0.1:9876/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <your-token>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -354,7 +417,7 @@ match an allowed loopback address, the server rejects the request with
 
 ```bash
 # Verify the server is running
-curl -s -X POST http://127.0.0.1:6010/mcp \
+curl -s -X POST http://127.0.0.1:9876/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -374,7 +437,7 @@ This server supports **both** transports transparently — no configuration
 change needed. Just use `POST /mcp` as the endpoint and the server handles
 everything synchronously.
 
-### Example: tool list (49 tools)
+### Example: tool list (50 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
@@ -429,8 +492,11 @@ Full MCP protocol lifecycle implemented:
 
 ### Port Retry
 
-If the default port (6010) is busy, the server tries up to 5 consecutive ports
-(±1 each try). If all fail, the extension logs an error and deactivates.
+If the default port (9876) is busy, the leader scans up to 5 consecutive ports
+(9876..9880, controlled by `MCP_SERVER_MAX_RETRIES`). If a port is occupied by
+a non-MCP process, the next port is tried. The election loop retries the whole
+scan up to 8 times with exponential backoff; workers re-join the elected leader
+over IPC rather than taking their own port.
 
 ## Configuration
 
@@ -438,7 +504,7 @@ All settings under `vscode-mcp-server.*`:
 
 | Setting | Default | Description |
 | --------- | --------- | ------------- |
-| `port` | `6010` | HTTP server port (auto-retries if busy) |
+| `port` | `9876` | HTTP server port (auto-retries if busy) |
 | `authToken` | `""` | Bearer token (empty = no auth). Warns if set without TLS |
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
@@ -447,11 +513,11 @@ Settings fall back to environment variables:
 
 | Env var | Overrides | Default |
 | --------- | ----------- | --------- |
-| `MCP_PORT` | `port` | `6010` |
+| `MCP_PORT` | `port` | `9876` |
 | `MCP_AUTH_TOKEN` | `authToken` | (none) |
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
 | `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
-| `MCP_SERVER_MAX_RETRIES` | port retry count | `3` |
+| `MCP_SERVER_MAX_RETRIES` | ports scanned per election (default 5, 9876–9880) | `5` |
 
 VS Code settings take priority over env vars.
 
@@ -507,14 +573,15 @@ name-based lookup with an undefined folder fails.
 npm install
 npm run compile    # Build TypeScript → out/
 npm run watch      # Watch mode
-npm test           # 75 tests across 3 suites (server, transport, tools)
+npm test           # Unit tests (server, transport, tools, cluster, …)
+npm run test:e2e   # End-to-end: launches real VS Code windows and verifies cluster routing
 ```
 
 ### Debug the extension itself
 
 1. Press F5 in VS Code (uses `.vscode/launch.json` "Run Extension" config)
 2. A new Extension Development Host window opens
-3. The MCP server starts automatically on port 6010
+3. The MCP server starts automatically on port 9876
 4. Set breakpoints in `src/` to debug tool handlers
 5. The `npm: watch` task auto-compiles on save
 

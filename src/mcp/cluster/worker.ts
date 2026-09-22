@@ -1,18 +1,18 @@
 /**
- * WorkerCoordinator — a non-master VS Code window.
+ * WorkerCoordinator — a non-leader VS Code window.
  *
  * Responsibilities:
- *  - Connect to the Master's IPC pipe and register this window's workspace.
+ *  - Connect to the Leader's IPC pipe and register this window's workspace.
  *  - Execute forwarded tool payloads locally (this process's vscode API).
  *  - Send a heartbeat (PING) and watch for PONG; two missed PONGs mean the
- *    Master's event loop is frozen, so force-close the socket and trigger
+ *    Leader's event loop is frozen, so force-close the socket and trigger
  *    re-election.
  *  - On IPC close/error, immediately trigger re-election.
  *
  * Pure Node (no vscode API); workspace identity, executor, and the
  * re-election callback are injected by extension.ts.
  */
-import type * as net from "net";
+import type * as net from "node:net";
 import type { JsonRpcResponse } from "../../utils/types";
 import { BusyError, type ToolExecutor } from "../executor";
 import {
@@ -32,7 +32,7 @@ export interface WorkerOptions {
   workspaceId: string;
   workspacePaths: string[];
   displayName: string;
-  /** Stable per-window UUID surfaced in REGISTER → master's list_workspaces. */
+  /** Stable per-window UUID surfaced in REGISTER → leader's list_workspaces. */
   instanceId?: string;
   instanceName?: string;
   /** Initial window state (active file / open editors) for list_workspaces. */
@@ -44,10 +44,11 @@ export class WorkerCoordinator {
   readonly role = "worker" as const;
   private readonly opts: WorkerOptions;
   private readonly ipcPath: string;
-  private lostMasterHandler: (reason: string) => void = () => {};
+  private lostLeaderHandler: (reason: string) => void = () => {};
   private socket: net.Socket | null = null;
   private stopped = false;
   private registered = false;
+  private state: WindowState = { openEditors: [] };
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private lastPongAt = 0;
   private missedPongs = 0;
@@ -57,6 +58,7 @@ export class WorkerCoordinator {
   constructor(opts: WorkerOptions) {
     this.opts = opts;
     this.ipcPath = opts.ipcPath ?? getIpcPath();
+    if (opts.state) this.state = opts.state;
   }
 
   async start(): Promise<void> {
@@ -78,13 +80,13 @@ export class WorkerCoordinator {
       try {
         decode(chunk);
       } catch {
-        this.failOver("corrupt IPC frame from master");
+        this.failOver("corrupt IPC frame from leader");
       }
     });
     socket.on("close", () => this.failOver("IPC socket closed"));
     socket.on("error", () => this.failOver("IPC socket error"));
 
-    // Register with the Master and wait for WELCOME.
+    // Register with the Leader and wait for WELCOME.
     const welcome = new Promise<void>((resolve, reject) => {
       this.welcomeResolve = resolve;
       this.welcomeReject = reject;
@@ -97,13 +99,14 @@ export class WorkerCoordinator {
         displayName: this.opts.displayName,
         instanceId: this.opts.instanceId,
         instanceName: this.opts.instanceName,
+        state: this.state,
       }),
     );
     await Promise.race([
       welcome,
       new Promise<never>((_, reject) => {
         const t = setTimeout(
-          () => reject(new Error("WELCOME from master timed out")),
+          () => reject(new Error("WELCOME from leader timed out")),
           REGISTER_TIMEOUT_MS,
         );
         (t as NodeJS.Timeout).unref?.();
@@ -117,13 +120,29 @@ export class WorkerCoordinator {
     this.heartbeatTimer = setInterval(() => this.heartbeatTick(), HEARTBEAT_INTERVAL_MS);
     this.heartbeatTimer.unref?.();
     this.opts.log?.(
-      `[worker] registered with master on ${this.ipcPath} as ${this.opts.displayName}`,
+      `[worker] registered with leader on ${this.ipcPath} as ${this.opts.displayName}`,
     );
   }
 
   /** Wire re-election. Called by the cluster owner after every election. */
-  setOnLostMaster(handler: (reason: string) => void): void {
-    this.lostMasterHandler = handler;
+  setOnLostLeader(handler: (reason: string) => void): void {
+    this.lostLeaderHandler = handler;
+  }
+
+  /**
+   * Publish a window-state change (active file / open editors) to the
+   * Leader. Before registration the value is only stored locally — it is
+   * carried in the REGISTER payload so the Leader never sees a window
+   * without state. After REGISTERED, each call sends MSG.UPDATE over IPC.
+   */
+  updateState(state: WindowState): void {
+    this.state = state;
+    if (!this.registered || !this.socket || this.socket.destroyed) return;
+    try {
+      this.socket.write(encodeMessage({ type: MSG.UPDATE, state }));
+    } catch {
+      this.failOver("UPDATE write failed");
+    }
   }
 
   async stop(timeoutMs = 3000): Promise<void> {
@@ -156,7 +175,7 @@ export class WorkerCoordinator {
       this.missedPongs++;
       if (this.missedPongs >= HEARTBEAT_MISS_LIMIT) {
         this.failOver(
-          `no PONG for ${this.missedPongs} heartbeat intervals — master event loop assumed frozen`,
+          `no PONG for ${this.missedPongs} heartbeat intervals — leader event loop assumed frozen`,
         );
       }
     } else {
@@ -217,8 +236,8 @@ export class WorkerCoordinator {
       this.socket.destroy();
     }
     this.socket = null;
-    this.opts.log?.(`[worker] lost master: ${reason}`);
-    this.lostMasterHandler(reason);
+    this.opts.log?.(`[worker] lost leader: ${reason}`);
+    this.lostLeaderHandler(reason);
   }
 
   private resolveWelcome(): void {
