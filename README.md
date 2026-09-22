@@ -573,7 +573,7 @@ name-based lookup with an undefined folder fails.
 npm install
 npm run compile    # Build TypeScript → out/
 npm run watch      # Watch mode
-npm test           # 266 unit tests across 11 files (server, transport, tools, cluster, …)
+npm test           # Unit tests (server, transport, tools, cluster, …)
 npm run test:e2e   # End-to-end: launches real VS Code windows and verifies cluster routing
 ```
 
