@@ -47,14 +47,14 @@ function makeOpts(log: (msg: string) => void) {
   };
 }
 
-function fakeMember(role: "master" | "worker" = "master"): ClusterMember {
+function fakeMember(role: "leader" | "worker" = "leader"): ClusterMember {
   return {
     role,
     port: 9876,
     stop: vi.fn(async () => {}),
     updateState: vi.fn(),
     setOnListen: vi.fn(),
-    setOnLostMaster: vi.fn(),
+    setOnLostLeader: vi.fn(),
   } as unknown as ClusterMember;
 }
 
@@ -123,7 +123,7 @@ describe("startCluster FATAL retry", () => {
 
   it("resets the retry counter after a successful election", async () => {
     const log = vi.fn();
-    let lostMaster: ((reason: string) => void) | undefined;
+    let lostLeader: ((reason: string) => void) | undefined;
     vi.mocked(bootstrapCluster)
       .mockRejectedValueOnce(new Error("boom"))
       .mockResolvedValueOnce({
@@ -132,8 +132,8 @@ describe("startCluster FATAL retry", () => {
         stop: vi.fn(async () => {}),
         updateState: vi.fn(),
         setOnListen: vi.fn(),
-        setOnLostMaster: (cb: (reason: string) => void) => {
-          lostMaster = cb;
+        setOnLostLeader: (cb: (reason: string) => void) => {
+          lostLeader = cb;
         },
       } as unknown as ClusterMember)
       .mockRejectedValueOnce(new Error("boom2"))
@@ -145,12 +145,12 @@ describe("startCluster FATAL retry", () => {
     // The retry succeeds as a worker: the backoff counter resets.
     await vi.advanceTimersByTimeAsync(2000);
     await settle();
-    expect(lostMaster).toBeDefined();
+    expect(lostLeader).toBeDefined();
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledTimes(2);
 
-    // Lost master triggers a re-election that FATALs again. Because the
+    // Lost leader triggers a re-election that FATALs again. Because the
     // counter was reset, the backoff restarts from the base delay.
-    lostMaster?.("simulated");
+    lostLeader?.("simulated");
     await settle();
     expect(log).toHaveBeenCalledWith(expect.stringContaining("retrying in 2000ms (attempt 1)"));
     await p;

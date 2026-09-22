@@ -132,13 +132,13 @@ export function activate(context: vscode.ExtensionContext): void {
   const instanceId = randomUUID();
   const instanceName = vscode.workspace.name ?? "Untitled";
 
-  // Shared execution engine: one instance per process, reused by the Master's
-  // HTTP server, the Master's router, and Worker forwarded calls, so every
+  // Shared execution engine: one instance per process, reused by the Leader's
+  // HTTP server, the Leader's router, and Worker forwarded calls, so every
   // cluster member runs the identical tool set with identical limits.
   const executor = new ToolExecutor({ metrics, logger: fileLog, instanceId, instanceName });
   registerAllTools(executor, context);
 
-  // Elect a role (master = own the port; worker = join the existing master).
+  // Elect a role (leader = own the port; worker = join the existing leader).
   void startCluster({
     basePort: port,
     host,
@@ -217,7 +217,7 @@ interface ClusterStartOptions {
   log: (msg: string) => void;
 }
 
-/** Elect a role and wire re-election. Re-runs whenever the Master is lost. */
+/** Elect a role and wire re-election. Re-runs whenever the Leader is lost. */
 export async function startCluster(opts: ClusterStartOptions): Promise<void> {
   if (electing) return;
   // A fresh election (retry, re-election, or manual reload) supersedes any
@@ -246,7 +246,7 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
       log: opts.log,
     });
 
-    // Stop the previous member (a worker that lost its master; idempotent).
+    // Stop the previous member (a worker that lost its leader; idempotent).
     if (member && member !== newMember) {
       const old = member;
       member = null;
@@ -262,8 +262,8 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     newMember.updateState(currentWindowState());
 
     if (newMember.role === "worker") {
-      newMember.setOnLostMaster((reason: string) => {
-        opts.log(`Lost master (${reason}) — re-electing...`);
+      newMember.setOnLostLeader((reason: string) => {
+        opts.log(`Lost leader (${reason}) — re-electing...`);
         void startCluster(opts);
       });
     } else {
@@ -303,13 +303,13 @@ function updateStatusBar(m: ClusterMember): void {
     statusBar.name = "MCP Server";
     statusBar.show();
   }
-  if (m.role === "master") {
+  if (m.role === "leader") {
     statusBar.text = `$(server) MCP :${m.port}`;
-    statusBar.tooltip = `MCP cluster master — serving ${m.port}`;
+    statusBar.tooltip = `MCP cluster leader — serving ${m.port}`;
     statusBar.backgroundColor = undefined;
   } else {
     statusBar.text = "$(plug) MCP worker";
-    statusBar.tooltip = "MCP cluster worker (master in another window)";
+    statusBar.tooltip = "MCP cluster worker (leader in another window)";
     statusBar.backgroundColor = undefined;
   }
 }

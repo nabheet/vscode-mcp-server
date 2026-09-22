@@ -9,7 +9,7 @@ import { bootstrapCluster } from "../mcp/cluster/bootstrap";
 import { HEALTH_SERVICE, MAX_FRAME_BYTES, MSG } from "../mcp/cluster/constants";
 import { probePort } from "../mcp/cluster/election";
 import { closeIpcServer, createIpcServer, isIpcAlive } from "../mcp/cluster/ipc";
-import { MasterCoordinator } from "../mcp/cluster/master";
+import { LeaderCoordinator } from "../mcp/cluster/leader";
 import {
   createDecoder,
   encodeMessage,
@@ -41,7 +41,7 @@ interface RpcResponseBody {
   error: { code: number; message: string };
 }
 
-/** One row of the list_workspaces output (master or worker). */
+/** One row of the list_workspaces output (leader or worker). */
 interface WorkspaceRow {
   id: string;
   instanceId?: string;
@@ -375,14 +375,14 @@ describe("cluster IPC helpers", () => {
   });
 });
 
-// ── Master + Worker integration ──────────────────────────────────────
+// ── Leader + Worker integration ──────────────────────────────────────
 
-describe("master-worker cluster", () => {
+describe("leader-worker cluster", () => {
   let port: number;
   let ipcPath: string;
-  let master: MasterCoordinator;
+  let leader: LeaderCoordinator;
   let worker: WorkerCoordinator;
-  let masterExec: ToolExecutor;
+  let leaderExec: ToolExecutor;
   let workerExec: ToolExecutor;
   let lostReasons: string[];
 
@@ -391,22 +391,22 @@ describe("master-worker cluster", () => {
     ipcPath = findFreeIpcPath();
     lostReasons = [];
 
-    masterExec = new ToolExecutor();
-    masterExec.registerTool(makeTool("echo", (a) => `echo from master: ${a.msg ?? ""}`));
+    leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (a) => `echo from leader: ${a.msg ?? ""}`));
     workerExec = new ToolExecutor();
     workerExec.registerTool(makeTool("echo", (a) => `echo from worker: ${a.msg ?? ""}`));
     workerExec.registerTool(makeTool("whoami_worker", () => "worker"));
 
-    master = new MasterCoordinator({
+    leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
       ipcPath,
-      executor: masterExec,
-      workspaceId: "master-ws",
-      workspacePaths: ["/mnt/master"],
-      displayName: "Master Window",
+      executor: leaderExec,
+      workspaceId: "leader-ws",
+      workspacePaths: ["/mnt/leader"],
+      displayName: "Leader Window",
     });
-    await master.start();
+    await leader.start();
 
     worker = new WorkerCoordinator({
       ipcPath,
@@ -415,13 +415,13 @@ describe("master-worker cluster", () => {
       workspacePaths: ["/mnt/worker"],
       displayName: "Worker Window",
     });
-    worker.setOnLostMaster((reason) => lostReasons.push(reason));
+    worker.setOnLostLeader((reason) => lostReasons.push(reason));
     await worker.start();
   });
 
   afterEach(async () => {
     if (worker) await worker.stop(500).catch(() => {});
-    if (master) await master.stop(1000).catch(() => {});
+    if (leader) await leader.stop(1000).catch(() => {});
     if (process.platform !== "win32") {
       try {
         fs.unlinkSync(ipcPath);
@@ -442,10 +442,10 @@ describe("master-worker cluster", () => {
     });
   }
 
-  it("executes calls targeting the master workspace locally", async () => {
+  it("executes calls targeting the leader workspace locally", async () => {
     const res = await toolCall("echo", { msg: "hi" });
     expect(res.status).toBe(200);
-    expect(res.body.result.content[0].text).toBe("echo from master: hi");
+    expect(res.body.result.content[0].text).toBe("echo from leader: hi");
   });
 
   it("routes calls to a worker via the workspace id", async () => {
@@ -468,14 +468,14 @@ describe("master-worker cluster", () => {
     expect(res.body.result.content[0].text).toBe("echo from worker: x");
   });
 
-  it("keeps calls under the master path local", async () => {
-    const res = await toolCall("echo", { path: "/mnt/master/src/main.ts", msg: "x" });
-    expect(res.body.result.content[0].text).toBe("echo from master: x");
+  it("keeps calls under the leader path local", async () => {
+    const res = await toolCall("echo", { path: "/mnt/leader/src/main.ts", msg: "x" });
+    expect(res.body.result.content[0].text).toBe("echo from leader: x");
   });
 
-  it("falls back to the master for non-path arguments", async () => {
+  it("falls back to the leader for non-path arguments", async () => {
     const res = await toolCall("echo", { msg: "just text" });
-    expect(res.body.result.content[0].text).toBe("echo from master: just text");
+    expect(res.body.result.content[0].text).toBe("echo from leader: just text");
   });
 
   it("returns an InvalidParams error for an unknown workspace reference", async () => {
@@ -501,11 +501,11 @@ describe("master-worker cluster", () => {
     expect(workerNames).not.toContain("list_workspaces");
   });
 
-  it("exposes list_workspaces with master and worker entries", async () => {
+  it("exposes list_workspaces with leader and worker entries", async () => {
     const res = await toolCall("list_workspaces", {});
     const parsed = JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
     const ids = parsed.map((e) => e.id).sort();
-    expect(ids).toEqual(["master-ws", "worker-ws"]);
+    expect(ids).toEqual(["leader-ws", "worker-ws"]);
     const workerEntry = parsed.find((e) => e.id === "worker-ws");
     expect(workerEntry.folders).toEqual(["/mnt/worker"]);
     expect(workerEntry.role).toBe("worker");
@@ -543,14 +543,14 @@ describe("master-worker cluster", () => {
     socket.destroy();
   }, 10_000);
 
-  it("fires the lost-master handler when the master goes away", async () => {
-    await master.stop(500);
+  it("fires the lost-leader handler when the leader goes away", async () => {
+    await leader.stop(500);
     await vi.waitFor(() => expect(lostReasons.length).toBeGreaterThan(0), { timeout: 3000 });
   });
 
-  it("master stop unlinks the IPC socket file (POSIX)", async () => {
+  it("leader stop unlinks the IPC socket file (POSIX)", async () => {
     expect(fs.existsSync(ipcPath)).toBe(true);
-    await master.stop(500);
+    await leader.stop(500);
     if (process.platform !== "win32") {
       expect(fs.existsSync(ipcPath)).toBe(false);
     }
@@ -562,31 +562,31 @@ describe("master-worker cluster", () => {
 describe("window state descriptor", () => {
   let port: number;
   let ipcPath: string;
-  let master: MasterCoordinator;
+  let leader: LeaderCoordinator;
   let worker: WorkerCoordinator;
-  let masterExec: ToolExecutor;
+  let leaderExec: ToolExecutor;
   let workerExec: ToolExecutor;
 
   beforeEach(async () => {
     port = await findFreePort();
     ipcPath = findFreeIpcPath();
 
-    masterExec = new ToolExecutor();
-    masterExec.registerTool(makeTool("echo", (a) => `echo from master: ${a.msg ?? ""}`));
+    leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (a) => `echo from leader: ${a.msg ?? ""}`));
     workerExec = new ToolExecutor();
     workerExec.registerTool(makeTool("echo", (a) => `echo from worker: ${a.msg ?? ""}`));
 
-    master = new MasterCoordinator({
+    leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
       ipcPath,
-      executor: masterExec,
-      workspaceId: "master-ws",
-      workspacePaths: ["/mnt/master"],
-      displayName: "Master Window",
-      state: { activeFile: "/mnt/master/init.ts", openEditors: ["/mnt/master/init.ts"] },
+      executor: leaderExec,
+      workspaceId: "leader-ws",
+      workspacePaths: ["/mnt/leader"],
+      displayName: "Leader Window",
+      state: { activeFile: "/mnt/leader/init.ts", openEditors: ["/mnt/leader/init.ts"] },
     });
-    await master.start();
+    await leader.start();
 
     worker = new WorkerCoordinator({
       ipcPath,
@@ -601,7 +601,7 @@ describe("window state descriptor", () => {
 
   afterEach(async () => {
     if (worker) await worker.stop(500).catch(() => {});
-    if (master) await master.stop(1000).catch(() => {});
+    if (leader) await leader.stop(1000).catch(() => {});
     if (process.platform !== "win32") {
       try {
         fs.unlinkSync(ipcPath);
@@ -629,11 +629,11 @@ describe("window state descriptor", () => {
 
   it("carries initial state in REGISTER and list_workspaces rows", async () => {
     const rows = await listRows();
-    const masterRow = rows.find((e) => e.id === "master-ws");
+    const leaderRow = rows.find((e) => e.id === "leader-ws");
     const workerRow = rows.find((e) => e.id === "worker-ws");
-    expect(masterRow.state).toEqual({
-      activeFile: "/mnt/master/init.ts",
-      openEditors: ["/mnt/master/init.ts"],
+    expect(leaderRow.state).toEqual({
+      activeFile: "/mnt/leader/init.ts",
+      openEditors: ["/mnt/leader/init.ts"],
     });
     expect(workerRow.state).toEqual({ openEditors: ["/mnt/worker/a.ts"] });
   });
@@ -688,7 +688,7 @@ describe("window state descriptor", () => {
     await new Promise<void>((resolve) => {
       socket.on("connect", () => resolve());
     });
-    // No REGISTER: MSG.UPDATE must be dropped, not crash the master.
+    // No REGISTER: MSG.UPDATE must be dropped, not crash the leader.
     socket.write(encodeMessage({ type: MSG.UPDATE, state: { openEditors: ["/x/y.ts"] } }));
     await new Promise((r) => setTimeout(r, 300));
     const rows = await listRows();
@@ -698,12 +698,12 @@ describe("window state descriptor", () => {
     socket.destroy();
   }, 10_000);
 
-  it("lets the master publish its own window state", async () => {
-    master.updateState({ activeFile: "/mnt/master/next.ts", openEditors: ["/mnt/master/next.ts"] });
+  it("lets the leader publish its own window state", async () => {
+    leader.updateState({ activeFile: "/mnt/leader/next.ts", openEditors: ["/mnt/leader/next.ts"] });
     const rows = await listRows();
-    expect(rows.find((e) => e.id === "master-ws").state).toEqual({
-      activeFile: "/mnt/master/next.ts",
-      openEditors: ["/mnt/master/next.ts"],
+    expect(rows.find((e) => e.id === "leader-ws").state).toEqual({
+      activeFile: "/mnt/leader/next.ts",
+      openEditors: ["/mnt/leader/next.ts"],
     });
   });
 
@@ -740,7 +740,7 @@ describe("window state descriptor", () => {
 // ── End-to-end bootstrap ─────────────────────────────────────────────
 
 describe("cluster bootstrap", () => {
-  it("promotes a single window to master and serves the port", async () => {
+  it("promotes a single window to leader and serves the port", async () => {
     const port = await findFreePort();
     const ipcPath = findFreeIpcPath();
     const exec = new ToolExecutor();
@@ -756,7 +756,7 @@ describe("cluster bootstrap", () => {
       displayName: "Window A",
     });
 
-    expect(member.role).toBe("master");
+    expect(member.role).toBe("leader");
     const res = await post(`http://127.0.0.1:${port}/mcp`, {
       jsonrpc: "2.0",
       id: 1,
@@ -770,21 +770,21 @@ describe("cluster bootstrap", () => {
     }
   });
 
-  it("joins an existing master as a worker", async () => {
+  it("joins an existing leader as a worker", async () => {
     const port = await findFreePort();
     const ipcPath = findFreeIpcPath();
-    const masterExec = new ToolExecutor();
-    masterExec.registerTool(makeTool("echo", (a) => `master: ${a.msg ?? ""}`));
-    const master = new MasterCoordinator({
+    const leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (a) => `leader: ${a.msg ?? ""}`));
+    const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
       ipcPath,
-      executor: masterExec,
+      executor: leaderExec,
       workspaceId: "m1",
       workspacePaths: ["/mnt/m"],
       displayName: "M",
     });
-    await master.start();
+    await leader.start();
 
     const workerExec = new ToolExecutor();
     workerExec.registerTool(makeTool("echo", (a) => `worker: ${a.msg ?? ""}`));
@@ -807,18 +807,18 @@ describe("cluster bootstrap", () => {
     });
     expect(res.body.result.content[0].text).toBe("worker: hi");
     await worker.stop(500);
-    await master.stop(500);
+    await leader.stop(500);
   });
 
-  it("does not promote to the next port when a valid master rejects the join", async () => {
+  it("does not promote to the next port when a valid leader rejects the join", async () => {
     const port = await findFreePort();
     const ipcPath = findFreeIpcPath();
     const logs: string[] = [];
 
-    // Fake "valid" master: answers /health with our service signature, but
+    // Fake "valid" leader: answers /health with our service signature, but
     // its IPC pipe destroys every connection, so the join handshake always
     // fails. Split-brain repro: the old code advanced to the next port and
-    // promoted, fragmenting the cluster into two masters.
+    // promoted, fragmenting the cluster into two leaders.
     const httpServer = http.createServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ service: HEALTH_SERVICE }));
@@ -843,9 +843,9 @@ describe("cluster bootstrap", () => {
         }),
       ).rejects.toThrow(/Could not elect or join/);
 
-      // Every attempt must target the live master's port — never a
+      // Every attempt must target the live leader's port — never a
       // promotion on a higher port.
-      expect(logs.filter((l) => l.includes("Promoted to master"))).toHaveLength(0);
+      expect(logs.filter((l) => l.includes("Promoted to leader"))).toHaveLength(0);
       expect(logs.some((l) => l.includes(`Join on port ${port} failed`))).toBe(true);
 
       // And the next port was never bound for promotion.
@@ -866,12 +866,12 @@ describe("cluster bootstrap", () => {
     }
   }, 10_000);
 
-  it("a second master cannot steal a live master's IPC socket", async () => {
+  it("a second leader cannot steal a live leader's IPC socket", async () => {
     const port = await findFreePort();
     const ipcPath = findFreeIpcPath();
     const exec1 = new ToolExecutor();
     exec1.registerTool(makeTool("echo", (a) => `m1: ${a.msg ?? ""}`));
-    const master1 = new MasterCoordinator({
+    const leader1 = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
       ipcPath,
@@ -880,11 +880,11 @@ describe("cluster bootstrap", () => {
       workspacePaths: ["/mnt/m1"],
       displayName: "M1",
     });
-    await master1.start();
+    await leader1.start();
 
     const exec2 = new ToolExecutor();
     exec2.registerTool(makeTool("echo", (a) => `m2: ${a.msg ?? ""}`));
-    const master2 = new MasterCoordinator({
+    const leader2 = new LeaderCoordinator({
       port: port + 1,
       host: "127.0.0.1",
       ipcPath, // same path — a promoting window must NOT steal it
@@ -896,9 +896,9 @@ describe("cluster bootstrap", () => {
 
     let worker: WorkerCoordinator | null = null;
     try {
-      await expect(master2.start()).rejects.toThrow();
+      await expect(leader2.start()).rejects.toThrow();
 
-      // The live master's pipe must still serve workers normally.
+      // The live leader's pipe must still serve workers normally.
       worker = new WorkerCoordinator({
         ipcPath,
         executor: exec1,
@@ -910,8 +910,8 @@ describe("cluster bootstrap", () => {
       expect(fs.existsSync(ipcPath)).toBe(true);
     } finally {
       if (worker) await worker.stop(300).catch(() => {});
-      await master2.stop(300).catch(() => {});
-      await master1.stop(500).catch(() => {});
+      await leader2.stop(300).catch(() => {});
+      await leader1.stop(500).catch(() => {});
       try {
         fs.unlinkSync(ipcPath);
       } catch {
@@ -924,13 +924,13 @@ describe("cluster bootstrap", () => {
 // ── Wire-level instance identity ────────────────────────────────────
 
 describe("wire-level instance identity", () => {
-  const MASTER_INSTANCE = "11111111-1111-1111-1111-111111111111";
+  const LEADER_INSTANCE = "11111111-1111-1111-1111-111111111111";
   const WORKER_INSTANCE = "22222222-2222-2222-2222-222222222222";
   let port: number;
   let ipcPath: string;
-  let master: MasterCoordinator;
+  let leader: LeaderCoordinator;
   let worker: WorkerCoordinator;
-  let masterExec: ToolExecutor;
+  let leaderExec: ToolExecutor;
   let workerExec: ToolExecutor;
   let lostReasons: string[];
 
@@ -940,24 +940,24 @@ describe("wire-level instance identity", () => {
     lostReasons = [];
 
     // Mirrors extension.ts: the shared executor carries the window identity,
-    // so initialize serverInfo reports it through the Master's HTTP server.
-    masterExec = new ToolExecutor({ instanceId: MASTER_INSTANCE, instanceName: "Master Instance" });
-    masterExec.registerTool(makeTool("echo", (a) => `echo from master: ${a.msg ?? ""}`));
+    // so initialize serverInfo reports it through the Leader's HTTP server.
+    leaderExec = new ToolExecutor({ instanceId: LEADER_INSTANCE, instanceName: "Leader Instance" });
+    leaderExec.registerTool(makeTool("echo", (a) => `echo from leader: ${a.msg ?? ""}`));
     workerExec = new ToolExecutor();
     workerExec.registerTool(makeTool("echo", (a) => `echo from worker: ${a.msg ?? ""}`));
 
-    master = new MasterCoordinator({
+    leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
       ipcPath,
-      executor: masterExec,
-      workspaceId: "master-ws",
-      workspacePaths: ["/mnt/master"],
-      displayName: "Master Window",
-      instanceId: MASTER_INSTANCE,
-      instanceName: "Master Instance",
+      executor: leaderExec,
+      workspaceId: "leader-ws",
+      workspacePaths: ["/mnt/leader"],
+      displayName: "Leader Window",
+      instanceId: LEADER_INSTANCE,
+      instanceName: "Leader Instance",
     });
-    await master.start();
+    await leader.start();
 
     worker = new WorkerCoordinator({
       ipcPath,
@@ -968,13 +968,13 @@ describe("wire-level instance identity", () => {
       instanceId: WORKER_INSTANCE,
       instanceName: "Worker Instance",
     });
-    worker.setOnLostMaster((reason) => lostReasons.push(reason));
+    worker.setOnLostLeader((reason) => lostReasons.push(reason));
     await worker.start();
   });
 
   afterEach(async () => {
     if (worker) await worker.stop(500).catch(() => {});
-    if (master) await master.stop(1000).catch(() => {});
+    if (leader) await leader.stop(1000).catch(() => {});
     if (process.platform !== "win32") {
       try {
         fs.unlinkSync(ipcPath);
@@ -1007,17 +1007,17 @@ describe("wire-level instance identity", () => {
       },
     });
     expect(res.body.result.serverInfo.name).toBeTruthy();
-    expect(res.body.result.serverInfo.instanceId).toBe(MASTER_INSTANCE);
-    expect(res.body.result.serverInfo.instanceName).toBe("Master Instance");
+    expect(res.body.result.serverInfo.instanceId).toBe(LEADER_INSTANCE);
+    expect(res.body.result.serverInfo.instanceName).toBe("Leader Instance");
   });
 
   it("surfaces instanceId/instanceName in list_workspaces rows", async () => {
     const res = await toolCall("list_workspaces", {});
     const parsed = JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
-    const masterRow = parsed.find((e) => e.id === "master-ws");
+    const leaderRow = parsed.find((e) => e.id === "leader-ws");
     const workerRow = parsed.find((e) => e.id === "worker-ws");
-    expect(masterRow.instanceId).toBe(MASTER_INSTANCE);
-    expect(masterRow.instanceName).toBe("Master Instance");
+    expect(leaderRow.instanceId).toBe(LEADER_INSTANCE);
+    expect(leaderRow.instanceName).toBe("Leader Instance");
     expect(workerRow.instanceId).toBe(WORKER_INSTANCE);
     expect(workerRow.instanceName).toBe("Worker Instance");
   });
@@ -1026,8 +1026,8 @@ describe("wire-level instance identity", () => {
     const toWorker = await toolCall("echo", { msg: "hi" }, { workspace: WORKER_INSTANCE });
     expect(toWorker.body.result.content[0].text).toBe("echo from worker: hi");
 
-    const toMaster = await toolCall("echo", { msg: "hi" }, { workspace: MASTER_INSTANCE });
-    expect(toMaster.body.result.content[0].text).toBe("echo from master: hi");
+    const toLeader = await toolCall("echo", { msg: "hi" }, { workspace: LEADER_INSTANCE });
+    expect(toLeader.body.result.content[0].text).toBe("echo from leader: hi");
   });
 
   it("routes tools/list by instanceId", async () => {
@@ -1039,7 +1039,7 @@ describe("wire-level instance identity", () => {
     });
     const names = res.body.result.tools.map((t) => t.name);
     expect(names).toContain("echo");
-    // Worker list must NOT include master-only list_workspaces.
+    // Worker list must NOT include leader-only list_workspaces.
     expect(names).not.toContain("list_workspaces");
   });
 });

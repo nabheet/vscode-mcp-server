@@ -14,7 +14,7 @@ export interface IpcConnection {
 }
 
 /** Connect to the well-known IPC path with a hard timeout. Rejects on
- *  ECONNREFUSED / ENOENT (no master listening) and on timeout. */
+ *  ECONNREFUSED / ENOENT (no leader listening) and on timeout. */
 export function connectIpc(path: string, timeoutMs = IPC_CONNECT_TIMEOUT_MS): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(path);
@@ -46,7 +46,7 @@ export function connectIpc(path: string, timeoutMs = IPC_CONNECT_TIMEOUT_MS): Pr
 
 /**
  * Best-effort liveness probe of the IPC path. Used to distinguish a frozen
- * Master (socket exists and accepts connections at the kernel level even
+ * Leader (socket exists and accepts connections at the kernel level even
  * while its event loop is blocked) from an unrelated app squatting on the
  * HTTP port. A successful connect is closed immediately.
  */
@@ -70,7 +70,7 @@ export function isIpcAlive(path: string, timeoutMs = 1500): Promise<boolean> {
 }
 
 /**
- * Remove a stale POSIX socket file left by a crashed Master. Only unlinks
+ * Remove a stale POSIX socket file left by a crashed Leader. Only unlinks
  * when the path exists AND is a socket (never a regular file). No-op on
  * Windows named pipes.
  */
@@ -90,7 +90,7 @@ export function unlinkStaleSocketFile(path: string): void {
  * Create an IPC server that listens on the well-known path. Handles the
  * stale-file race: first try binding; if the path exists but is dead,
  * unlink it and retry once. If the path is alive, the caller must treat the
- * port as occupied (another Master holds it).
+ * port as occupied (another Leader holds it).
  *
  * Resolves with the listening server, or rejects with the original
  * EADDRINUSE-ish error when the path is owned by a live peer.
@@ -117,7 +117,7 @@ export function createIpcServer(path: string): Promise<net.Server> {
     if (err.code !== "EADDRINUSE") throw err;
     if (process.platform === "win32") throw err; // named pipes: EADDRINUSE = live peer
     const alive = await isIpcAlive(path, 800);
-    if (alive) throw err; // live (possibly frozen) Master owns the path
+    if (alive) throw err; // live (possibly frozen) Leader owns the path
     unlinkStaleSocketFile(path);
     return listen();
   });

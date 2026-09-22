@@ -1,5 +1,5 @@
 /**
- * Length-prefixed JSON framing for the Master-Worker IPC pipe.
+ * Length-prefixed JSON framing for the Leader-Worker IPC pipe.
  *
  * Each frame is: 4-byte big-endian payload length + UTF-8 JSON body.
  * Length-prefixing (vs NDJSON) is deliberate: tool results (file reads,

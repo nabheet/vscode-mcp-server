@@ -1,17 +1,17 @@
 /**
  * Cluster bootstrap — the single entry point each VS Code window runs on
- * activation (and re-runs after losing its Master).
+ * activation (and re-runs after losing its Leader).
  *
  * Algorithm (bounded retry loop over base..base+MAX_PORT_SCAN-1):
  *  - probe /health on the port
  *    • valid   → join as Worker. If the join handshake fails, retry the SAME
  *                port (never increment — that fragments the cluster).
- *    • free    → promote to Master (bind IPC pipe + HTTP)
+ *    • free    → promote to Leader (bind IPC pipe + HTTP)
  *    • foreign → unrelated app squatting the port → try next port
  *    • zombie  → occupied, no HTTP signature, but IPC pipe alive: a frozen
- *                or still-starting Master. Retry registration on the SAME
+ *                or still-starting Leader. Retry registration on the SAME
  *                port (never increment — that fragments the cluster).
- *  - registration/promotion races (master died mid-handshake, two windows
+ *  - registration/promotion races (leader died mid-handshake, two windows
  *    promoted simultaneously) fall out of the loop naturally: re-probe and
  *    retry with exponential backoff + jitter.
  */
@@ -21,11 +21,11 @@ import type { ServerLog } from "../../utils/serverLog";
 import type { ToolExecutor } from "../executor";
 import { getIpcPath, MAX_ELECTION_ATTEMPTS, MAX_PORT_SCAN, REELECT_JITTER_MS } from "./constants";
 import { jitter, probePort, sleep } from "./election";
-import { MasterCoordinator } from "./master";
+import { LeaderCoordinator } from "./leader";
 import type { WindowState } from "./protocol";
 import { WorkerCoordinator } from "./worker";
 
-export type ClusterMember = MasterCoordinator | WorkerCoordinator;
+export type ClusterMember = LeaderCoordinator | WorkerCoordinator;
 
 export interface BootstrapOptions {
   basePort: number;
@@ -63,31 +63,31 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
       if (probe.status === "valid") {
         const worker = await tryJoin(port, opts, ipcPath);
         if (worker) {
-          opts.log?.(`[mcp] Joined master on port ${port} as worker`);
+          opts.log?.(`[mcp] Joined leader on port ${port} as worker`);
           return worker;
         }
-        // Master died mid-handshake: back off and retry the SAME port on
+        // Leader died mid-handshake: back off and retry the SAME port on
         // the next attempt (never increment — that fragments the cluster).
         break;
       }
 
       if (probe.status === "zombie") {
-        // Frozen master: do NOT skip the port. Try to rejoin; if that fails,
+        // Frozen leader: do NOT skip the port. Try to rejoin; if that fails,
         // back off and retry this port on the next attempt (it may unfreeze,
         // or die and free the port for promotion).
         const worker = await tryJoin(port, opts, ipcPath);
         if (worker) {
-          opts.log?.(`[mcp] Rejoined master on port ${port} after freeze`);
+          opts.log?.(`[mcp] Rejoined leader on port ${port} after freeze`);
           return worker;
         }
         break;
       }
 
       if (probe.status === "free") {
-        const master = await tryPromote(port, opts, ipcPath);
-        if (master) {
-          opts.log?.(`[mcp] Promoted to master on port ${port}`);
-          return master;
+        const leader = await tryPromote(port, opts, ipcPath);
+        if (leader) {
+          opts.log?.(`[mcp] Promoted to leader on port ${port}`);
+          return leader;
         }
       }
 
@@ -99,7 +99,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
   }
 
   throw new Error(
-    `Could not elect or join a master after ${MAX_ELECTION_ATTEMPTS} attempts ` +
+    `Could not elect or join a leader after ${MAX_ELECTION_ATTEMPTS} attempts ` +
       `(ports ${base}..${base + maxPorts - 1})`,
   );
 }
@@ -139,8 +139,8 @@ async function tryPromote(
   port: number,
   opts: BootstrapOptions,
   ipcPath: string,
-): Promise<MasterCoordinator | null> {
-  const master = new MasterCoordinator({
+): Promise<LeaderCoordinator | null> {
+  const leader = new LeaderCoordinator({
     port,
     host: opts.host,
     ipcPath,
@@ -160,13 +160,13 @@ async function tryPromote(
     log: opts.log,
   });
   try {
-    await master.start();
-    return master;
+    await leader.start();
+    return leader;
   } catch (err) {
     opts.log?.(
       `[mcp] Promotion on port ${port} failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    await master.stop(100);
+    await leader.stop(100);
     return null;
   }
 }

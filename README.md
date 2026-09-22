@@ -15,7 +15,7 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
    or install a `.vsix` from the [latest release](https://github.com/nabheet/vscode-mcp-server/releases).
 
 2. **Reload VS Code** — the extension starts automatically on startup. The first window becomes the
-   **master** and listens on `http://127.0.0.1:9876`; additional windows join as **workers** over an
+   **leader** and listens on `http://127.0.0.1:9876`; additional windows join as **workers** over an
    IPC socket and share the same port (the MCP client targets a window via a `workspace` argument).
 
 3. **Configure your AI tool** (e.g., opencode) to connect via SSE:
@@ -50,10 +50,10 @@ VS Code Extension (onStartupFinished)
        ├─ cluster/
        │    ├─ election.ts     — Port probing (/health + IPC liveness) → valid | free | foreign | zombie
        │    ├─ constants.ts    — Port/IPC/heartbeat/timeout constants + MSG protocol types
-       │    ├─ master.ts       — MasterCoordinator: owns the HTTP port, routes tools/call
+       │    ├─ leader.ts       — LeaderCoordinator: owns the HTTP port, routes tools/call
        │    │                    to workers, serves list_workspaces
-       │    ├─ worker.ts       — WorkerCoordinator: joins master via IPC, heartbeat failover + re-election
-       │    ├─ bootstrap.ts    — Bounded retry loop: promote (master) or join (worker), with backoff
+       │    ├─ worker.ts       — WorkerCoordinator: joins leader via IPC, heartbeat failover + re-election
+       │    ├─ bootstrap.ts    — Bounded retry loop: promote (leader) or join (worker), with backoff
        │    ├─ protocol.ts     — Length-prefixed JSON framing + WindowState for the IPC pipe
        │    └─ ipc.ts          — Unix-socket helpers (stale-socket recovery, liveness checks)
        └─ tools/
@@ -92,7 +92,7 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
-| `list_workspaces` | cluster | List windows (master + workers): id, name, folders, role, state |
+| `list_workspaces` | cluster | List windows (leader + workers): id, name, folders, role, state |
 | `add_workspace_folder` | workspace | Add a folder to the workspace (multi-root) |
 | `update_workspace_folder` | workspace | Rename/change a workspace folder's path (multi-root) |
 | `remove_workspace_folder` | workspace | Remove a folder from the workspace (multi-root) |
@@ -128,8 +128,8 @@ VS Code Extension (onStartupFinished)
 ## Cluster mode
 
 Every VS Code window runs one cluster member. Exactly one window (the
-**master**) owns the HTTP port; every other window (a **worker**) connects to
-it over a local IPC pipe. Clients connect to the single master port and target
+**leader**) owns the HTTP port; every other window (a **worker**) connects to
+it over a local IPC pipe. Clients connect to the single leader port and target
 a specific window via the `workspace` argument on `tools/call` / `tools/list`
 (see below).
 
@@ -146,7 +146,7 @@ plus live editor state:
     "instanceName": "My Project",
     "displayName": "My Project",
     "folders": ["/path/to/folder"],
-    "role": "master",
+    "role": "leader",
     "state": {
       "activeFile": "/path/to/folder/src/main.ts",
       "openEditors": ["/path/to/folder/src/main.ts", "/path/to/folder/src/util.ts"]
@@ -155,7 +155,7 @@ plus live editor state:
 ]
 ```
 
-- `role` — `"master"` (owns the port) or `"worker"` (joined over IPC).
+- `role` — `"leader"` (owns the port) or `"worker"` (joined over IPC).
 - `state.activeFile` — absolute path of the active editor, when one is open
   (omitted otherwise).
 - `state.openEditors` — absolute paths of all open editor tabs; always present.
@@ -186,7 +186,7 @@ Accepted values:
 }
 ```
 
-Without `workspace`, calls target the master window.
+Without `workspace`, calls target the leader window.
 
 ## Connecting from other AI tools
 
@@ -492,10 +492,10 @@ Full MCP protocol lifecycle implemented:
 
 ### Port Retry
 
-If the default port (9876) is busy, the master scans up to 5 consecutive ports
+If the default port (9876) is busy, the leader scans up to 5 consecutive ports
 (9876..9880, controlled by `MCP_SERVER_MAX_RETRIES`). If a port is occupied by
 a non-MCP process, the next port is tried. The election loop retries the whole
-scan up to 8 times with exponential backoff; workers re-join the elected master
+scan up to 8 times with exponential backoff; workers re-join the elected leader
 over IPC rather than taking their own port.
 
 ## Configuration

@@ -1,5 +1,5 @@
 /**
- * MasterCoordinator — the single process that owns the HTTP/SSE port.
+ * LeaderCoordinator — the single process that owns the HTTP/SSE port.
  *
  * Responsibilities:
  *  - Serve the HTTP endpoint via McpServer (health, metrics, SSE, direct
@@ -44,7 +44,7 @@ interface PendingCall {
   timer: NodeJS.Timeout;
 }
 
-export interface MasterOptions {
+export interface LeaderOptions {
   port: number;
   host: string;
   ipcPath?: string;
@@ -57,19 +57,19 @@ export interface MasterOptions {
   workspaceId: string;
   workspacePaths: string[];
   displayName: string;
-  /** Stable per-window UUID for the master's own list_workspaces row. */
+  /** Stable per-window UUID for the leader's own list_workspaces row. */
   instanceId?: string;
   instanceName?: string;
-  /** Initial window state (active file / open editors) for the master row. */
+  /** Initial window state (active file / open editors) for the leader row. */
   state?: WindowState;
   log?: (msg: string) => void;
 }
 
 type Target = "local" | { workerId: string } | { error: JsonRpcResponse };
 
-export class MasterCoordinator implements McpRouter {
-  readonly role = "master" as const;
-  private readonly opts: MasterOptions;
+export class LeaderCoordinator implements McpRouter {
+  readonly role = "leader" as const;
+  private readonly opts: LeaderOptions;
   private readonly ipcPath: string;
   private server: McpServer;
   private ipcServer: net.Server | null = null;
@@ -80,7 +80,7 @@ export class MasterCoordinator implements McpRouter {
   private workers = new Map<string, WorkerEntry>();
   private pending = new Map<string, PendingCall>();
 
-  constructor(opts: MasterOptions) {
+  constructor(opts: LeaderOptions) {
     this.opts = opts;
     this.ipcPath = opts.ipcPath ?? getIpcPath();
     if (opts.state) this.localState = opts.state;
@@ -113,7 +113,7 @@ export class MasterCoordinator implements McpRouter {
               instanceName: opts.instanceName,
               displayName: opts.displayName,
               folders: opts.workspacePaths,
-              role: "master",
+              role: "leader",
               state: this.localState,
             },
             ...Array.from(this.workers.values()).map((w) => ({
@@ -152,14 +152,14 @@ export class MasterCoordinator implements McpRouter {
     // NOTE: no pre-unlink here. createIpcServer already recovers stale
     // socket files safely (EADDRINUSE -> isIpcAlive -> unlink only if the
     // holder is dead). Unlinking unconditionally would let a promoting
-    // window steal the IPC path from a LIVE master — the split-brain bug.
+    // window steal the IPC path from a LIVE leader — the split-brain bug.
     this.ipcServer = await createIpcServer(this.ipcPath);
     this.ipcServer.on("connection", (socket) => this.onIpcConnection(socket));
     try {
       await this.server.start();
     } catch (err) {
       // HTTP bind lost the race — undo the IPC server and let bootstrap
-      // re-probe (it will find the winner as a valid master and join).
+      // re-probe (it will find the winner as a valid leader and join).
       if (this.ipcServer) {
         await closeIpcServer(this.ipcServer, this.sockets);
         this.ipcServer = null;
@@ -171,7 +171,7 @@ export class MasterCoordinator implements McpRouter {
   async stop(timeoutMs = 5000): Promise<void> {
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.reject(new Error("Master shutting down"));
+      p.reject(new Error("Leader shutting down"));
     }
     this.pending.clear();
     await this.server.stop(timeoutMs);
@@ -204,7 +204,7 @@ export class MasterCoordinator implements McpRouter {
     const body = stripWorkspaceArg(rawBody, params) ?? rawBody;
     const response = await this.proxyCall(target.workerId, body).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
-      this.log(`[master] proxy to worker ${target.workerId} failed: ${msg}`);
+      this.log(`[leader] proxy to worker ${target.workerId} failed: ${msg}`);
       return {
         jsonrpc: "2.0",
         id,
@@ -255,7 +255,7 @@ export class MasterCoordinator implements McpRouter {
    * Path-based inference for tools/call without an explicit workspace arg.
    * Scans path-like arguments (path/uri/file/folder/dir/cwd/workspaceFolder
    * and absolute-looking strings) and routes to the Worker whose workspace
-   * path is the longest prefix of the target. Master wins ties and is the
+   * path is the longest prefix of the target. Leader wins ties and is the
    * default when nothing matches.
    */
   private inferWorker(params: Record<string, unknown> | undefined): string | null {
@@ -285,7 +285,7 @@ export class MasterCoordinator implements McpRouter {
             best = { id: e.id, len: ws.length };
           } else if (ws.length === best.len && best.id !== "local" && e.id === "local") {
             // Equal-length match (same folder open in two windows):
-            // the Master wins the tie — it is the explicit default target.
+            // the Leader wins the tie — it is the explicit default target.
             best = { id: e.id, len: ws.length };
           }
         }
@@ -328,14 +328,14 @@ export class MasterCoordinator implements McpRouter {
       try {
         this.onIpcMessage(socket, msg);
       } catch (err) {
-        this.log(`[master] IPC handler error: ${err instanceof Error ? err.message : String(err)}`);
+        this.log(`[leader] IPC handler error: ${err instanceof Error ? err.message : String(err)}`);
         socket.destroy();
       }
     });
 
     const regTimer = setTimeout(() => {
       if (!state.registered) {
-        this.log("[master] IPC peer did not REGISTER in time — closing");
+        this.log("[leader] IPC peer did not REGISTER in time — closing");
         socket.destroy();
       }
     }, REGISTER_TIMEOUT_MS);
@@ -368,11 +368,11 @@ export class MasterCoordinator implements McpRouter {
         const displayName =
           typeof msg.displayName === "string" ? msg.displayName : (id ?? "unknown");
         if (!id) {
-          this.log("[master] REGISTER without id — closing peer");
+          this.log("[leader] REGISTER without id — closing peer");
           socket.destroy();
           return;
         }
-        // Replace a stale entry for the same window (reconnect after master
+        // Replace a stale entry for the same window (reconnect after leader
         // restart) and fail any calls that were in flight to it.
         const existing = this.workers.get(id);
         if (existing && existing.socket !== socket) {
@@ -393,9 +393,9 @@ export class MasterCoordinator implements McpRouter {
           state.registered = true;
           state.entryId = id;
         }
-        socket.write(encodeMessage({ type: MSG.WELCOME, masterId: this.opts.workspaceId }));
+        socket.write(encodeMessage({ type: MSG.WELCOME, leaderId: this.opts.workspaceId }));
         this.log(
-          `[master] worker registered: ${displayName} (${paths.join(", ") || "no workspace"})`,
+          `[leader] worker registered: ${displayName} (${paths.join(", ") || "no workspace"})`,
         );
         break;
       }
@@ -455,9 +455,9 @@ export class MasterCoordinator implements McpRouter {
   }
 
   /**
-   * Publish the master window's own state (active file / open editors).
-   * The master row in list_workspaces reflects the latest value. No IPC
-   * message is needed — the master already owns its row locally.
+   * Publish the leader window's own state (active file / open editors).
+   * The leader row in list_workspaces reflects the latest value. No IPC
+   * message is needed — the leader already owns its row locally.
    */
   updateState(state: WindowState): void {
     this.localState = state;

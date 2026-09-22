@@ -9,7 +9,7 @@ import { BusyError, ToolExecutor } from "./executor";
 
 export { BusyError };
 
-/** Health-check signature used by the cluster to recognize a live Master. */
+/** Health-check signature used by the cluster to recognize a live Leader. */
 export const HEALTH_SERVICE_NAME = "vscode-mcp-server";
 
 interface SseSession {
@@ -32,9 +32,9 @@ export interface McpRouterResult {
 
 /**
  * Optional cluster hook invoked at the single dispatch chokepoint (covers
- * both direct POST /mcp and SSE session messages). Lets the Master route a
+ * both direct POST /mcp and SSE session messages). Lets the Leader route a
  * request to the Worker whose workspace it targets instead of executing it
- * in the Master's own extension host.
+ * in the Leader's own extension host.
  */
 export interface McpRouter {
   route(rawBody: string): Promise<McpRouterResult | null>;
@@ -59,11 +59,11 @@ export interface McpServerOptions {
   metrics?: Metrics;
   /** JSON-lines file logger (survives process death — hot reload). */
   logger?: ServerLog;
-  /** Cluster routing hook (Master only). */
+  /** Cluster routing hook (Leader only). */
   router?: McpRouter;
   /**
    * Shared tool executor (single instance per process, created in
-   * extension.ts and reused by the Master's server, the Master's router,
+   * extension.ts and reused by the Leader's server, the Leader's router,
    * and any Worker coordinator). When omitted the server creates its own
    * private executor with no tools registered — only useful for tests.
    */
@@ -125,7 +125,7 @@ export class McpServer {
   }
 
   /** Public entry for the cluster router to execute a body locally (or via
-   *  the configured router hook). Used by the Master's proxy fallback. */
+   *  the configured router hook). Used by the Leader's proxy fallback. */
   async handleRawBody(rawBody: string): Promise<JsonRpcResponse> {
     return this.dispatch(rawBody);
   }
@@ -315,7 +315,7 @@ export class McpServer {
     const pathname = (req.url || "").split("?")[0];
 
     // Health check — carries the cluster signature so other instances can
-    // recognize this process as a valid Master (see cluster/election.ts).
+    // recognize this process as a valid Leader (see cluster/election.ts).
     if (req.method === "GET" && pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
