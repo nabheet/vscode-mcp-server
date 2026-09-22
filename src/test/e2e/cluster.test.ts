@@ -569,8 +569,25 @@ describe("cluster leader-worker (E2E)", () => {
     // not elect or join a leader after N attempts"). Pre-fix, the window
     // stayed dead until a manual reload.
     leaderProc.kill("SIGKILL");
-    fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
-    fs.mkdirSync(ipcPath);
+    // Block the socket path with a directory. The killed leader's
+    // extension-host child — or the survivor's fast promotion (triggered
+    // instantly when the IPC connection drops) — can re-create the socket
+    // file in the kill→block window, so retry removing + blocking until
+    // the directory actually sticks. Once it does, no future bind can
+    // recreate a file (bind on a directory path fails immediately).
+    let blocked = false;
+    for (let i = 0; i < 50 && !blocked; i++) {
+      fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
+      try {
+        fs.mkdirSync(ipcPath);
+        blocked = true;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        // Socket file reappeared mid-block — loop removes it again.
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    }
+    expect(blocked, "should block the IPC socket path with a directory").toBe(true);
 
     try {
       // Leader is dead and the socket is blocked: MCP must be down.
