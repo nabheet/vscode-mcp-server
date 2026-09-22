@@ -358,6 +358,50 @@ describe("cluster master-worker (E2E)", () => {
     throw new Error(`Cluster did not reach 2 windows within ${deadlineMs}ms`);
   }
 
+  /**
+   * Assert the MCP endpoint is NOT serving — used right after killing the
+   * master to prove the cluster is genuinely broken before self-heal.
+   * Only a master serves the HTTP port, so any success here means the
+   * kill+block did not land.
+   */
+  async function expectServerDown(port: number, timeoutMs = 8000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const res = await mcpRequest(port, "tools/list");
+        if (res?.result) {
+          throw new Error("MCP server unexpectedly up right after master SIGKILL");
+        }
+      } catch {
+        return; // refused / no server — exactly what we want
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error(`MCP server still responding ${timeoutMs}ms after master SIGKILL`);
+  }
+
+  /** Poll list_workspaces until SOME window reports role "master". */
+  async function waitForMaster(deadlineMs = 15000): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      const res = await mcpRequest(port, "tools/call", {
+        name: "list_workspaces",
+        arguments: {},
+      });
+      if (res.result && !res.result.isError) {
+        try {
+          const rows = JSON.parse(res.result.content[0].text) as Array<Record<string, unknown>>;
+          const master = rows.find((r) => r.role === "master");
+          if (master) return master;
+        } catch {
+          /* not JSON yet */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`No window reported master within ${deadlineMs}ms after self-heal`);
+  }
+
   // ── Discovery ─────────────────────────────────────────────────────────
 
   it("list_workspaces returns both windows with distinct instanceIds", async () => {
@@ -459,4 +503,53 @@ describe("cluster master-worker (E2E)", () => {
     expect(names).toContain("get_workspace_folders");
     expect(names).not.toContain("list_workspaces");
   });
+
+  // ── FATAL self-heal ──────────────────────────────────────────────────
+
+  it("worker self-heals to master after master death + blocked IPC socket (no reload)", async () => {
+    if (!ENABLED) return;
+
+    // Identify the elected master and the surviving worker window.
+    const rows = await waitForTwoWindows();
+    const masterIdx = rows.findIndex((r) => r.role === "master");
+    expect(masterIdx).toBeGreaterThanOrEqual(0);
+    const masterFolders = (rows[masterIdx].folders as string[]) ?? [];
+    const masterFolder = masterFolders.find((f) => f.endsWith("alpha") || f.endsWith("beta"));
+    expect(masterFolder, "master row should carry the alpha or beta folder").toBeTruthy();
+    const masterProc = procs[masterFolder?.endsWith("alpha") ? 0 : 1];
+    const survivorTag = masterFolder?.endsWith("alpha") ? "beta" : "alpha";
+    expect(masterProc.pid, "master process should be trackable").toBeTruthy();
+
+    // Kill the master, then immediately block its IPC socket path with a
+    // directory: the survivor's re-election can neither join (connecting
+    // to a directory fails) nor promote (bind fails EADDRINUSE), so
+    // bootstrap exhausts its attempts and throws FATAL — the exact
+    // reported failure ("Could not elect or join a master after N
+    // attempts"). Pre-fix, the window stayed dead until a manual reload.
+    masterProc.kill("SIGKILL");
+    fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
+    fs.mkdirSync(ipcPath);
+
+    try {
+      // Master is dead and the socket is blocked: MCP must be down.
+      await expectServerDown(port);
+
+      // Hold the block long enough for the first bootstrap to exhaust its
+      // attempts (8 attempts x up to ~5.5s backoff ≈ 28s worst case).
+      // Lost-master detection is ≤5s (heartbeat), so by 28s the survivor
+      // has FATALed and scheduled its first retry.
+      await new Promise((r) => setTimeout(r, 28000));
+      fs.rmSync(ipcPath, { recursive: true, force: true });
+
+      // Self-heal must happen WITHOUT any reload: the retry re-runs
+      // startCluster and the surviving window promotes itself to master.
+      await waitForServer(port, 90000);
+      const healed = await waitForMaster(15000);
+      expect(healed.role).toBe("master");
+      expect((healed.folders as string[]).some((f) => f.endsWith(survivorTag))).toBe(true);
+    } finally {
+      // Restore the socket path so afterAll cleanup is uncomplicated.
+      fs.rmSync(ipcPath, { recursive: true, force: true });
+    }
+  }, 180000);
 });
