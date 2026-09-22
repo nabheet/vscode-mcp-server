@@ -1,6 +1,7 @@
 import { type ChildProcess, execSync, type SpawnOptions, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -519,15 +520,26 @@ describe("cluster master-worker (E2E)", () => {
     const masterProc = procs[masterFolder?.endsWith("alpha") ? 0 : 1];
     expect(masterProc.pid, "master process should be trackable").toBeTruthy();
 
-    // Kill the master, then immediately block its IPC socket path with a
-    // directory: neither joining (connecting to a directory fails) nor
-    // promoting (bind fails EADDRINUSE) can succeed, so bootstrap exhausts
-    // its attempts and throws FATAL — the exact reported failure ("Could
-    // not elect or join a master after N attempts"). Pre-fix, the window
-    // stayed dead until a manual reload.
+    // Kill the master, then block the IPC path so neither joining nor
+    // promoting can succeed: bootstrap exhausts its attempts and throws
+    // FATAL — the exact reported failure ("Could not elect or join a master
+    // after N attempts"). Pre-fix, the window stayed dead until a manual
+    // reload. POSIX blocks the Unix socket with a directory; win32 holds
+    // the named pipe with a dummy server (a directory can't block the
+    // Windows pipe namespace, and createIpcServer throws EADDRINUSE
+    // immediately on win32 — no stale-file retry).
     masterProc.kill("SIGKILL");
     fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
-    fs.mkdirSync(ipcPath);
+    let pipeHolder: net.Server | null = null;
+    if (process.platform === "win32") {
+      pipeHolder = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        pipeHolder!.once("error", reject);
+        pipeHolder!.listen(ipcPath, resolve);
+      });
+    } else {
+      fs.mkdirSync(ipcPath);
+    }
 
     try {
       // Master is dead and the socket is blocked: MCP must be down.
@@ -538,7 +550,11 @@ describe("cluster master-worker (E2E)", () => {
       // Lost-master detection is ≤5s (heartbeat), so by 28s the candidate
       // has FATALed and scheduled its first retry.
       await new Promise((r) => setTimeout(r, 28000));
-      fs.rmSync(ipcPath, { recursive: true, force: true });
+      if (pipeHolder) {
+        await new Promise<void>((resolve) => pipeHolder!.close(() => resolve()));
+      } else {
+        fs.rmSync(ipcPath, { recursive: true, force: true });
+      }
 
       // Self-heal must happen WITHOUT any reload: the retry re-runs
       // startCluster and a master comes back. Which window becomes master
@@ -553,6 +569,7 @@ describe("cluster master-worker (E2E)", () => {
       expect(healed.role).toBe("master");
     } finally {
       // Restore the socket path so afterAll cleanup is uncomplicated.
+      if (pipeHolder) pipeHolder.close();
       fs.rmSync(ipcPath, { recursive: true, force: true });
     }
   }, 180000);
