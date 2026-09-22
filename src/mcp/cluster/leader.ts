@@ -22,7 +22,7 @@ import type { ToolExecutor } from "../executor";
 import { type McpRouter, type McpRouterResult, McpServer } from "../server";
 import { defineTool } from "../tools/index";
 import { getIpcPath, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
-import { closeIpcServer, createIpcServer, unlinkStaleSocketFile } from "./ipc";
+import { closeIpcServer, createIpcServer } from "./ipc";
 import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
 
 interface WorkerEntry {
@@ -180,9 +180,13 @@ export class LeaderCoordinator implements McpRouter {
       this.ipcServer = null;
     }
     this.workers.clear();
-    if (process.platform !== "win32") {
-      unlinkStaleSocketFile(this.ipcPath);
-    }
+    // Do NOT unlink this.ipcPath here. The socket path is cluster-shared, not
+    // owned by one leader: during a split-brain two leaders can exist, and one
+    // stopping must not remove the path the other is actively serving (that
+    // strands every worker in a permanent ENOENT loop). Stale-file recovery
+    // lives in createIpcServer (EADDRINUSE -> isIpcAlive -> unlink only when
+    // the holder is dead); if this process is dying the kernel closes the
+    // socket and the next promotion reclaims the path.
   }
 
   // ── Cluster routing (McpRouter) ────────────────────────────────────

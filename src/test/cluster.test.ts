@@ -373,6 +373,36 @@ describe("cluster IPC helpers", () => {
       await closeIpcServer(srv, new Set());
     }
   });
+
+  it("leader stop() never unlinks the shared IPC path (split-brain safety)", async () => {
+    const ipcPath = findFreeIpcPath();
+    // Leader A owns the shared socket (e.g. promoted on port 9876).
+    const holder = await createIpcServer(ipcPath);
+    // Leader B tries to promote on another port (transient split: 9877).
+    // Its start() must reject — A holds the IPC path — and bootstrap then
+    // calls B.stop(). stop() must NOT unlink the shared path, or A's socket
+    // disappears and every worker enters a permanent ENOENT loop.
+    const exec = new ToolExecutor();
+    const loser = new LeaderCoordinator({
+      port: await findFreePort(),
+      host: "127.0.0.1",
+      ipcPath,
+      executor: exec,
+      workspaceId: "leader-loser",
+      workspacePaths: ["/mnt/loser"],
+      displayName: "Leader Loser",
+    });
+    try {
+      await expect(loser.start()).rejects.toThrow();
+      await loser.stop(500);
+      // The socket file must still exist and accept connections.
+      expect(fs.existsSync(ipcPath)).toBe(true);
+      expect(await isIpcAlive(ipcPath, 800)).toBe(true);
+    } finally {
+      await loser.stop(500).catch(() => {});
+      await closeIpcServer(holder, new Set());
+    }
+  });
 });
 
 // ── Leader + Worker integration ──────────────────────────────────────
