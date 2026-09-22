@@ -489,18 +489,30 @@ describe("cluster leader-worker (E2E)", () => {
   it("routes tools/list by instanceId: worker list excludes leader-only list_workspaces", async () => {
     if (!ENABLED) return;
 
-    // The cluster can re-elect between the poll and this request: the
-    // sampled "worker" may be promoted to leader, in which case its
-    // instanceId now resolves to the leader and tools/list legitimately
-    // includes list_workspaces. Retry until we catch a stable snapshot
-    // where the sampled window is STILL a worker — only then assert the
-    // leader-only tool is excluded.
+    // Snapshot key: the (role, instanceId) pairs that define the cluster
+    // composition. Re-elections change the leader's instanceId (a restarted
+    // host gets a new random UUID), so a stable key across the whole check
+    // proves no re-election happened between the poll and the tools/list
+    // call — only then is a worker returning list_workspaces a real bug.
+    const snapshotKey = (rows: Array<Record<string, unknown>>): string =>
+      JSON.stringify(
+        rows
+          .map((r) => [r.role, r.instanceId] as const)
+          .sort((a, b) => String(a[1]).localeCompare(String(b[1]))),
+      );
+
     const deadline = Date.now() + 30000;
     for (;;) {
+      if (Date.now() > deadline) {
+        throw new Error(
+          "Cluster never presented a stable worker tools/list within 30s (repeated re-elections)",
+        );
+      }
       const rows = await waitForTwoWindows();
       const workerIdx = rows.findIndex((r) => r.role === "worker");
       expect(workerIdx).toBeGreaterThanOrEqual(0);
       const workerId = rows[workerIdx].instanceId as string;
+      const beforeKey = snapshotKey(rows);
 
       const res = (await mcpRequest(port, "tools/list", {
         workspace: workerId,
@@ -512,34 +524,25 @@ describe("cluster leader-worker (E2E)", () => {
       expect(names).toContain("get_workspace_folders");
       if (!names.includes("list_workspaces")) return;
 
-      // list_workspaces present — either a real bug or the sampled window
-      // was promoted mid-check. Re-read the cluster to verify the current
-      // role before failing.
-      const fresh = await mcpRequest(port, "tools/call", {
-        name: "list_workspaces",
-        arguments: {},
-      });
-      let freshRows: Array<Record<string, unknown>> = [];
-      if (fresh.result && !fresh.result.isError) {
-        try {
-          freshRows = JSON.parse(fresh.result.content[0].text);
-        } catch {
-          /* not JSON yet */
-        }
-      }
-      const stillWorker = freshRows.some((r) => r.instanceId === workerId && r.role === "worker");
-      if (!stillWorker) {
-        // Role flipped — re-poll and retry (unless we never settle).
-        if (Date.now() > deadline) {
-          throw new Error(
-            "Cluster never presented a stable worker tools/list within 30s (repeated re-elections)",
-          );
-        }
+      // list_workspaces present — either a real bug or the cluster
+      // re-elected mid-check (the sampled worker was promoted, answered as
+      // leader, then was demoted before we re-read). Re-read the cluster
+      // and compare the full composition: if the leader identity or the
+      // worker set changed at all, treat it as churn and retry.
+      const afterRows = await waitForTwoWindows();
+      const stillSame = snapshotKey(afterRows) === beforeKey;
+      const stillWorker = afterRows.some((r) => r.instanceId === workerId && r.role === "worker");
+      if (!stillSame || !stillWorker) {
+        // Cluster churned mid-check — re-poll and retry.
         await new Promise((r) => setTimeout(r, 500));
         continue;
       }
-      // Sampled window is still a worker but returned list_workspaces — real bug.
-      expect(names).not.toContain("list_workspaces");
+      // Identical, stable cluster composition with the sampled window
+      // still a worker, yet tools/list returned list_workspaces — real bug.
+      expect(
+        names,
+        `cluster snapshot unchanged (${beforeKey}) but worker returned list_workspaces`,
+      ).not.toContain("list_workspaces");
       return;
     }
   });

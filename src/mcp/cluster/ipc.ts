@@ -98,6 +98,17 @@ export function ensureIpcDir(socketPath: string): void {
   const dir = dirname(socketPath);
   if (!dir || dir === "." || dir === "/") return;
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdirSync's mode only applies at creation; a pre-existing dir with
+  // looser perms (e.g. 0755 from a prior run or another tool) would
+  // silently weaken the "private to the cluster" boundary. Enforce it.
+  try {
+    const st = fs.statSync(dir);
+    if ((st.mode & 0o777) !== 0o700) {
+      fs.chmodSync(dir, 0o700);
+    }
+  } catch {
+    /* dir vanished in a race — bind will surface the real error */
+  }
 }
 
 /**

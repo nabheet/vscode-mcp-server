@@ -41,8 +41,30 @@ export const DEFAULT_IPC_PATH =
  * bind a TCP port; we only accept genuine non-empty strings.
  */
 export function resolveIpcPath(setting?: unknown, env?: string): string {
-  const s = typeof setting === "string" ? setting : "";
-  return s || env || DEFAULT_IPC_PATH;
+  const s = typeof setting === "string" ? sanitizeIpcPath(setting) : "";
+  if (s) return s;
+  const e = typeof env === "string" ? sanitizeIpcPath(env) : "";
+  return e || DEFAULT_IPC_PATH;
+}
+
+/**
+ * Return a safe socket path, or "" to signal "fall through to the next
+ * source". Guards against values that silently change `net.listen()`
+ * semantics:
+ * - all-digit strings (e.g. `"18099"`) are interpreted by Node as TCP
+ *   ports, binding an unauthenticated listener on all interfaces instead
+ *   of a unix socket — reject;
+ * - whitespace-only strings are a settings.json mistake — treat as unset;
+ * - on POSIX a bare relative name (e.g. `"ipc.sock"`) binds in the process
+ *   CWD, silently splitting the cluster across windows — require absolute;
+ * - trailing slashes are stripped so `dirname()` (used by ensureIpcDir)
+ *   and `listen()` agree instead of failing with EACCES.
+ */
+function sanitizeIpcPath(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed || /^\d+$/.test(trimmed)) return "";
+  if (process.platform !== "win32" && !path.isAbsolute(trimmed)) return "";
+  return trimmed;
 }
 
 /** Env override so tests can use per-suite socket paths. */

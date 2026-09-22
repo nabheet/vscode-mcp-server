@@ -14,7 +14,7 @@ import {
   resolveIpcPath,
 } from "../mcp/cluster/constants";
 import { probePort } from "../mcp/cluster/election";
-import { closeIpcServer, createIpcServer, isIpcAlive } from "../mcp/cluster/ipc";
+import { closeIpcServer, createIpcServer, ensureIpcDir, isIpcAlive } from "../mcp/cluster/ipc";
 import { LeaderCoordinator } from "../mcp/cluster/leader";
 import {
   createDecoder,
@@ -435,6 +435,20 @@ describe("cluster IPC helpers", () => {
     // rather than flowing into net.listen() as a TCP port.
     expect(resolveIpcPath(123, env)).toBe(env);
     expect(resolveIpcPath(false, env)).toBe(env);
+    // Numeric strings are the same hazard: net.listen("18099") binds an
+    // unauthenticated TCP listener on all interfaces, not a unix socket.
+    expect(resolveIpcPath("18099", env)).toBe(env);
+    expect(resolveIpcPath("0", env)).toBe(env);
+    expect(resolveIpcPath(undefined, "9876")).toBe(DEFAULT_IPC_PATH);
+    // Whitespace-only is a settings.json mistake — treated as unset.
+    expect(resolveIpcPath("   ", env)).toBe(env);
+    expect(resolveIpcPath(undefined, "   ")).toBe(DEFAULT_IPC_PATH);
+    if (process.platform !== "win32") {
+      // Relative paths bind in the process CWD and silently split the cluster.
+      expect(resolveIpcPath("ipc.sock", env)).toBe(env);
+      // Trailing slashes are normalized so dirname() and listen() agree.
+      expect(resolveIpcPath("/tmp/foo/", env)).toBe("/tmp/foo");
+    }
   });
 
   it("POSIX default IPC path lives in a dedicated subdirectory (not the tmp root)", () => {
@@ -470,6 +484,27 @@ describe("cluster IPC helpers", () => {
       } catch {
         /* already gone */
       }
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
+  it("ensureIpcDir tightens a pre-existing loose parent dir to 0700", () => {
+    if (process.platform === "win32") return; // named pipes have no filesystem dir
+    const dir = path.join(
+      os.tmpdir(),
+      `vscode-mcp-loose-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    try {
+      // Simulate a pre-existing dir with looser perms (0755 default umask).
+      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("755");
+      ensureIpcDir(path.join(dir, "ipc.sock"));
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("700");
+    } finally {
       try {
         fs.rmSync(dir, { recursive: true, force: true });
       } catch {
