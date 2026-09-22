@@ -488,20 +488,60 @@ describe("cluster leader-worker (E2E)", () => {
 
   it("routes tools/list by instanceId: worker list excludes leader-only list_workspaces", async () => {
     if (!ENABLED) return;
-    const rows = await waitForTwoWindows();
-    const workerIdx = rows.findIndex((r) => r.role === "worker");
-    expect(workerIdx).toBeGreaterThanOrEqual(0);
-    const workerId = rows[workerIdx].instanceId as string;
 
-    const res = (await mcpRequest(port, "tools/list", {
-      workspace: workerId,
-    })) as unknown as { result: { tools: Array<{ name: string }> } };
+    // The cluster can re-elect between the poll and this request: the
+    // sampled "worker" may be promoted to leader, in which case its
+    // instanceId now resolves to the leader and tools/list legitimately
+    // includes list_workspaces. Retry until we catch a stable snapshot
+    // where the sampled window is STILL a worker — only then assert the
+    // leader-only tool is excluded.
+    const deadline = Date.now() + 30000;
+    for (;;) {
+      const rows = await waitForTwoWindows();
+      const workerIdx = rows.findIndex((r) => r.role === "worker");
+      expect(workerIdx).toBeGreaterThanOrEqual(0);
+      const workerId = rows[workerIdx].instanceId as string;
 
-    expect(res.result.tools).toBeDefined();
-    const names = res.result.tools.map((t) => t.name);
-    expect(names).toContain("read_file");
-    expect(names).toContain("get_workspace_folders");
-    expect(names).not.toContain("list_workspaces");
+      const res = (await mcpRequest(port, "tools/list", {
+        workspace: workerId,
+      })) as unknown as { result: { tools: Array<{ name: string }> } };
+
+      expect(res.result.tools).toBeDefined();
+      const names = res.result.tools.map((t) => t.name);
+      expect(names).toContain("read_file");
+      expect(names).toContain("get_workspace_folders");
+      if (!names.includes("list_workspaces")) return;
+
+      // list_workspaces present — either a real bug or the sampled window
+      // was promoted mid-check. Re-read the cluster to verify the current
+      // role before failing.
+      const fresh = await mcpRequest(port, "tools/call", {
+        name: "list_workspaces",
+        arguments: {},
+      });
+      let freshRows: Array<Record<string, unknown>> = [];
+      if (fresh.result && !fresh.result.isError) {
+        try {
+          freshRows = JSON.parse(fresh.result.content[0].text);
+        } catch {
+          /* not JSON yet */
+        }
+      }
+      const stillWorker = freshRows.some((r) => r.instanceId === workerId && r.role === "worker");
+      if (!stillWorker) {
+        // Role flipped — re-poll and retry (unless we never settle).
+        if (Date.now() > deadline) {
+          throw new Error(
+            "Cluster never presented a stable worker tools/list within 30s (repeated re-elections)",
+          );
+        }
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      // Sampled window is still a worker but returned list_workspaces — real bug.
+      expect(names).not.toContain("list_workspaces");
+      return;
+    }
   });
 
   // ── FATAL self-heal ──────────────────────────────────────────────────
