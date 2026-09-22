@@ -506,10 +506,10 @@ describe("cluster master-worker (E2E)", () => {
 
   // ── FATAL self-heal ──────────────────────────────────────────────────
 
-  it("worker self-heals to master after master death + blocked IPC socket (no reload)", async () => {
+  it("cluster self-heals to master after master death + blocked IPC socket (no reload)", async () => {
     if (!ENABLED) return;
 
-    // Identify the elected master and the surviving worker window.
+    // Identify the elected master so we can kill it.
     const rows = await waitForTwoWindows();
     const masterIdx = rows.findIndex((r) => r.role === "master");
     expect(masterIdx).toBeGreaterThanOrEqual(0);
@@ -517,15 +517,14 @@ describe("cluster master-worker (E2E)", () => {
     const masterFolder = masterFolders.find((f) => f.endsWith("alpha") || f.endsWith("beta"));
     expect(masterFolder, "master row should carry the alpha or beta folder").toBeTruthy();
     const masterProc = procs[masterFolder?.endsWith("alpha") ? 0 : 1];
-    const survivorTag = masterFolder?.endsWith("alpha") ? "beta" : "alpha";
     expect(masterProc.pid, "master process should be trackable").toBeTruthy();
 
     // Kill the master, then immediately block its IPC socket path with a
-    // directory: the survivor's re-election can neither join (connecting
-    // to a directory fails) nor promote (bind fails EADDRINUSE), so
-    // bootstrap exhausts its attempts and throws FATAL — the exact
-    // reported failure ("Could not elect or join a master after N
-    // attempts"). Pre-fix, the window stayed dead until a manual reload.
+    // directory: neither joining (connecting to a directory fails) nor
+    // promoting (bind fails EADDRINUSE) can succeed, so bootstrap exhausts
+    // its attempts and throws FATAL — the exact reported failure ("Could
+    // not elect or join a master after N attempts"). Pre-fix, the window
+    // stayed dead until a manual reload.
     masterProc.kill("SIGKILL");
     fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
     fs.mkdirSync(ipcPath);
@@ -536,17 +535,22 @@ describe("cluster master-worker (E2E)", () => {
 
       // Hold the block long enough for the first bootstrap to exhaust its
       // attempts (8 attempts x up to ~5.5s backoff ≈ 28s worst case).
-      // Lost-master detection is ≤5s (heartbeat), so by 28s the survivor
+      // Lost-master detection is ≤5s (heartbeat), so by 28s the candidate
       // has FATALed and scheduled its first retry.
       await new Promise((r) => setTimeout(r, 28000));
       fs.rmSync(ipcPath, { recursive: true, force: true });
 
       // Self-heal must happen WITHOUT any reload: the retry re-runs
-      // startCluster and the surviving window promotes itself to master.
+      // startCluster and a master comes back. Which window becomes master
+      // is intentionally NOT asserted: on Linux CI the SIGKILL hits the
+      // xvfb-run wrapper, so the killed window's VS Code main survives as
+      // an orphan and VS Code auto-restarts its extension host, which hits
+      // FATAL and self-heals through the same retry path — racing the
+      // survivor's re-election. Pre-fix, every path stays dead after FATAL
+      // and the port never returns, so role=master is the regression signal.
       await waitForServer(port, 90000);
       const healed = await waitForMaster(15000);
       expect(healed.role).toBe("master");
-      expect((healed.folders as string[]).some((f) => f.endsWith(survivorTag))).toBe(true);
     } finally {
       // Restore the socket path so afterAll cleanup is uncomplicated.
       fs.rmSync(ipcPath, { recursive: true, force: true });
