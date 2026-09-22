@@ -16,7 +16,9 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 2. **Reload VS Code** — the extension starts automatically on startup. The first window becomes the
    **leader** and listens on `http://127.0.0.1:9876`; additional windows join as **workers** over an
-   IPC socket and share the same port (the MCP client targets a window via a `workspace` argument).
+   IPC socket at `<tmpdir>/vscode-mcp/ipc.sock` (POSIX; named pipe on Windows) and share the same
+   port (the MCP client targets a window via a `workspace` argument). The socket path is configurable
+   via the `vscode-mcp-server.ipcPath` setting or `VSCODE_MCP_IPC_PATH` env var.
 
 3. **Configure your AI tool** (e.g., opencode) to connect via SSE:
 
@@ -508,6 +510,7 @@ All settings under `vscode-mcp-server.*`:
 | `authToken` | `""` | Bearer token (empty = no auth). Warns if set without TLS |
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
+| `ipcPath` | `""` | Cluster IPC socket: `<tmpdir>/vscode-mcp/ipc.sock` POSIX, pipe Windows |
 
 Settings fall back to environment variables:
 
@@ -517,6 +520,7 @@ Settings fall back to environment variables:
 | `MCP_AUTH_TOKEN` | `authToken` | (none) |
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
 | `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
+| `VSCODE_MCP_IPC_PATH` | `ipcPath` | (none — `<tmpdir>/vscode-mcp/ipc.sock` POSIX) |
 | `MCP_SERVER_MAX_RETRIES` | ports scanned per election (default 5, 9876–9880) | `5` |
 
 VS Code settings take priority over env vars.

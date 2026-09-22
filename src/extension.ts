@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
+import { resolveIpcPath } from "./mcp/cluster/constants";
 import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
@@ -89,6 +90,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const authToken = config.get<string>("authToken") || process.env.MCP_AUTH_TOKEN || "";
   const tlsCertPath = config.get<string>("tlsCertPath") || process.env.MCP_TLS_CERT_PATH || "";
   const tlsKeyPath = config.get<string>("tlsKeyPath") || process.env.MCP_TLS_KEY_PATH || "";
+  // IPC path precedence: explicit setting → env var → default (see
+  // resolveIpcPath). All windows in the cluster must share the same value.
+  const ipcPath = resolveIpcPath(config.get<string>("ipcPath"), process.env.VSCODE_MCP_IPC_PATH);
 
   // Detect remote container
   const isRemoteContainer =
@@ -117,6 +121,7 @@ export function activate(context: vscode.ExtensionContext): void {
   if (useTls) {
     outputChannel.appendLine(`[mcp] TLS enabled — using cert: ${tlsCertPath}`);
   }
+  outputChannel.appendLine(`[mcp] Cluster IPC path: ${ipcPath}`);
 
   // This window's cluster identity. The id must be unique per window (even
   // for two windows on the same folder) — the pid disambiguates.
@@ -148,6 +153,7 @@ export function activate(context: vscode.ExtensionContext): void {
     executor,
     metrics,
     logger: fileLog,
+    ipcPath,
     workspaceId,
     workspacePaths: workspaceFolders,
     displayName,
@@ -204,6 +210,8 @@ interface ClusterStartOptions {
   authToken: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
+  /** IPC socket/named-pipe path shared by all cluster windows. */
+  ipcPath?: string;
   executor: ToolExecutor;
   metrics: Metrics;
   logger?: ServerLog;
@@ -234,6 +242,7 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
       host: opts.host,
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
+      ...(opts.ipcPath ? { ipcPath: opts.ipcPath } : {}),
       executor: opts.executor,
       metrics: opts.metrics,
       logger: opts.logger,

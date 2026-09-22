@@ -6,6 +6,7 @@
 
 import * as fs from "fs";
 import * as net from "net";
+import { dirname } from "path";
 import { IPC_CONNECT_TIMEOUT_MS } from "./constants";
 
 export interface IpcConnection {
@@ -87,6 +88,30 @@ export function unlinkStaleSocketFile(path: string): void {
 }
 
 /**
+ * Ensure the parent directory of a POSIX IPC socket exists (mode 0700) so the
+ * socket can live in a dedicated subdirectory (`<dir>/<name>`) instead of as a
+ * bare file in the tmp root. No-op on Windows named pipes, which have no
+ * filesystem directory.
+ */
+export function ensureIpcDir(socketPath: string): void {
+  if (process.platform === "win32") return;
+  const dir = dirname(socketPath);
+  if (!dir || dir === "." || dir === "/") return;
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdirSync's mode only applies at creation; a pre-existing dir with
+  // looser perms (e.g. 0755 from a prior run or another tool) would
+  // silently weaken the "private to the cluster" boundary. Enforce it.
+  try {
+    const st = fs.statSync(dir);
+    if ((st.mode & 0o777) !== 0o700) {
+      fs.chmodSync(dir, 0o700);
+    }
+  } catch {
+    /* dir vanished in a race — bind will surface the real error */
+  }
+}
+
+/**
  * Create an IPC server that listens on the well-known path. Handles the
  * stale-file race: first try binding; if the path exists but is dead,
  * unlink it and retry once. If the path is alive, the caller must treat the
@@ -96,6 +121,7 @@ export function unlinkStaleSocketFile(path: string): void {
  * EADDRINUSE-ish error when the path is owned by a live peer.
  */
 export function createIpcServer(path: string): Promise<net.Server> {
+  ensureIpcDir(path);
   const server = net.createServer();
 
   const listen = (): Promise<net.Server> =>

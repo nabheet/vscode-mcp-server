@@ -6,9 +6,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCluster } from "../mcp/cluster/bootstrap";
-import { HEALTH_SERVICE, MAX_FRAME_BYTES, MSG } from "../mcp/cluster/constants";
+import {
+  DEFAULT_IPC_PATH,
+  HEALTH_SERVICE,
+  MAX_FRAME_BYTES,
+  MSG,
+  resolveIpcPath,
+} from "../mcp/cluster/constants";
 import { probePort } from "../mcp/cluster/election";
-import { closeIpcServer, createIpcServer, isIpcAlive } from "../mcp/cluster/ipc";
+import { closeIpcServer, createIpcServer, ensureIpcDir, isIpcAlive } from "../mcp/cluster/ipc";
 import { LeaderCoordinator } from "../mcp/cluster/leader";
 import {
   createDecoder,
@@ -318,7 +324,15 @@ describe("cluster IPC helpers", () => {
   });
 
   it("createIpcServer recovers from a stale socket file left by a crash", async () => {
-    const ipcPath = findFreeIpcPath();
+    // Stale socket in the nested <dir>/<name> layout (the production default):
+    // the parent dir already exists from a prior healthy run, a hard crash
+    // leaves the socket file behind, and recovery must unlink it and re-bind.
+    const dir = path.join(
+      os.tmpdir(),
+      `vscode-mcp-stale-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const ipcPath = path.join(dir, "ipc.sock");
     // Simulate a hard crash: a child binds the socket then SIGKILLs itself.
     // Node's normal close() auto-unlinks, so only a real crash leaves a
     // stale socket file behind — this is the exact scenario the recovery
@@ -358,6 +372,11 @@ describe("cluster IPC helpers", () => {
       }
       try {
         fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
       } catch {
         /* already gone */
       }
@@ -401,6 +420,96 @@ describe("cluster IPC helpers", () => {
     } finally {
       await loser.stop(500).catch(() => {});
       await closeIpcServer(holder, new Set());
+    }
+  });
+
+  it("resolveIpcPath precedence: explicit setting > env var > default", () => {
+    const setting = "/opt/vscode-mcp/ipc.sock";
+    const env = "/tmp/custom/ipc.sock";
+    expect(resolveIpcPath(setting, env)).toBe(setting);
+    expect(resolveIpcPath("", env)).toBe(env);
+    expect(resolveIpcPath(undefined, env)).toBe(env);
+    expect(resolveIpcPath("", "")).toBe(DEFAULT_IPC_PATH);
+    expect(resolveIpcPath(undefined, undefined)).toBe(DEFAULT_IPC_PATH);
+    // A hand-edited settings.json can hold a non-string; it must be ignored
+    // rather than flowing into net.listen() as a TCP port.
+    expect(resolveIpcPath(123, env)).toBe(env);
+    expect(resolveIpcPath(false, env)).toBe(env);
+    // Numeric strings are the same hazard: net.listen("18099") binds an
+    // unauthenticated TCP listener on all interfaces, not a unix socket.
+    expect(resolveIpcPath("18099", env)).toBe(env);
+    expect(resolveIpcPath("0", env)).toBe(env);
+    expect(resolveIpcPath(undefined, "9876")).toBe(DEFAULT_IPC_PATH);
+    // Whitespace-only is a settings.json mistake — treated as unset.
+    expect(resolveIpcPath("   ", env)).toBe(env);
+    expect(resolveIpcPath(undefined, "   ")).toBe(DEFAULT_IPC_PATH);
+    if (process.platform !== "win32") {
+      // Relative paths bind in the process CWD and silently split the cluster.
+      expect(resolveIpcPath("ipc.sock", env)).toBe(env);
+      // Trailing slashes are normalized so dirname() and listen() agree.
+      expect(resolveIpcPath("/tmp/foo/", env)).toBe("/tmp/foo");
+    }
+  });
+
+  it("POSIX default IPC path lives in a dedicated subdirectory (not the tmp root)", () => {
+    if (process.platform === "win32") return; // named pipes have no directory
+    const dir = path.dirname(DEFAULT_IPC_PATH);
+    const base = path.basename(DEFAULT_IPC_PATH);
+    expect(base).toBe("ipc.sock");
+    expect(dir).not.toBe(os.tmpdir()); // not a bare file in the tmp root
+    expect(path.basename(dir)).toBe("vscode-mcp");
+  });
+
+  it("createIpcServer creates a missing parent dir (nested <dir>/<name> layout)", async () => {
+    if (process.platform === "win32") return; // named pipes have no filesystem dir
+    const dir = path.join(
+      os.tmpdir(),
+      `vscode-mcp-dir-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    const ipcPath = path.join(dir, "ipc.sock");
+    let srv: net.Server | undefined;
+    try {
+      expect(fs.existsSync(dir)).toBe(false); // parent must not exist yet
+      srv = await createIpcServer(ipcPath);
+      expect(srv.listening).toBe(true);
+      expect(fs.existsSync(dir)).toBe(true);
+      expect(fs.existsSync(ipcPath)).toBe(true);
+      // Socket lives at <dir>/<name> and the dir is private to the cluster.
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("700");
+      expect(await isIpcAlive(ipcPath, 800)).toBe(true);
+    } finally {
+      if (srv) await closeIpcServer(srv, new Set());
+      try {
+        fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
+  it("ensureIpcDir tightens a pre-existing loose parent dir to 0700", () => {
+    if (process.platform === "win32") return; // named pipes have no filesystem dir
+    const dir = path.join(
+      os.tmpdir(),
+      `vscode-mcp-loose-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    try {
+      // Simulate a pre-existing dir with looser perms (0755 default umask).
+      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("755");
+      ensureIpcDir(path.join(dir, "ipc.sock"));
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("700");
+    } finally {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* already gone */
+      }
     }
   });
 });

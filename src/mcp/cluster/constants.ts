@@ -6,6 +6,8 @@
  * to the Leader over a local IPC pipe. Keeping these values in one module
  * makes the coordination protocol auditable and testable.
  */
+import * as os from "node:os";
+import * as path from "node:path";
 
 /** Default HTTP port the Leader listens on. */
 export const DEFAULT_PORT = 9876;
@@ -13,13 +15,61 @@ export const DEFAULT_PORT = 9876;
 /** /health response signature that identifies a valid Leader. */
 export const HEALTH_SERVICE = "vscode-mcp-server";
 
-/** Well-known IPC path (POSIX socket or Windows named pipe). */
+/**
+ * Well-known IPC path (POSIX socket or Windows named pipe).
+ *
+ * On POSIX the socket lives inside a dedicated subdirectory of the OS temp
+ * dir rather than as a bare file in the tmp root — the directory is created
+ * on demand (mode 0700) before binding, so the well-known path is
+ * `<dir>/<name>` (e.g. `<tmpdir>/vscode-mcp/ipc.sock`). Windows keeps the
+ * named pipe unchanged.
+ */
 export const DEFAULT_IPC_PATH =
-  process.platform === "win32" ? "\\\\.\\pipe\\vscode-mcp-ipc" : "/tmp/vscode-mcp-ipc.sock";
+  process.platform === "win32"
+    ? "\\\\.\\pipe\\vscode-mcp-ipc"
+    : path.join(os.tmpdir(), "vscode-mcp", "ipc.sock");
+
+/**
+ * Resolve the IPC path with the documented precedence:
+ * explicit setting → env var → default.
+ *
+ * The setting is typed as `unknown` rather than `string` because
+ * `vscode.workspace.getConfiguration().get()` surfaces raw settings.json
+ * values at runtime — a hand-edited settings.json can hold a number or bool
+ * even though the schema declares a string. A truthy non-string would
+ * otherwise flow all the way to `net.createServer().listen(n)` and silently
+ * bind a TCP port; we only accept genuine non-empty strings.
+ */
+export function resolveIpcPath(setting?: unknown, env?: string): string {
+  const s = typeof setting === "string" ? sanitizeIpcPath(setting) : "";
+  if (s) return s;
+  const e = typeof env === "string" ? sanitizeIpcPath(env) : "";
+  return e || DEFAULT_IPC_PATH;
+}
+
+/**
+ * Return a safe socket path, or "" to signal "fall through to the next
+ * source". Guards against values that silently change `net.listen()`
+ * semantics:
+ * - all-digit strings (e.g. `"18099"`) are interpreted by Node as TCP
+ *   ports, binding an unauthenticated listener on all interfaces instead
+ *   of a unix socket — reject;
+ * - whitespace-only strings are a settings.json mistake — treat as unset;
+ * - on POSIX a bare relative name (e.g. `"ipc.sock"`) binds in the process
+ *   CWD, silently splitting the cluster across windows — require absolute;
+ * - trailing slashes are stripped so `dirname()` (used by ensureIpcDir)
+ *   and `listen()` agree instead of failing with EACCES.
+ */
+function sanitizeIpcPath(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed || /^\d+$/.test(trimmed)) return "";
+  if (process.platform !== "win32" && !path.isAbsolute(trimmed)) return "";
+  return trimmed;
+}
 
 /** Env override so tests can use per-suite socket paths. */
 export function getIpcPath(): string {
-  return process.env.VSCODE_MCP_IPC_PATH || DEFAULT_IPC_PATH;
+  return resolveIpcPath(undefined, process.env.VSCODE_MCP_IPC_PATH);
 }
 
 /** How many consecutive ports (base, base+1, ...) we scan before giving up. */
