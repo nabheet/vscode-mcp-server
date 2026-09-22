@@ -6,6 +6,8 @@
  * to the Leader over a local IPC pipe. Keeping these values in one module
  * makes the coordination protocol auditable and testable.
  */
+import * as os from "node:os";
+import * as path from "node:path";
 
 /** Default HTTP port the Leader listens on. */
 export const DEFAULT_PORT = 9876;
@@ -13,13 +15,31 @@ export const DEFAULT_PORT = 9876;
 /** /health response signature that identifies a valid Leader. */
 export const HEALTH_SERVICE = "vscode-mcp-server";
 
-/** Well-known IPC path (POSIX socket or Windows named pipe). */
+/**
+ * Well-known IPC path (POSIX socket or Windows named pipe).
+ *
+ * On POSIX the socket lives inside a dedicated subdirectory of the OS temp
+ * dir rather than as a bare file in the tmp root — the directory is created
+ * on demand (mode 0700) before binding, so the well-known path is
+ * `<dir>/<name>` (e.g. `<tmpdir>/vscode-mcp/ipc.sock`). Windows keeps the
+ * named pipe unchanged.
+ */
 export const DEFAULT_IPC_PATH =
-  process.platform === "win32" ? "\\\\.\\pipe\\vscode-mcp-ipc" : "/tmp/vscode-mcp-ipc.sock";
+  process.platform === "win32"
+    ? "\\\\.\\pipe\\vscode-mcp-ipc"
+    : path.join(os.tmpdir(), "vscode-mcp", "ipc.sock");
+
+/**
+ * Resolve the IPC path with the documented precedence:
+ * explicit setting → env var → default.
+ */
+export function resolveIpcPath(setting?: string, env?: string): string {
+  return setting || env || DEFAULT_IPC_PATH;
+}
 
 /** Env override so tests can use per-suite socket paths. */
 export function getIpcPath(): string {
-  return process.env.VSCODE_MCP_IPC_PATH || DEFAULT_IPC_PATH;
+  return resolveIpcPath(undefined, process.env.VSCODE_MCP_IPC_PATH);
 }
 
 /** How many consecutive ports (base, base+1, ...) we scan before giving up. */

@@ -6,7 +6,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCluster } from "../mcp/cluster/bootstrap";
-import { HEALTH_SERVICE, MAX_FRAME_BYTES, MSG } from "../mcp/cluster/constants";
+import {
+  DEFAULT_IPC_PATH,
+  HEALTH_SERVICE,
+  MAX_FRAME_BYTES,
+  MSG,
+  resolveIpcPath,
+} from "../mcp/cluster/constants";
 import { probePort } from "../mcp/cluster/election";
 import { closeIpcServer, createIpcServer, isIpcAlive } from "../mcp/cluster/ipc";
 import { LeaderCoordinator } from "../mcp/cluster/leader";
@@ -401,6 +407,56 @@ describe("cluster IPC helpers", () => {
     } finally {
       await loser.stop(500).catch(() => {});
       await closeIpcServer(holder, new Set());
+    }
+  });
+
+  it("resolveIpcPath precedence: explicit setting > env var > default", () => {
+    const setting = "/opt/vscode-mcp/ipc.sock";
+    const env = "/tmp/custom/ipc.sock";
+    expect(resolveIpcPath(setting, env)).toBe(setting);
+    expect(resolveIpcPath("", env)).toBe(env);
+    expect(resolveIpcPath(undefined, env)).toBe(env);
+    expect(resolveIpcPath("", "")).toBe(DEFAULT_IPC_PATH);
+    expect(resolveIpcPath(undefined, undefined)).toBe(DEFAULT_IPC_PATH);
+  });
+
+  it("POSIX default IPC path lives in a dedicated subdirectory (not the tmp root)", () => {
+    if (process.platform === "win32") return; // named pipes have no directory
+    const dir = path.dirname(DEFAULT_IPC_PATH);
+    const base = path.basename(DEFAULT_IPC_PATH);
+    expect(base).toBe("ipc.sock");
+    expect(dir).not.toBe(os.tmpdir()); // not a bare file in the tmp root
+    expect(path.basename(dir)).toBe("vscode-mcp");
+  });
+
+  it("createIpcServer creates a missing parent dir (nested <dir>/<name> layout)", async () => {
+    const dir = path.join(
+      os.tmpdir(),
+      `vscode-mcp-dir-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    const ipcPath = path.join(dir, "ipc.sock");
+    let srv: net.Server | undefined;
+    try {
+      expect(fs.existsSync(dir)).toBe(false); // parent must not exist yet
+      srv = await createIpcServer(ipcPath);
+      expect(srv.listening).toBe(true);
+      expect(fs.existsSync(dir)).toBe(true);
+      expect(fs.existsSync(ipcPath)).toBe(true);
+      // Socket lives at <dir>/<name> and the dir is private to the cluster.
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("700");
+      expect(await isIpcAlive(ipcPath, 800)).toBe(true);
+    } finally {
+      if (srv) await closeIpcServer(srv, new Set());
+      try {
+        fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* already gone */
+      }
     }
   });
 });

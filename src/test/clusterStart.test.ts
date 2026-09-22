@@ -29,13 +29,17 @@ vi.mock("../mcp/cluster/bootstrap", () => ({
 import { deactivate, startCluster } from "../extension";
 import { bootstrapCluster, type ClusterMember } from "../mcp/cluster/bootstrap";
 
-function makeOpts(log: (msg: string) => void) {
+function makeOpts(
+  log: (msg: string) => void,
+  overrides: Partial<Parameters<typeof startCluster>[0]> = {},
+) {
   return {
     basePort: 9876,
     host: "127.0.0.1",
     authToken: "",
     executor: {} as ToolExecutor,
     metrics: {} as Metrics,
+    ipcPath: "/tmp/vscode-mcp/ipc.sock",
     workspaceId: "ws",
     workspacePaths: ["/mnt/ws"],
     displayName: "W",
@@ -44,6 +48,7 @@ function makeOpts(log: (msg: string) => void) {
     state: { openEditors: [] } as WindowState,
     isRemoteContainer: false,
     log,
+    ...overrides,
   };
 }
 
@@ -187,6 +192,27 @@ describe("startCluster FATAL retry", () => {
     await vi.advanceTimersByTimeAsync(10000);
     await settle();
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledTimes(1);
+    await p;
+  });
+
+  it("threads the configured ipcPath into bootstrapCluster", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(makeOpts(log, { ipcPath: "/opt/vscode-mcp/ipc.sock" }));
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({ ipcPath: "/opt/vscode-mcp/ipc.sock" }),
+    );
+    await p;
+  });
+
+  it("omits ipcPath from bootstrapCluster when not configured", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(makeOpts(log, { ipcPath: undefined }));
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("ipcPath");
     await p;
   });
 });
