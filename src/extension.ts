@@ -18,6 +18,19 @@ let electing = false;
 let statePushTimer: ReturnType<typeof setTimeout> | undefined;
 
 /**
+ * Auto-retry after a FATAL cluster startup so transient IPC races (e.g. a
+ * socket file momentarily unlinked during a reload) self-heal instead of
+ * leaving the window with no cluster role until a manual reload.
+ */
+let startupRetryAttempt = 0;
+let startupRetryTimer: ReturnType<typeof setTimeout> | undefined;
+/** Bumped by every startCluster call; retries check it so a stale scheduled
+ * retry never fires after a newer election superseded it. */
+let startupGeneration = 0;
+const STARTUP_RETRY_BASE_MS = 2000;
+const STARTUP_RETRY_MAX_MS = 30000;
+
+/**
  * Snapshot this window's editor state (active file + open editors) for
  * list_workspaces, so clients can tell windows apart even when they share
  * a folder and display name.
@@ -168,6 +181,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   outputChannel?.appendLine("[mcp] Shutting down...");
+  // Invalidate any scheduled startup retry — the host is going away.
+  startupGeneration += 1;
+  startupRetryAttempt = 0;
+  if (startupRetryTimer) {
+    clearTimeout(startupRetryTimer);
+    startupRetryTimer = undefined;
+  }
   if (member) {
     const m = member;
     member = null;
@@ -198,8 +218,15 @@ interface ClusterStartOptions {
 }
 
 /** Elect a role and wire re-election. Re-runs whenever the Master is lost. */
-async function startCluster(opts: ClusterStartOptions): Promise<void> {
+export async function startCluster(opts: ClusterStartOptions): Promise<void> {
   if (electing) return;
+  // A fresh election (retry, re-election, or manual reload) supersedes any
+  // pending scheduled retry from a previous FATAL.
+  if (startupRetryTimer) {
+    clearTimeout(startupRetryTimer);
+    startupRetryTimer = undefined;
+  }
+  const generation = ++startupGeneration;
   electing = true;
   try {
     const newMember = await bootstrapCluster({
@@ -226,6 +253,9 @@ async function startCluster(opts: ClusterStartOptions): Promise<void> {
       await old.stop(500).catch(() => {});
     }
     member = newMember;
+    // A successful election resets the backoff so the next transient FATAL
+    // starts from the base delay again.
+    startupRetryAttempt = 0;
     // State captured at activation may be stale after election; push the
     // freshest snapshot once the member is wired. Debounced pushes handle
     // the rest.
@@ -248,7 +278,20 @@ async function startCluster(opts: ClusterStartOptions): Promise<void> {
     updateStatusBar(newMember);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    opts.log(`FATAL cluster startup: ${msg}`);
+    // Transient FATALs (e.g. the IPC socket file momentarily unlinked during a
+    // simultaneous reload) self-heal: retry with exponential backoff so the
+    // window still gets a cluster role without a manual reload.
+    const delay = Math.min(STARTUP_RETRY_BASE_MS * 2 ** startupRetryAttempt, STARTUP_RETRY_MAX_MS);
+    startupRetryAttempt += 1;
+    opts.log(
+      `FATAL cluster startup: ${msg} — retrying in ${delay}ms (attempt ${startupRetryAttempt})`,
+    );
+    startupRetryTimer = setTimeout(() => {
+      startupRetryTimer = undefined;
+      // Stale retry: a newer election (or deactivate) superseded this one.
+      if (generation !== startupGeneration) return;
+      void startCluster(opts);
+    }, delay);
   } finally {
     electing = false;
   }
