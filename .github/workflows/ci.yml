@@ -58,6 +58,8 @@ jobs:
 
       - run: npm run compile
 
+      - run: npm test
+
       # Cache VS Code binary downloaded by @vscode/test-electron
       - name: Cache VS Code
         uses: actions/cache@v6
@@ -96,6 +98,8 @@ jobs:
       - run: npm ci
 
       - run: npm run compile
+
+      - run: npm test
 
       # Cache VS Code binary downloaded by @vscode/test-electron
       - name: Cache VS Code
