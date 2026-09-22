@@ -3,11 +3,18 @@ import type { WindowState } from "../mcp/cluster/protocol";
 import type { ToolExecutor } from "../mcp/executor";
 import type { Metrics } from "../utils/metrics";
 
+// The setting value activate() reads from getConfiguration("ipcPath"). It is
+// mutable so tests can exercise the setting → env → default precedence.
+const mockIpcPathSetting = vi.hoisted(() => ({ current: undefined as unknown }));
+
 // extension.ts (and the tool modules it imports) binds the vscode module;
 // provide a stub sufficient for the startCluster paths under test.
 vi.mock("vscode", () => ({
   window: {
-    tabGroups: { all: [] },
+    tabGroups: {
+      all: [],
+      onDidChangeTabs: () => ({ dispose: vi.fn() }),
+    },
     activeTextEditor: null,
     createStatusBarItem: () => ({
       name: "",
@@ -16,7 +23,25 @@ vi.mock("vscode", () => ({
       backgroundColor: undefined,
       show: vi.fn(),
     }),
+    createOutputChannel: () => ({
+      appendLine: vi.fn(),
+      show: vi.fn(),
+      dispose: vi.fn(),
+    }),
+    onDidChangeActiveTextEditor: () => ({ dispose: vi.fn() }),
   },
+  workspace: {
+    getConfiguration: (_section: string) => ({
+      get: <T>(key: string, defaultValue?: T): T | undefined =>
+        key === "ipcPath" ? (mockIpcPathSetting.current as T) : defaultValue,
+    }),
+    name: undefined,
+    workspaceFolders: [],
+    onDidOpenTextDocument: () => ({ dispose: vi.fn() }),
+    onDidCloseTextDocument: () => ({ dispose: vi.fn() }),
+    onDidChangeConfiguration: () => ({ dispose: vi.fn() }),
+  },
+  env: { remoteName: undefined },
   StatusBarAlignment: { Right: 1 },
   TabInputText: class {},
   TabInputTextDiff: class {},
@@ -26,8 +51,15 @@ vi.mock("../mcp/cluster/bootstrap", () => ({
   bootstrapCluster: vi.fn(),
 }));
 
-import { deactivate, startCluster } from "../extension";
+// activate() registers tools through this module; stub it so the heavy tool
+// modules don't need vscode stubs for this test file's scope.
+vi.mock("../mcp/tools/index", () => ({
+  registerAllTools: vi.fn(),
+}));
+
+import { activate, deactivate, startCluster } from "../extension";
 import { bootstrapCluster, type ClusterMember } from "../mcp/cluster/bootstrap";
+import { DEFAULT_IPC_PATH } from "../mcp/cluster/constants";
 
 function makeOpts(
   log: (msg: string) => void,
@@ -214,5 +246,58 @@ describe("startCluster FATAL retry", () => {
     const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
     expect(callArgs).not.toHaveProperty("ipcPath");
     await p;
+  });
+});
+
+// ── activate() IPC path wiring ────────────────────────────────────────
+
+describe("activate IPC path wiring", () => {
+  const context = () =>
+    ({ subscriptions: [], logUri: undefined }) as Parameters<typeof activate>[0];
+
+  beforeEach(() => {
+    vi.mocked(bootstrapCluster).mockReset();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    mockIpcPathSetting.current = undefined;
+    delete process.env.VSCODE_MCP_IPC_PATH;
+  });
+
+  afterEach(() => {
+    deactivate();
+    delete process.env.VSCODE_MCP_IPC_PATH;
+  });
+
+  async function waitForBootstrapCall() {
+    await vi.waitFor(() => expect(vi.mocked(bootstrapCluster)).toHaveBeenCalled());
+    return vi.mocked(bootstrapCluster).mock.calls[0][0];
+  }
+
+  it("threads the resolved ipcPath from the vscode-mcp-server.ipcPath setting into the cluster", async () => {
+    mockIpcPathSetting.current = "/opt/vscode-mcp/ipc.sock";
+    activate(context());
+    const callArgs = await waitForBootstrapCall();
+    expect(callArgs).toMatchObject({ ipcPath: "/opt/vscode-mcp/ipc.sock" });
+  });
+
+  it("falls back to the VSCODE_MCP_IPC_PATH env var when the setting is empty", async () => {
+    mockIpcPathSetting.current = "";
+    process.env.VSCODE_MCP_IPC_PATH = "/tmp/env-ipc/ipc.sock";
+    activate(context());
+    const callArgs = await waitForBootstrapCall();
+    expect(callArgs).toMatchObject({ ipcPath: "/tmp/env-ipc/ipc.sock" });
+  });
+
+  it("falls back to the default IPC path when neither setting nor env is set", async () => {
+    activate(context());
+    const callArgs = await waitForBootstrapCall();
+    expect(callArgs).toMatchObject({ ipcPath: DEFAULT_IPC_PATH });
+  });
+
+  it("ignores a non-string setting value (hand-edited settings.json)", async () => {
+    mockIpcPathSetting.current = 123;
+    process.env.VSCODE_MCP_IPC_PATH = "/tmp/env-ipc/ipc.sock";
+    activate(context());
+    const callArgs = await waitForBootstrapCall();
+    expect(callArgs).toMatchObject({ ipcPath: "/tmp/env-ipc/ipc.sock" });
   });
 });

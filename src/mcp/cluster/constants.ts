@@ -32,9 +32,17 @@ export const DEFAULT_IPC_PATH =
 /**
  * Resolve the IPC path with the documented precedence:
  * explicit setting → env var → default.
+ *
+ * The setting is typed as `unknown` rather than `string` because
+ * `vscode.workspace.getConfiguration().get()` surfaces raw settings.json
+ * values at runtime — a hand-edited settings.json can hold a number or bool
+ * even though the schema declares a string. A truthy non-string would
+ * otherwise flow all the way to `net.createServer().listen(n)` and silently
+ * bind a TCP port; we only accept genuine non-empty strings.
  */
-export function resolveIpcPath(setting?: string, env?: string): string {
-  return setting || env || DEFAULT_IPC_PATH;
+export function resolveIpcPath(setting?: unknown, env?: string): string {
+  const s = typeof setting === "string" ? setting : "";
+  return s || env || DEFAULT_IPC_PATH;
 }
 
 /** Env override so tests can use per-suite socket paths. */

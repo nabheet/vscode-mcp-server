@@ -324,7 +324,15 @@ describe("cluster IPC helpers", () => {
   });
 
   it("createIpcServer recovers from a stale socket file left by a crash", async () => {
-    const ipcPath = findFreeIpcPath();
+    // Stale socket in the nested <dir>/<name> layout (the production default):
+    // the parent dir already exists from a prior healthy run, a hard crash
+    // leaves the socket file behind, and recovery must unlink it and re-bind.
+    const dir = path.join(
+      os.tmpdir(),
+      `vscode-mcp-stale-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const ipcPath = path.join(dir, "ipc.sock");
     // Simulate a hard crash: a child binds the socket then SIGKILLs itself.
     // Node's normal close() auto-unlinks, so only a real crash leaves a
     // stale socket file behind — this is the exact scenario the recovery
@@ -364,6 +372,11 @@ describe("cluster IPC helpers", () => {
       }
       try {
         fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
       } catch {
         /* already gone */
       }
@@ -418,6 +431,10 @@ describe("cluster IPC helpers", () => {
     expect(resolveIpcPath(undefined, env)).toBe(env);
     expect(resolveIpcPath("", "")).toBe(DEFAULT_IPC_PATH);
     expect(resolveIpcPath(undefined, undefined)).toBe(DEFAULT_IPC_PATH);
+    // A hand-edited settings.json can hold a non-string; it must be ignored
+    // rather than flowing into net.listen() as a TCP port.
+    expect(resolveIpcPath(123, env)).toBe(env);
+    expect(resolveIpcPath(false, env)).toBe(env);
   });
 
   it("POSIX default IPC path lives in a dedicated subdirectory (not the tmp root)", () => {
@@ -430,6 +447,7 @@ describe("cluster IPC helpers", () => {
   });
 
   it("createIpcServer creates a missing parent dir (nested <dir>/<name> layout)", async () => {
+    if (process.platform === "win32") return; // named pipes have no filesystem dir
     const dir = path.join(
       os.tmpdir(),
       `vscode-mcp-dir-${process.pid}-${Math.random().toString(36).slice(2)}`,
