@@ -4,7 +4,8 @@
  *
  * Algorithm (bounded retry loop over base..base+MAX_PORT_SCAN-1):
  *  - probe /health on the port
- *    • valid   → join as Worker
+ *    • valid   → join as Worker. If the join handshake fails, retry the SAME
+ *                port (never increment — that fragments the cluster).
  *    • free    → promote to Master (bind IPC pipe + HTTP)
  *    • foreign → unrelated app squatting the port → try next port
  *    • zombie  → occupied, no HTTP signature, but IPC pipe alive: a frozen
@@ -65,7 +66,9 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
           opts.log?.(`[mcp] Joined master on port ${port} as worker`);
           return worker;
         }
-        continue; // master died mid-handshake — re-probe
+        // Master died mid-handshake: back off and retry the SAME port on
+        // the next attempt (never increment — that fragments the cluster).
+        break;
       }
 
       if (probe.status === "zombie") {

@@ -79,7 +79,6 @@ export class MasterCoordinator implements McpRouter {
   private ipcPeer = new Map<net.Socket, { registered: boolean; entryId: string | null }>();
   private workers = new Map<string, WorkerEntry>();
   private pending = new Map<string, PendingCall>();
-  private stopped = false;
 
   constructor(opts: MasterOptions) {
     this.opts = opts;
@@ -150,9 +149,10 @@ export class MasterCoordinator implements McpRouter {
   }
 
   async start(): Promise<void> {
-    this.stopped = false;
-    // Pre-clean crash leftovers (createIpcServer also re-checks under race).
-    unlinkStaleSocketFile(this.ipcPath);
+    // NOTE: no pre-unlink here. createIpcServer already recovers stale
+    // socket files safely (EADDRINUSE -> isIpcAlive -> unlink only if the
+    // holder is dead). Unlinking unconditionally would let a promoting
+    // window steal the IPC path from a LIVE master — the split-brain bug.
     this.ipcServer = await createIpcServer(this.ipcPath);
     this.ipcServer.on("connection", (socket) => this.onIpcConnection(socket));
     try {
@@ -169,7 +169,6 @@ export class MasterCoordinator implements McpRouter {
   }
 
   async stop(timeoutMs = 5000): Promise<void> {
-    this.stopped = true;
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error("Master shutting down"));

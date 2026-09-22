@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCluster } from "../mcp/cluster/bootstrap";
-import { MAX_FRAME_BYTES, MSG } from "../mcp/cluster/constants";
+import { HEALTH_SERVICE, MAX_FRAME_BYTES, MSG } from "../mcp/cluster/constants";
 import { probePort } from "../mcp/cluster/election";
 import { closeIpcServer, createIpcServer, isIpcAlive } from "../mcp/cluster/ipc";
 import { MasterCoordinator } from "../mcp/cluster/master";
@@ -21,13 +21,44 @@ import { ToolExecutor } from "../mcp/executor";
 import { McpServer } from "../mcp/server";
 import type { ToolDefinition } from "../utils/types";
 
+// The retry loop in bootstrapCluster backs off between attempts (up to ~18s
+// for 8 attempts). Collapse that to zero so the split-brain regression tests
+// run fast; probePort stays real (spread the original module).
+vi.mock("../mcp/cluster/election", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../mcp/cluster/election")>();
+  return { ...actual, sleep: async () => {}, jitter: () => 0 };
+});
+
+// ── Response/row shapes used by the HTTP helpers ─────────────────────
+
+/** Minimal successful/error JSON-RPC response shape used by tests. */
+interface RpcResponseBody {
+  result: {
+    content: Array<{ type: string; text: string }>;
+    tools: Array<{ name: string }>;
+    serverInfo: { name: string; instanceId?: string; instanceName?: string };
+  };
+  error: { code: number; message: string };
+}
+
+/** One row of the list_workspaces output (master or worker). */
+interface WorkspaceRow {
+  id: string;
+  instanceId?: string;
+  instanceName?: string;
+  displayName: string;
+  folders: string[];
+  role: string;
+  state: { activeFile?: string; openEditors: string[] };
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function findFreePort(): Promise<number> {
   return new Promise((resolve) => {
     const srv = http.createServer();
     srv.listen(0, "127.0.0.1", () => {
-      const port = (srv.address() as any).port;
+      const port = (srv.address() as net.AddressInfo).port;
       srv.close(() => resolve(port));
     });
   });
@@ -40,7 +71,7 @@ function findFreeIpcPath(): string {
   );
 }
 
-function post(url: string, body: unknown): Promise<{ status: number; body: any }> {
+function post(url: string, body: unknown): Promise<{ status: number; body: RpcResponseBody }> {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request(
@@ -54,11 +85,14 @@ function post(url: string, body: unknown): Promise<{ status: number; body: any }
         res.on("data", (c: Buffer) => chunks.push(c));
         res.on("end", () => {
           const raw = Buffer.concat(chunks).toString("utf-8");
-          let parsed: any;
+          let parsed: RpcResponseBody;
           try {
-            parsed = JSON.parse(raw);
+            parsed = JSON.parse(raw) as RpcResponseBody;
           } catch {
-            parsed = raw;
+            parsed = {
+              result: { content: [], tools: [], serverInfo: { name: "" } },
+              error: { code: 0, message: raw },
+            };
           }
           resolve({ status: res.statusCode ?? 0, body: parsed });
         });
@@ -70,7 +104,7 @@ function post(url: string, body: unknown): Promise<{ status: number; body: any }
   });
 }
 
-function _get(url: string): Promise<{ status: number; body: any }> {
+function _get(url: string): Promise<{ status: number; body: RpcResponseBody }> {
   return new Promise((resolve, reject) => {
     http
       .get(url, (res) => {
@@ -78,11 +112,14 @@ function _get(url: string): Promise<{ status: number; body: any }> {
         res.on("data", (c: Buffer) => chunks.push(c));
         res.on("end", () => {
           const raw = Buffer.concat(chunks).toString("utf-8");
-          let parsed: any;
+          let parsed: RpcResponseBody;
           try {
-            parsed = JSON.parse(raw);
+            parsed = JSON.parse(raw) as RpcResponseBody;
           } catch {
-            parsed = raw;
+            parsed = {
+              result: { content: [], tools: [], serverInfo: { name: "" } },
+              error: { code: 0, message: raw },
+            };
           }
           resolve({ status: res.statusCode ?? 0, body: parsed });
         });
@@ -179,7 +216,7 @@ describe("cluster protocol framing", () => {
       decode(frame.subarray(i, i + 64 * 1024));
     }
     expect(seen).toHaveLength(1);
-    expect((seen[0].response as any).result.text).toBe(big);
+    expect((seen[0].response as { result: { text: string } }).result.text).toBe(big);
   });
 
   it("rejects frames whose header declares a size over the cap", () => {
@@ -449,7 +486,7 @@ describe("master-worker cluster", () => {
 
   it("serves tools/list locally by default and per-worker with a workspace arg", async () => {
     const local = await post(url(), { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-    const localNames = local.body.result.tools.map((t: any) => t.name);
+    const localNames = local.body.result.tools.map((t) => t.name);
     expect(localNames).toContain("list_workspaces");
     expect(localNames).not.toContain("whoami_worker");
 
@@ -459,17 +496,17 @@ describe("master-worker cluster", () => {
       method: "tools/list",
       params: { workspace: "worker-ws" },
     });
-    const workerNames = workerList.body.result.tools.map((t: any) => t.name);
+    const workerNames = workerList.body.result.tools.map((t) => t.name);
     expect(workerNames).toContain("whoami_worker");
     expect(workerNames).not.toContain("list_workspaces");
   });
 
   it("exposes list_workspaces with master and worker entries", async () => {
     const res = await toolCall("list_workspaces", {});
-    const parsed = JSON.parse(res.body.result.content[0].text);
-    const ids = parsed.map((e: any) => e.id).sort();
+    const parsed = JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
+    const ids = parsed.map((e) => e.id).sort();
     expect(ids).toEqual(["master-ws", "worker-ws"]);
-    const workerEntry = parsed.find((e: any) => e.id === "worker-ws");
+    const workerEntry = parsed.find((e) => e.id === "worker-ws");
     expect(workerEntry.folders).toEqual(["/mnt/worker"]);
     expect(workerEntry.role).toBe("worker");
   });
@@ -585,15 +622,15 @@ describe("window state descriptor", () => {
     });
   }
 
-  async function listRows(): Promise<any[]> {
+  async function listRows(): Promise<WorkspaceRow[]> {
     const res = await toolCall("list_workspaces", {});
-    return JSON.parse(res.body.result.content[0].text);
+    return JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
   }
 
   it("carries initial state in REGISTER and list_workspaces rows", async () => {
     const rows = await listRows();
-    const masterRow = rows.find((e: any) => e.id === "master-ws");
-    const workerRow = rows.find((e: any) => e.id === "worker-ws");
+    const masterRow = rows.find((e) => e.id === "master-ws");
+    const workerRow = rows.find((e) => e.id === "worker-ws");
     expect(masterRow.state).toEqual({
       activeFile: "/mnt/master/init.ts",
       openEditors: ["/mnt/master/init.ts"],
@@ -624,7 +661,7 @@ describe("window state descriptor", () => {
       timeout: 3000,
     });
     const rows = await listRows();
-    const bare = rows.find((e: any) => e.id === "bare-ws");
+    const bare = rows.find((e) => e.id === "bare-ws");
     expect(bare.state).toEqual({ openEditors: [] });
     socket.destroy();
   }, 10_000);
@@ -633,8 +670,8 @@ describe("window state descriptor", () => {
     worker.updateState({ activeFile: "/mnt/worker/b.ts", openEditors: ["/mnt/worker/b.ts"] });
     await vi.waitFor(
       () => {
-        return listRows().then((rows: any[]) => {
-          const workerRow = rows.find((e: any) => e.id === "worker-ws");
+        return listRows().then((rows) => {
+          const workerRow = rows.find((e) => e.id === "worker-ws");
           expect(workerRow.state).toEqual({
             activeFile: "/mnt/worker/b.ts",
             openEditors: ["/mnt/worker/b.ts"],
@@ -655,7 +692,7 @@ describe("window state descriptor", () => {
     socket.write(encodeMessage({ type: MSG.UPDATE, state: { openEditors: ["/x/y.ts"] } }));
     await new Promise((r) => setTimeout(r, 300));
     const rows = await listRows();
-    expect(rows.find((e: any) => e.id === "worker-ws").state).toEqual({
+    expect(rows.find((e) => e.id === "worker-ws").state).toEqual({
       openEditors: ["/mnt/worker/a.ts"],
     });
     socket.destroy();
@@ -664,7 +701,7 @@ describe("window state descriptor", () => {
   it("lets the master publish its own window state", async () => {
     master.updateState({ activeFile: "/mnt/master/next.ts", openEditors: ["/mnt/master/next.ts"] });
     const rows = await listRows();
-    expect(rows.find((e: any) => e.id === "master-ws").state).toEqual({
+    expect(rows.find((e) => e.id === "master-ws").state).toEqual({
       activeFile: "/mnt/master/next.ts",
       openEditors: ["/mnt/master/next.ts"],
     });
@@ -694,7 +731,7 @@ describe("window state descriptor", () => {
       timeout: 3000,
     });
     const rows = await listRows();
-    const dirty = rows.find((e: any) => e.id === "dirty-ws");
+    const dirty = rows.find((e) => e.id === "dirty-ws");
     expect(dirty.state).toEqual({ openEditors: ["/ok.ts"] });
     socket.destroy();
   }, 10_000);
@@ -771,6 +808,116 @@ describe("cluster bootstrap", () => {
     expect(res.body.result.content[0].text).toBe("worker: hi");
     await worker.stop(500);
     await master.stop(500);
+  });
+
+  it("does not promote to the next port when a valid master rejects the join", async () => {
+    const port = await findFreePort();
+    const ipcPath = findFreeIpcPath();
+    const logs: string[] = [];
+
+    // Fake "valid" master: answers /health with our service signature, but
+    // its IPC pipe destroys every connection, so the join handshake always
+    // fails. Split-brain repro: the old code advanced to the next port and
+    // promoted, fragmenting the cluster into two masters.
+    const httpServer = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ service: HEALTH_SERVICE }));
+    });
+    await new Promise<void>((resolve) => httpServer.listen(port, "127.0.0.1", resolve));
+    const ipcServer = net.createServer((socket) => {
+      setImmediate(() => socket.destroy()); // REGISTER dies immediately
+    });
+    await new Promise<void>((resolve) => ipcServer.listen(ipcPath, resolve));
+
+    try {
+      await expect(
+        bootstrapCluster({
+          basePort: port,
+          host: "127.0.0.1",
+          ipcPath,
+          executor: new ToolExecutor(),
+          workspaceId: "ws-join-fail",
+          workspacePaths: ["/mnt/join-fail"],
+          displayName: "Join Fail",
+          log: (m) => logs.push(m),
+        }),
+      ).rejects.toThrow(/Could not elect or join/);
+
+      // Every attempt must target the live master's port — never a
+      // promotion on a higher port.
+      expect(logs.filter((l) => l.includes("Promoted to master"))).toHaveLength(0);
+      expect(logs.some((l) => l.includes(`Join on port ${port} failed`))).toBe(true);
+
+      // And the next port was never bound for promotion.
+      const nextPortFree = await new Promise<boolean>((resolve) => {
+        const srv = http.createServer();
+        srv.once("error", () => resolve(false));
+        srv.listen(port + 1, "127.0.0.1", () => srv.close(() => resolve(true)));
+      });
+      expect(nextPortFree).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => ipcServer.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      try {
+        fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+    }
+  }, 10_000);
+
+  it("a second master cannot steal a live master's IPC socket", async () => {
+    const port = await findFreePort();
+    const ipcPath = findFreeIpcPath();
+    const exec1 = new ToolExecutor();
+    exec1.registerTool(makeTool("echo", (a) => `m1: ${a.msg ?? ""}`));
+    const master1 = new MasterCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath,
+      executor: exec1,
+      workspaceId: "m1",
+      workspacePaths: ["/mnt/m1"],
+      displayName: "M1",
+    });
+    await master1.start();
+
+    const exec2 = new ToolExecutor();
+    exec2.registerTool(makeTool("echo", (a) => `m2: ${a.msg ?? ""}`));
+    const master2 = new MasterCoordinator({
+      port: port + 1,
+      host: "127.0.0.1",
+      ipcPath, // same path — a promoting window must NOT steal it
+      executor: exec2,
+      workspaceId: "m2",
+      workspacePaths: ["/mnt/m2"],
+      displayName: "M2",
+    });
+
+    let worker: WorkerCoordinator | null = null;
+    try {
+      await expect(master2.start()).rejects.toThrow();
+
+      // The live master's pipe must still serve workers normally.
+      worker = new WorkerCoordinator({
+        ipcPath,
+        executor: exec1,
+        workspaceId: "w1",
+        workspacePaths: ["/mnt/w"],
+        displayName: "W",
+      });
+      await worker.start();
+      expect(fs.existsSync(ipcPath)).toBe(true);
+    } finally {
+      if (worker) await worker.stop(300).catch(() => {});
+      await master2.stop(300).catch(() => {});
+      await master1.stop(500).catch(() => {});
+      try {
+        fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+    }
   });
 });
 
@@ -866,9 +1013,9 @@ describe("wire-level instance identity", () => {
 
   it("surfaces instanceId/instanceName in list_workspaces rows", async () => {
     const res = await toolCall("list_workspaces", {});
-    const parsed = JSON.parse(res.body.result.content[0].text);
-    const masterRow = parsed.find((e: any) => e.id === "master-ws");
-    const workerRow = parsed.find((e: any) => e.id === "worker-ws");
+    const parsed = JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
+    const masterRow = parsed.find((e) => e.id === "master-ws");
+    const workerRow = parsed.find((e) => e.id === "worker-ws");
     expect(masterRow.instanceId).toBe(MASTER_INSTANCE);
     expect(masterRow.instanceName).toBe("Master Instance");
     expect(workerRow.instanceId).toBe(WORKER_INSTANCE);
@@ -890,7 +1037,7 @@ describe("wire-level instance identity", () => {
       method: "tools/list",
       params: { workspace: WORKER_INSTANCE },
     });
-    const names = res.body.result.tools.map((t: any) => t.name);
+    const names = res.body.result.tools.map((t) => t.name);
     expect(names).toContain("echo");
     // Worker list must NOT include master-only list_workspaces.
     expect(names).not.toContain("list_workspaces");
