@@ -2,7 +2,7 @@
   "name": "vscode-ide-mcp",
   "displayName": "MCP Server for VS Code",
   "description": "MCP server that lets AI agents (opencode, Claude, Cursor) debug, edit, and control VS Code directly. Debugger, terminal, LSP, file ops.",
-  "version": "0.3.34",
+  "version": "0.3.40",
   "publisher": "nabheet",
   "license": "MIT",
   "repository": {
@@ -14,7 +14,7 @@
   },
   "homepage": "https://github.com/nabheet/vscode-mcp-server#readme",
   "engines": {
-    "vscode": "^1.134.0"
+    "vscode": "^1.138.0"
   },
   "icon": "icon.png",
   "categories": [
@@ -82,17 +82,17 @@
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "RUN_E2E=1 vitest run --config vitest.e2e.config.ts",
-    "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.ts"
+    "test:e2e": "RUN_E2E=1 vitest run --config vitest.e2e.config.mts",
+    "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.mts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
-    "@types/node": "^26.2.0",
-    "@types/vscode": "^1.134.0",
+    "@types/node": "^26.6.1",
+    "@types/vscode": "^1.138.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^3.9.2",
+    "@vscode/vsce": "^4.0.0",
     "markdownlint-cli2": "^0.23.3",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.1"
   }
 }
