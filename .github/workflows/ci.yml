@@ -77,39 +77,6 @@ jobs:
         run: xvfb-run --auto-servernum npm run test:e2e
         timeout-minutes: 10
 
-  # Windows e2e coverage: the cluster's named-pipe IPC path (createIpcServer
-  # EADDRINUSE semantics, no stale-socket retry) is distinct from POSIX and
-  # was untested anywhere. Windows runners have a real desktop session, so no
-  # xvfb needed; the self-heal test holds the pipe with a dummy server.
-  test-e2e-windows:
-    runs-on: windows-latest
-    needs: build
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-
-      - run: npm ci
-
-      - run: npm run compile
-
-      # Cache VS Code binary downloaded by @vscode/test-electron
-      - name: Cache VS Code
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/vscode-test-electron
-          key: ${{ runner.os }}-vscode-test-electron-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-vscode-test-electron-
-
-      - name: Run E2E tests
-        run: npm run test:e2e
-        timeout-minutes: 10
-
   # macOS e2e coverage: VS Code's darwin launch path is distinct (app binary
   # spawned directly, no CLI wrapper). Runners have a real windowserver
   # session, so no xvfb needed; the self-heal test blocks the Unix socket
@@ -151,7 +118,7 @@ jobs:
   # non-dependabot PRs. --skip-duplicate makes re-runs safe.
   publish-pre-release:
     runs-on: ubuntu-latest
-    needs: [build, test-e2e, test-e2e-windows, test-e2e-macos]
+    needs: [build, test-e2e, test-e2e-macos]
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&

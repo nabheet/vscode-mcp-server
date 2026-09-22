@@ -82,7 +82,7 @@
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "cross-env RUN_E2E=1 vitest run --config vitest.e2e.config.mts",
+    "test:e2e": "RUN_E2E=1 vitest run --config vitest.e2e.config.mts",
     "test:e2e:watch": "RUN_E2E=1 vitest --config vitest.e2e.config.mts"
   },
   "devDependencies": {
@@ -91,7 +91,6 @@
     "@types/vscode": "^1.138.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.0.0",
-    "cross-env": "^10.1.0",
     "markdownlint-cli2": "^0.23.3",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
