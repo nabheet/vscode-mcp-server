@@ -1,13 +1,13 @@
-import { spawn } from "child_process";
-import * as fs from "fs";
-import * as http from "http";
-import * as net from "net";
-import * as os from "os";
-import * as path from "path";
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCluster } from "../mcp/cluster/bootstrap";
 import { MAX_FRAME_BYTES, MSG } from "../mcp/cluster/constants";
-import { PortProbe, probePort } from "../mcp/cluster/election";
+import { probePort } from "../mcp/cluster/election";
 import { closeIpcServer, createIpcServer, isIpcAlive } from "../mcp/cluster/ipc";
 import { MasterCoordinator } from "../mcp/cluster/master";
 import {
@@ -70,7 +70,7 @@ function post(url: string, body: unknown): Promise<{ status: number; body: any }
   });
 }
 
-function get(url: string): Promise<{ status: number; body: any }> {
+function _get(url: string): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
     http
       .get(url, (res) => {
@@ -231,7 +231,7 @@ describe("cluster port probing", () => {
 
   it("probePort returns foreign for an occupied non-MCP HTTP server", async () => {
     const port = await findFreePort();
-    const srv = http.createServer((req, res) => {
+    const srv = http.createServer((_req, res) => {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "nothing here" }));
     });
@@ -286,7 +286,7 @@ describe("cluster IPC helpers", () => {
     // Node's normal close() auto-unlinks, so only a real crash leaves a
     // stale socket file behind — this is the exact scenario the recovery
     // path guards against.
-    const readyFile = ipcPath + ".ready";
+    const readyFile = `${ipcPath}.ready`;
     const child = spawn(
       process.execPath,
       [
@@ -518,6 +518,186 @@ describe("master-worker cluster", () => {
       expect(fs.existsSync(ipcPath)).toBe(false);
     }
   });
+});
+
+// ── Window state descriptor (issue #76) ─────────────────────────────
+
+describe("window state descriptor", () => {
+  let port: number;
+  let ipcPath: string;
+  let master: MasterCoordinator;
+  let worker: WorkerCoordinator;
+  let masterExec: ToolExecutor;
+  let workerExec: ToolExecutor;
+
+  beforeEach(async () => {
+    port = await findFreePort();
+    ipcPath = findFreeIpcPath();
+
+    masterExec = new ToolExecutor();
+    masterExec.registerTool(makeTool("echo", (a) => `echo from master: ${a.msg ?? ""}`));
+    workerExec = new ToolExecutor();
+    workerExec.registerTool(makeTool("echo", (a) => `echo from worker: ${a.msg ?? ""}`));
+
+    master = new MasterCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath,
+      executor: masterExec,
+      workspaceId: "master-ws",
+      workspacePaths: ["/mnt/master"],
+      displayName: "Master Window",
+      state: { activeFile: "/mnt/master/init.ts", openEditors: ["/mnt/master/init.ts"] },
+    });
+    await master.start();
+
+    worker = new WorkerCoordinator({
+      ipcPath,
+      executor: workerExec,
+      workspaceId: "worker-ws",
+      workspacePaths: ["/mnt/worker"],
+      displayName: "Worker Window",
+      state: { openEditors: ["/mnt/worker/a.ts"] },
+    });
+    await worker.start();
+  });
+
+  afterEach(async () => {
+    if (worker) await worker.stop(500).catch(() => {});
+    if (master) await master.stop(1000).catch(() => {});
+    if (process.platform !== "win32") {
+      try {
+        fs.unlinkSync(ipcPath);
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
+  const url = () => `http://127.0.0.1:${port}/mcp`;
+
+  function toolCall(name: string, args: Record<string, unknown>, extra?: Record<string, unknown>) {
+    return post(url(), {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args, ...extra },
+    });
+  }
+
+  async function listRows(): Promise<any[]> {
+    const res = await toolCall("list_workspaces", {});
+    return JSON.parse(res.body.result.content[0].text);
+  }
+
+  it("carries initial state in REGISTER and list_workspaces rows", async () => {
+    const rows = await listRows();
+    const masterRow = rows.find((e: any) => e.id === "master-ws");
+    const workerRow = rows.find((e: any) => e.id === "worker-ws");
+    expect(masterRow.state).toEqual({
+      activeFile: "/mnt/master/init.ts",
+      openEditors: ["/mnt/master/init.ts"],
+    });
+    expect(workerRow.state).toEqual({ openEditors: ["/mnt/worker/a.ts"] });
+  });
+
+  it("defaults state to empty openEditors when not provided", async () => {
+    const socket = net.createConnection(ipcPath);
+    const msgs: IpcMessage[] = [];
+    const decode = createDecoder((m) => msgs.push(m));
+    socket.on("data", (c: Buffer) => decode(c));
+    socket.on("error", () => {});
+    await new Promise<void>((resolve) => {
+      socket.on("connect", () => {
+        socket.write(
+          encodeMessage({
+            type: MSG.REGISTER,
+            id: "bare-ws",
+            workspacePaths: [],
+            displayName: "Bare",
+          }),
+        );
+        resolve();
+      });
+    });
+    await vi.waitFor(() => expect(msgs.some((m) => m.type === MSG.WELCOME)).toBe(true), {
+      timeout: 3000,
+    });
+    const rows = await listRows();
+    const bare = rows.find((e: any) => e.id === "bare-ws");
+    expect(bare.state).toEqual({ openEditors: [] });
+    socket.destroy();
+  }, 10_000);
+
+  it("propagates worker state updates via MSG.UPDATE", async () => {
+    worker.updateState({ activeFile: "/mnt/worker/b.ts", openEditors: ["/mnt/worker/b.ts"] });
+    await vi.waitFor(
+      () => {
+        return listRows().then((rows: any[]) => {
+          const workerRow = rows.find((e: any) => e.id === "worker-ws");
+          expect(workerRow.state).toEqual({
+            activeFile: "/mnt/worker/b.ts",
+            openEditors: ["/mnt/worker/b.ts"],
+          });
+        });
+      },
+      { timeout: 3000 },
+    );
+  }, 10_000);
+
+  it("ignores state updates from an unregistered socket", async () => {
+    const socket = net.createConnection(ipcPath);
+    socket.on("error", () => {});
+    await new Promise<void>((resolve) => {
+      socket.on("connect", () => resolve());
+    });
+    // No REGISTER: MSG.UPDATE must be dropped, not crash the master.
+    socket.write(encodeMessage({ type: MSG.UPDATE, state: { openEditors: ["/x/y.ts"] } }));
+    await new Promise((r) => setTimeout(r, 300));
+    const rows = await listRows();
+    expect(rows.find((e: any) => e.id === "worker-ws").state).toEqual({
+      openEditors: ["/mnt/worker/a.ts"],
+    });
+    socket.destroy();
+  }, 10_000);
+
+  it("lets the master publish its own window state", async () => {
+    master.updateState({ activeFile: "/mnt/master/next.ts", openEditors: ["/mnt/master/next.ts"] });
+    const rows = await listRows();
+    expect(rows.find((e: any) => e.id === "master-ws").state).toEqual({
+      activeFile: "/mnt/master/next.ts",
+      openEditors: ["/mnt/master/next.ts"],
+    });
+  });
+
+  it("sanitizes malformed worker state on the wire", async () => {
+    const socket = net.createConnection(ipcPath);
+    const msgs: IpcMessage[] = [];
+    const decode = createDecoder((m) => msgs.push(m));
+    socket.on("data", (c: Buffer) => decode(c));
+    socket.on("error", () => {});
+    await new Promise<void>((resolve) => {
+      socket.on("connect", () => {
+        socket.write(
+          encodeMessage({
+            type: MSG.REGISTER,
+            id: "dirty-ws",
+            workspacePaths: [],
+            displayName: "Dirty",
+            state: { activeFile: 42, openEditors: ["/ok.ts", 7] },
+          }),
+        );
+        resolve();
+      });
+    });
+    await vi.waitFor(() => expect(msgs.some((m) => m.type === MSG.WELCOME)).toBe(true), {
+      timeout: 3000,
+    });
+    const rows = await listRows();
+    const dirty = rows.find((e: any) => e.id === "dirty-ws");
+    expect(dirty.state).toEqual({ openEditors: ["/ok.ts"] });
+    socket.destroy();
+  }, 10_000);
 });
 
 // ── End-to-end bootstrap ─────────────────────────────────────────────

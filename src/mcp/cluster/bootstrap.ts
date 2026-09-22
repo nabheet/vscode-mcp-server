@@ -21,6 +21,7 @@ import type { ToolExecutor } from "../executor";
 import { getIpcPath, MAX_ELECTION_ATTEMPTS, MAX_PORT_SCAN, REELECT_JITTER_MS } from "./constants";
 import { jitter, probePort, sleep } from "./election";
 import { MasterCoordinator } from "./master";
+import type { WindowState } from "./protocol";
 import { WorkerCoordinator } from "./worker";
 
 export type ClusterMember = MasterCoordinator | WorkerCoordinator;
@@ -42,6 +43,8 @@ export interface BootstrapOptions {
   instanceId?: string;
   /** Human-readable window name (defaults to displayName). */
   instanceName?: string;
+  /** Initial window state (active file / open editors). */
+  state?: WindowState;
   log?: (msg: string) => void;
 }
 
@@ -111,6 +114,7 @@ async function tryJoin(
     displayName: opts.displayName,
     instanceId: opts.instanceId ?? opts.workspaceId,
     instanceName: opts.instanceName ?? opts.displayName,
+    state: opts.state,
     log: opts.log,
     // Re-election is wired by the owner (extension.ts) after the member is
     // returned: it must stop this worker, re-run bootstrapCluster, and swap
@@ -149,6 +153,7 @@ async function tryPromote(
     displayName: opts.displayName,
     instanceId: opts.instanceId ?? opts.workspaceId,
     instanceName: opts.instanceName ?? opts.displayName,
+    state: opts.state,
     log: opts.log,
   });
   try {

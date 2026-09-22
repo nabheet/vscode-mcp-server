@@ -12,7 +12,7 @@
  * Pure Node (no vscode API); workspace identity, executor, and the
  * re-election callback are injected by extension.ts.
  */
-import type * as net from "net";
+import type * as net from "node:net";
 import type { JsonRpcResponse } from "../../utils/types";
 import { BusyError, type ToolExecutor } from "../executor";
 import {
@@ -48,6 +48,7 @@ export class WorkerCoordinator {
   private socket: net.Socket | null = null;
   private stopped = false;
   private registered = false;
+  private state: WindowState = { openEditors: [] };
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private lastPongAt = 0;
   private missedPongs = 0;
@@ -57,6 +58,7 @@ export class WorkerCoordinator {
   constructor(opts: WorkerOptions) {
     this.opts = opts;
     this.ipcPath = opts.ipcPath ?? getIpcPath();
+    if (opts.state) this.state = opts.state;
   }
 
   async start(): Promise<void> {
@@ -97,6 +99,7 @@ export class WorkerCoordinator {
         displayName: this.opts.displayName,
         instanceId: this.opts.instanceId,
         instanceName: this.opts.instanceName,
+        state: this.state,
       }),
     );
     await Promise.race([
@@ -124,6 +127,22 @@ export class WorkerCoordinator {
   /** Wire re-election. Called by the cluster owner after every election. */
   setOnLostMaster(handler: (reason: string) => void): void {
     this.lostMasterHandler = handler;
+  }
+
+  /**
+   * Publish a window-state change (active file / open editors) to the
+   * Master. Before registration the value is only stored locally — it is
+   * carried in the REGISTER payload so the Master never sees a window
+   * without state. After REGISTERED, each call sends MSG.UPDATE over IPC.
+   */
+  updateState(state: WindowState): void {
+    this.state = state;
+    if (!this.registered || !this.socket || this.socket.destroyed) return;
+    try {
+      this.socket.write(encodeMessage({ type: MSG.UPDATE, state }));
+    } catch {
+      this.failOver("UPDATE write failed");
+    }
   }
 
   async stop(timeoutMs = 3000): Promise<void> {

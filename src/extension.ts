@@ -1,18 +1,56 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
+import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
 import { Metrics } from "./utils/metrics";
 import { ServerLog } from "./utils/serverLog";
 
 const OUTPUT_CHANNEL_NAME = "VS Code MCP Server";
-const DEFAULT_PORT = 6010;
+const DEFAULT_PORT = 9876;
 
 let outputChannel: vscode.OutputChannel | null = null;
 let member: ClusterMember | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
 let electing = false;
+/** Debounce timer for window-state pushes to the cluster. */
+let statePushTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Snapshot this window's editor state (active file + open editors) for
+ * list_workspaces, so clients can tell windows apart even when they share
+ * a folder and display name.
+ */
+function currentWindowState(): WindowState {
+  const openEditors: string[] = [];
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      let uri: vscode.Uri | undefined;
+      if (tab.input instanceof vscode.TabInputText) {
+        uri = tab.input.uri;
+      } else if (tab.input instanceof vscode.TabInputTextDiff) {
+        uri = tab.input.modified;
+      }
+      if (uri?.scheme === "file") {
+        const p = uri.fsPath;
+        if (!openEditors.includes(p)) openEditors.push(p);
+      }
+    }
+  }
+  const active = vscode.window.activeTextEditor?.document.uri;
+  const activeFile = active?.scheme === "file" ? active.fsPath : undefined;
+  return activeFile ? { activeFile, openEditors } : { openEditors };
+}
+
+/** Debounce rapid editor/tab churn into a single cluster state update. */
+function scheduleStatePush(): void {
+  if (statePushTimer) clearTimeout(statePushTimer);
+  statePushTimer = setTimeout(() => {
+    statePushTimer = undefined;
+    member?.updateState(currentWindowState());
+  }, 300);
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
@@ -23,7 +61,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const logDir = context.logUri?.scheme === "file" ? context.logUri.fsPath : undefined;
   const fileLog = logDir ? new ServerLog(logDir) : undefined;
   if (fileLog) {
-    outputChannel.appendLine("[mcp] JSON log: " + logDir);
+    outputChannel.appendLine(`[mcp] JSON log: ${logDir}`);
     fileLog.log({
       type: "lifecycle",
       event: "activate",
@@ -56,9 +94,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   if (isRemoteContainer) {
     outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
-    outputChannel.appendLine(
-      '[mcp] Ensure devcontainer.json includes: "forwardPorts": [' + port + "]",
-    );
+    outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
   }
   if (authToken) {
     outputChannel.appendLine(
@@ -66,7 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   }
   if (useTls) {
-    outputChannel.appendLine("[mcp] TLS enabled — using cert: " + tlsCertPath);
+    outputChannel.appendLine(`[mcp] TLS enabled — using cert: ${tlsCertPath}`);
   }
 
   // This window's cluster identity. The id must be unique per window (even
@@ -104,9 +140,19 @@ export function activate(context: vscode.ExtensionContext): void {
     displayName,
     instanceId,
     instanceName,
+    state: currentWindowState(),
     isRemoteContainer,
-    log: (msg: string) => outputChannel?.appendLine("[mcp] " + msg),
+    log: (msg: string) => outputChannel?.appendLine(`[mcp] ${msg}`),
   });
+
+  // Keep list_workspaces state fresh: push active file / open editors on
+  // editor and tab changes (debounced so bursty events coalesce).
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => scheduleStatePush()),
+    vscode.window.tabGroups.onDidChangeTabs(() => scheduleStatePush()),
+    vscode.workspace.onDidOpenTextDocument(() => scheduleStatePush()),
+    vscode.workspace.onDidCloseTextDocument(() => scheduleStatePush()),
+  );
 
   // Listen for config changes
   context.subscriptions.push(
@@ -146,6 +192,7 @@ interface ClusterStartOptions {
   displayName: string;
   instanceId: string;
   instanceName: string;
+  state: WindowState;
   isRemoteContainer: boolean;
   log: (msg: string) => void;
 }
@@ -168,6 +215,7 @@ async function startCluster(opts: ClusterStartOptions): Promise<void> {
       displayName: opts.displayName,
       instanceId: opts.instanceId,
       instanceName: opts.instanceName,
+      state: opts.state,
       log: opts.log,
     });
 
@@ -178,6 +226,10 @@ async function startCluster(opts: ClusterStartOptions): Promise<void> {
       await old.stop(500).catch(() => {});
     }
     member = newMember;
+    // State captured at activation may be stale after election; push the
+    // freshest snapshot once the member is wired. Debounced pushes handle
+    // the rest.
+    newMember.updateState(currentWindowState());
 
     if (newMember.role === "worker") {
       newMember.setOnLostMaster((reason: string) => {
@@ -186,17 +238,17 @@ async function startCluster(opts: ClusterStartOptions): Promise<void> {
       });
     } else {
       newMember.setOnListen((url: string) => {
-        let msg = "MCP server listening on " + url;
+        let msg = `MCP server listening on ${url}`;
         if (opts.isRemoteContainer) msg += " (remote container — use forwarded port)";
         if (opts.authToken) msg += " [auth enabled]";
         opts.log(msg);
-        console.log("[vscode-mcp-server] " + msg);
+        console.log(`[vscode-mcp-server] ${msg}`);
       });
     }
     updateStatusBar(newMember);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    opts.log("FATAL cluster startup: " + msg);
+    opts.log(`FATAL cluster startup: ${msg}`);
   } finally {
     electing = false;
   }
@@ -210,7 +262,7 @@ function updateStatusBar(m: ClusterMember): void {
   }
   if (m.role === "master") {
     statusBar.text = `$(server) MCP :${m.port}`;
-    statusBar.tooltip = "MCP cluster master — serving " + m.port;
+    statusBar.tooltip = `MCP cluster master — serving ${m.port}`;
     statusBar.backgroundColor = undefined;
   } else {
     statusBar.text = "$(plug) MCP worker";

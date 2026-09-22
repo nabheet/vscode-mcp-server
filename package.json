@@ -51,7 +51,7 @@
       "properties": {
         "vscode-mcp-server.port": {
           "type": "number",
-          "default": 6010,
+          "default": 9876,
           "description": "Base port for the MCP HTTP server. The first VS Code window becomes the cluster master and owns this port; other windows join as workers on the same port."
         },
         "vscode-mcp-server.authToken": {

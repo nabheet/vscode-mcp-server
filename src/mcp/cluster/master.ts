@@ -13,8 +13,8 @@
  * injected by extension.ts, which keeps this layer unit-testable.
  */
 
-import { randomUUID } from "crypto";
-import type * as net from "net";
+import { randomUUID } from "node:crypto";
+import type * as net from "node:net";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { JsonRpcResponse } from "../../utils/types";
@@ -23,7 +23,7 @@ import { type McpRouter, type McpRouterResult, McpServer } from "../server";
 import { defineTool } from "../tools/index";
 import { getIpcPath, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
 import { closeIpcServer, createIpcServer, unlinkStaleSocketFile } from "./ipc";
-import { createDecoder, encodeMessage, type IpcMessage } from "./protocol";
+import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
 
 interface WorkerEntry {
   id: string;
@@ -32,6 +32,8 @@ interface WorkerEntry {
   /** Stable per-window UUID sent in REGISTER (wire-level identity). */
   instanceId?: string;
   instanceName?: string;
+  /** Latest window state (active file / open editors) from MSG.UPDATE. */
+  state?: WindowState;
   socket: net.Socket;
 }
 
@@ -58,6 +60,8 @@ export interface MasterOptions {
   /** Stable per-window UUID for the master's own list_workspaces row. */
   instanceId?: string;
   instanceName?: string;
+  /** Initial window state (active file / open editors) for the master row. */
+  state?: WindowState;
   log?: (msg: string) => void;
 }
 
@@ -70,6 +74,7 @@ export class MasterCoordinator implements McpRouter {
   private server: McpServer;
   private ipcServer: net.Server | null = null;
   private sockets = new Set<net.Socket>();
+  private localState: WindowState = { openEditors: [] };
   /** Per-connection state: registration status + worker id (set on REGISTER). */
   private ipcPeer = new Map<net.Socket, { registered: boolean; entryId: string | null }>();
   private workers = new Map<string, WorkerEntry>();
@@ -79,6 +84,7 @@ export class MasterCoordinator implements McpRouter {
   constructor(opts: MasterOptions) {
     this.opts = opts;
     this.ipcPath = opts.ipcPath ?? getIpcPath();
+    if (opts.state) this.localState = opts.state;
 
     this.server = new McpServer({
       port: opts.port,
@@ -109,6 +115,7 @@ export class MasterCoordinator implements McpRouter {
               displayName: opts.displayName,
               folders: opts.workspacePaths,
               role: "master",
+              state: this.localState,
             },
             ...Array.from(this.workers.values()).map((w) => ({
               id: w.id,
@@ -117,6 +124,7 @@ export class MasterCoordinator implements McpRouter {
               displayName: w.displayName,
               folders: w.workspacePaths,
               role: "worker",
+              state: w.state ?? { openEditors: [] },
             })),
           ];
           return {
@@ -201,7 +209,7 @@ export class MasterCoordinator implements McpRouter {
       return {
         jsonrpc: "2.0",
         id,
-        error: { code: -32603, message: "Worker execution failed: " + msg },
+        error: { code: -32603, message: `Worker execution failed: ${msg}` },
       } as JsonRpcResponse;
     });
     return { body, response };
@@ -273,7 +281,7 @@ export class MasterCoordinator implements McpRouter {
       for (const e of all) {
         const ws = normalize(e.path);
         if (!ws) continue;
-        if (norm === ws || norm.startsWith(ws + "/") || norm.startsWith(ws + "\\")) {
+        if (norm === ws || norm.startsWith(`${ws}/`) || norm.startsWith(`${ws}\\`)) {
           if (!best || ws.length > best.len) {
             best = { id: e.id, len: ws.length };
           } else if (ws.length === best.len && best.id !== "local" && e.id === "local") {
@@ -321,9 +329,7 @@ export class MasterCoordinator implements McpRouter {
       try {
         this.onIpcMessage(socket, msg);
       } catch (err) {
-        this.log(
-          "[master] IPC handler error: " + (err instanceof Error ? err.message : String(err)),
-        );
+        this.log(`[master] IPC handler error: ${err instanceof Error ? err.message : String(err)}`);
         socket.destroy();
       }
     });
@@ -380,6 +386,7 @@ export class MasterCoordinator implements McpRouter {
           displayName,
           instanceId: typeof msg.instanceId === "string" ? msg.instanceId : undefined,
           instanceName: typeof msg.instanceName === "string" ? msg.instanceName : undefined,
+          state: this.normalizeWindowState(msg.state),
           socket,
         });
         const state = this.ipcPeer.get(socket);
@@ -398,6 +405,17 @@ export class MasterCoordinator implements McpRouter {
           socket.write(encodeMessage({ type: MSG.PONG }));
         } catch {
           /* peer gone */
+        }
+        break;
+      }
+      case MSG.UPDATE: {
+        // Worker publishes window state (active file / open editors).
+        const peer = this.ipcPeer.get(socket);
+        if (peer?.entryId) {
+          const entry = this.workers.get(peer.entryId);
+          if (entry) {
+            entry.state = this.normalizeWindowState(msg.state);
+          }
         }
         break;
       }
@@ -435,6 +453,26 @@ export class MasterCoordinator implements McpRouter {
 
   private log(msg: string): void {
     this.opts.log?.(msg);
+  }
+
+  /**
+   * Publish the master window's own state (active file / open editors).
+   * The master row in list_workspaces reflects the latest value. No IPC
+   * message is needed — the master already owns its row locally.
+   */
+  updateState(state: WindowState): void {
+    this.localState = state;
+  }
+
+  /** Coerce an untrusted wire value into a valid WindowState. */
+  private normalizeWindowState(value: unknown): WindowState {
+    if (typeof value !== "object" || value === null) return { openEditors: [] };
+    const v = value as Record<string, unknown>;
+    const openEditors = Array.isArray(v.openEditors)
+      ? v.openEditors.filter((p): p is string => typeof p === "string")
+      : [];
+    const activeFile = typeof v.activeFile === "string" ? v.activeFile : undefined;
+    return { openEditors, ...(activeFile !== undefined ? { activeFile } : {}) };
   }
 }
 

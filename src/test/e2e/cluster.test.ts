@@ -375,6 +375,17 @@ describe("cluster master-worker (E2E)", () => {
     const folders = rows.flatMap((r) => (r.folders as string[]) ?? []);
     expect(folders.some((f) => f.endsWith("alpha"))).toBe(true);
     expect(folders.some((f) => f.endsWith("beta"))).toBe(true);
+
+    // Every window must expose a state descriptor (issue #76): openEditors
+    // is always an array; activeFile is a string when an editor is active.
+    for (const row of rows) {
+      const state = row.state as { activeFile?: unknown; openEditors?: unknown } | undefined;
+      expect(state).toBeDefined();
+      expect(Array.isArray(state?.openEditors)).toBe(true);
+      if (state?.activeFile !== undefined) {
+        expect(typeof state.activeFile).toBe("string");
+      }
+    }
   });
 
   // ── Targeting by instanceId ──────────────────────────────────────────

@@ -8,7 +8,7 @@
  */
 
 /** Default HTTP port the Master listens on. */
-export const DEFAULT_PORT = 6010;
+export const DEFAULT_PORT = 9876;
 
 /** /health response signature that identifies a valid Master. */
 export const HEALTH_SERVICE = "vscode-mcp-server";
