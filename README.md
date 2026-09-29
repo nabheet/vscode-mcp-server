@@ -135,9 +135,10 @@ VS Code Extension (onStartupFinished)
 
 Every VS Code window runs one cluster member. Exactly one window (the
 **leader**) owns the HTTP port; every other window (a **worker**) connects to
-it over a local IPC pipe. Clients connect to the single leader port and target
-a specific window via the `workspace` argument on `tools/call` / `tools/list`
-(see below).
+it over a local IPC pipe (or an HTTP member channel when it can't reach the
+IPC socket — see below). Clients connect to the single leader port and target
+a specific window via the `workspace` argument on `tools/call` / `tools/list`,
+or via a `workspaceFolder` tool argument (see below).
 
 Workers join the leader over one of two transports:
 
