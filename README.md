@@ -236,6 +236,10 @@ Accepted values:
 - a row `id` from `list_workspaces`
 - an `instanceId` (stable per-window UUID)
 - a folder path contained in that window's `folders`
+- a folder **basename** from that window's `folders` (e.g. `"my-project"` for
+  `/path/to/my-project`) — the shortest matching prefix wins, with the leader
+  keeping ties
+- a window's `displayName` / `instanceName`
 
 ```json
 {
@@ -249,6 +253,43 @@ Accepted values:
   }
 }
 ```
+
+Most MCP clients (opencode, Claude Code, …) don't support non-standard top-level
+`params` fields, so the leader also resolves routing references from **tool
+arguments**. On every `tools/call` it checks `arguments.workspace` and
+`arguments.workspaceFolder` using the same accepted values as above (id,
+instanceId, display name, folder path, or folder basename):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search_files",
+    "arguments": {
+      "query": "TODO",
+      "workspaceFolder": "my-project"
+    }
+  }
+}
+```
+
+Routing order per call:
+
+1. Top-level `params.workspace` — explicit window id/path/displayName.
+2. Tool argument `workspace` / `workspaceFolder` — same resolution, useful when
+   the client can't send top-level params. Tools that already interpret
+   `workspaceFolder` as a multi-root folder name work unchanged: the leader
+   resolves it first, then the target window's tool resolves it against that
+   window's own folders (by name **or** full path).
+3. Path inference — any string argument that looks like an absolute path or a
+   workspace-relative path is matched against each window's `folders` by
+   prefix/basename.
+
+An unresolved `workspaceFolder` reference falls through to path inference and
+finally the leader — the tool itself then reports "folder not found" against the
+leader's folders, so local multi-root behavior is preserved.
 
 Without `workspace`, calls target the leader window.
 

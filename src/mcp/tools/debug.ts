@@ -209,10 +209,17 @@ export function registerDebugTools(server: ToolRegistrar): void {
         const folders = vscode.workspace.workspaceFolders;
         let targetFolders: vscode.WorkspaceFolder[];
         if (args.folder) {
-          const found = folders?.find((f) => f.name === args.folder);
+          const ref = String(args.folder);
+          const found = folders?.find((f) => f.name === ref || f.uri.fsPath === ref);
           if (!found) {
+            const names = folders?.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
             return {
-              content: [{ type: "text", text: `Workspace folder '${args.folder}' not found` }],
+              content: [
+                {
+                  type: "text",
+                  text: `Workspace folder '${args.folder}' not found. Available folders: ${names ?? "(none)"}`,
+                },
+              ],
               isError: true,
             };
           }

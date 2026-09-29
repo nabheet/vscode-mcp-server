@@ -52,9 +52,10 @@ export function registerSearchTools(server: ToolRegistrar): void {
         // workspace (every folder) — grep semantics. With one, scope to it.
         let roots: vscode.Uri[];
         if (args.workspaceFolder) {
-          const folder = folders.find((f) => f.name === args.workspaceFolder);
+          const ref = String(args.workspaceFolder);
+          const folder = folders.find((f) => f.name === ref || f.uri.fsPath === ref);
           if (!folder) {
-            const names = folders.map((f) => f.name).join(", ");
+            const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
             return {
               content: [
                 {

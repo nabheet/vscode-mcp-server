@@ -663,6 +663,7 @@ describe("leader-worker cluster", () => {
       workspaceId: "worker-ws",
       workspacePaths: ["/mnt/worker"],
       displayName: "Worker Window",
+      instanceId: "worker-inst",
     });
     worker.setOnLostLeader((reason) => lostReasons.push(reason));
     await worker.start();
@@ -715,6 +716,41 @@ describe("leader-worker cluster", () => {
   it("routes to the worker by path-prefix inference on path-like args", async () => {
     const res = await toolCall("echo", { path: "/mnt/worker/package.json", msg: "x" });
     expect(res.body.result.content[0].text).toBe("echo from worker: x");
+  });
+
+  it("routes to the worker by basename-prefix inference on path-like args", async () => {
+    const res = await toolCall("echo", { path: "worker/src/main.ts", msg: "x" });
+    expect(res.body.result.content[0].text).toBe("echo from worker: x");
+  });
+
+  it("routes calls to a worker via a workspaceFolder argument (basename)", async () => {
+    const res = await toolCall("echo", { workspaceFolder: "worker", msg: "hi" });
+    expect(res.body.result.content[0].text).toBe("echo from worker: hi");
+  });
+
+  it("routes calls to a worker via a workspaceFolder argument (full path)", async () => {
+    const res = await toolCall("echo", { workspaceFolder: "/mnt/worker", msg: "hi" });
+    expect(res.body.result.content[0].text).toBe("echo from worker: hi");
+  });
+
+  it("routes calls to a worker via a workspaceFolder argument (display name)", async () => {
+    const res = await toolCall("echo", { workspaceFolder: "Worker Window", msg: "hi" });
+    expect(res.body.result.content[0].text).toBe("echo from worker: hi");
+  });
+
+  it("routes calls to a worker via a workspaceFolder argument (instance id)", async () => {
+    const res = await toolCall("echo", { workspaceFolder: "worker-inst", msg: "hi" });
+    expect(res.body.result.content[0].text).toBe("echo from worker: hi");
+  });
+
+  it("keeps workspaceFolder targeting the leader's own folder local", async () => {
+    const res = await toolCall("echo", { workspaceFolder: "leader", msg: "hi" });
+    expect(res.body.result.content[0].text).toBe("echo from leader: hi");
+  });
+
+  it("falls through to the leader for an unknown workspaceFolder argument", async () => {
+    const res = await toolCall("echo", { workspaceFolder: "nope", msg: "hi" });
+    expect(res.body.result.content[0].text).toBe("echo from leader: hi");
   });
 
   it("keeps calls under the leader path local", async () => {

@@ -1253,4 +1253,23 @@ describe("handler behavior", () => {
     expect(res.isError).toBe(false);
     expect(res.content[0].text).toContain("/ws/be/src/app.ts:1:7: const x = 1;");
   });
+
+  it("search_files accepts a full folder path as workspaceFolder", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "fe", uri: vscode.Uri.file("/ws/fe") },
+      { name: "be", uri: vscode.Uri.file("/ws/be") },
+    ];
+    mockSearchFiles({ "/ws/be/src/app.ts": "const x = 1;\n" }, [{ fsPath: "/ws/be/src/app.ts" }]);
+
+    const h = requireHandler(handlers, "search_files");
+    const res = await h({ query: "x =", workspaceFolder: "/ws/be" });
+
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: "/ws/be" }) }),
+      "**/node_modules/**",
+      2000,
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("/ws/be/src/app.ts:1:7: const x = 1;");
+  });
 });

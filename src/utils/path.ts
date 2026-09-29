@@ -10,8 +10,9 @@ import * as vscode from "vscode";
  * - Falls back to `path.resolve()` if no workspace folders are open.
  *
  * @param input - Absolute or relative file path.
- * @param folderName - Optional workspace folder name (for multi-root workspaces).
- *                     If provided, resolves relative paths against this folder.
+ * @param folderName - Optional workspace folder reference (for multi-root
+ *                     workspaces): the folder name or its full path. If
+ *                     provided, resolves relative paths against this folder.
  * @param allowOutsideWorkspace - When true, absolute paths outside all open
  *                     workspace folders are accepted. Used by tools whose
  *                     target is not a workspace file (e.g. breakpoints).
@@ -33,9 +34,12 @@ export function resolvePath(
     const folders = vscode.workspace.workspaceFolders;
     if (folders && folders.length > 0) {
       if (folderName) {
-        const folder = folders.find((f) => f.name === folderName);
+        const folder = folders.find(
+          (f) =>
+            f.name === folderName || path.normalize(f.uri.fsPath) === path.normalize(folderName),
+        );
         if (!folder) {
-          const names = folders.map((f) => f.name).join(", ");
+          const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
           throw new Error(
             `Workspace folder '${folderName}' not found. Available folders: ${names || "(none)"}`,
           );

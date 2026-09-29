@@ -86,6 +86,22 @@ describe("resolvePath", () => {
     expect(result.fsPath).toBe("/workspace/b/lib/util.ts");
   });
 
+  it("resolves relative path against a folder given as a full path", () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "a", uri: { fsPath: "/workspace/a" } },
+      { name: "b", uri: { fsPath: "/workspace/b" } },
+    ];
+    const result = resolvePath("lib/util.ts", "/workspace/b");
+    expect(result.fsPath).toBe("/workspace/b/lib/util.ts");
+  });
+
+  it("throws when folder path does not match any open folder", () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "frontend", uri: { fsPath: "/workspace/frontend" } },
+    ];
+    expect(() => resolvePath("src/main.ts", "/other/path")).toThrow(/not found/i);
+  });
+
   it("throws when named workspace folder does not exist", () => {
     (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
       { name: "frontend", uri: { fsPath: "/workspace/frontend" } },

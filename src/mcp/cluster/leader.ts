@@ -310,11 +310,25 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
       };
     }
     if (method === "tools/list") return "local";
+    // Routing refs may also arrive as tool arguments — the only channel real
+    // MCP clients (e.g. opencode) use. Resolve id/path/basename/displayName/
+    // instanceId; fall through to path inference when unresolved so tools keep
+    // their own "folder not found" errors for genuinely unknown names.
+    const argRef = extractArgWorkspaceRef(params);
+    if (argRef) {
+      const t = this.resolveWorkspaceRef(argRef);
+      if (t === "local") return "local";
+      if (t) return { workerId: t };
+    }
     const inferred = this.inferWorker(params);
     return inferred ? { workerId: inferred } : "local";
   }
 
-  /** Resolve a `workspace` argument: id, exact folder path, or folder name. */
+  /**
+   * Resolve a workspace reference: id, instance id, display name, exact folder
+   * path, or folder name (basename). Used for the top-level `workspace` param
+   * and for `workspace`/`workspaceFolder` tool arguments alike.
+   */
   private resolveWorkspaceRef(ref: string): "local" | string | null {
     if (ref === this.opts.workspaceId || ref === this.opts.instanceId) return "local";
     if (this.opts.workspacePaths.some((p) => p === ref || basename(p) === ref)) return "local";
@@ -354,7 +368,17 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
       for (const e of all) {
         const ws = normalize(e.path);
         if (!ws) continue;
-        if (norm === ws || norm.startsWith(`${ws}/`) || norm.startsWith(`${ws}\\`)) {
+        const base = basename(ws);
+        if (
+          norm === ws ||
+          norm.startsWith(`${ws}/`) ||
+          norm.startsWith(`${ws}\\`) ||
+          // Folder-name refs (e.g. `workspaceFolder: "worker"`) and
+          // folder-relative paths ("worker/src/main.ts") resolve to the
+          // window whose workspace basename matches.
+          (base.length > 0 &&
+            (norm === base || norm.startsWith(`${base}/`) || norm.startsWith(`${base}\\`)))
+        ) {
           if (!best || ws.length > best.len) {
             best = { id: e.id, len: ws.length };
           } else if (ws.length === best.len && best.id !== "local" && e.id === "local") {
@@ -685,6 +709,23 @@ function stripWorkspaceArg(
 
 const PATH_KEY_RE = /(path|uri|file|folder|dir|cwd|root)/i;
 const ABS_RE = /^(\/|[a-zA-Z]:[\\/])/;
+
+/**
+ * Routing refs may arrive as tool arguments — the only channel standard MCP
+ * clients have. Prefers an explicit `workspace` argument over `workspaceFolder`
+ * so the routing contract works from either the top-level param or the args.
+ */
+function extractArgWorkspaceRef(params: Record<string, unknown> | undefined): string | undefined {
+  if (!params || typeof params.arguments !== "object" || params.arguments === null) {
+    return undefined;
+  }
+  const args = params.arguments as Record<string, unknown>;
+  for (const key of ["workspace", "workspaceFolder"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
 
 function collectPathCandidates(args: Record<string, unknown>): string[] {
   const out: string[] = [];
