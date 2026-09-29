@@ -1,6 +1,7 @@
 import { type ChildProcess, execSync, type SpawnOptions, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -179,7 +180,7 @@ function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: 
  *
  * Spawns TWO VS Code windows (distinct user-data dirs, distinct single-root
  * workspaces) sharing ONE cluster port. Election decides which becomes
- * leader; the other joins over IPC. The test then:
+ * leader; the other joins over the HTTP member channel. The test then:
  *  1. lists the cluster (2 rows, distinct instanceIds, one leader + one worker)
  *  2. targets each window BY instanceId and proves the calls land in the
  *     right window (folder listing + file content)
@@ -188,7 +189,6 @@ function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: 
 describe("cluster leader-worker (E2E)", () => {
   const procs: ChildProcess[] = [];
   let tmpDir: string | null = null;
-  let ipcPath: string;
   let port: number;
 
   beforeAll(async () => {
@@ -207,9 +207,6 @@ describe("cluster leader-worker (E2E)", () => {
 
     port = await findFreePort();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cl-"));
-    // Short socket name — macOS Unix socket paths must stay under ~103 chars
-    // (os.tmpdir() is already long: /var/folders/...).
-    ipcPath = path.join(tmpDir, "cl.sock");
 
     // Two single-root workspaces with distinct, greppable content
     const folderA = path.join(tmpDir, "alpha");
@@ -233,9 +230,9 @@ describe("cluster leader-worker (E2E)", () => {
     }
 
     // Two distinct user-data dirs = two distinct windows. BOTH windows share
-    // the SAME cluster port + IPC socket — the cluster elects exactly one
-    // leader; the other joins as worker. Settings carry the port (env vars
-    // don't reliably propagate through VS Code's extension host chain).
+    // the SAME cluster port — the cluster elects exactly one leader; the
+    // other joins as worker. Settings carry the port (env vars don't
+    // reliably propagate through VS Code's extension host chain).
     const spawns: Array<[string, string]> = [
       [folderA, "a"],
       [folderB, "b"],
@@ -271,7 +268,6 @@ describe("cluster leader-worker (E2E)", () => {
           ...process.env,
           MCP_PORT: String(port),
           MCP_SERVER_MAX_RETRIES: "1",
-          VSCODE_MCP_IPC_PATH: ipcPath,
         },
         stdio: ["ignore", "pipe", "pipe"],
       };
@@ -328,12 +324,6 @@ describe("cluster leader-worker (E2E)", () => {
         }
       }
       if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
-    }
-    // Stale IPC socket may outlive the leader on crash — remove defensively.
-    try {
-      fs.unlinkSync(ipcPath);
-    } catch {
-      /* already gone */
     }
   }, 20000);
 
@@ -549,7 +539,7 @@ describe("cluster leader-worker (E2E)", () => {
 
   // ── FATAL self-heal ──────────────────────────────────────────────────
 
-  it("cluster self-heals to leader after leader death + blocked IPC socket (no reload)", async () => {
+  it("cluster self-heals to leader after leader death + blocked port (no reload)", async () => {
     if (!ENABLED) return;
 
     // Identify the elected leader so we can kill it.
@@ -562,35 +552,36 @@ describe("cluster leader-worker (E2E)", () => {
     const leaderProc = procs[leaderFolder?.endsWith("alpha") ? 0 : 1];
     expect(leaderProc.pid, "leader process should be trackable").toBeTruthy();
 
-    // Kill the leader, then immediately block its IPC socket path with a
-    // directory: neither joining (connecting to a directory fails) nor
-    // promoting (bind fails EADDRINUSE) can succeed, so bootstrap exhausts
-    // its attempts and throws FATAL — the exact reported failure ("Could
-    // not elect or join a leader after N attempts"). Pre-fix, the window
-    // stayed dead until a manual reload.
+    // Kill the leader, then immediately squat on its port with a TCP server
+    // that accepts and immediately destroys sockets. The health probe then
+    // classifies the port as "timeout" (occupied but silent), so the
+    // survivor must NOT promote and must NOT advance to a higher port — it
+    // retries the SAME port and FATALs ("Could not elect or join a leader
+    // after N attempts"). Pre-fix, the window stayed dead until a manual
+    // reload.
     leaderProc.kill("SIGKILL");
-    // Block the socket path with a directory. The killed leader's
-    // extension-host child — or the survivor's fast promotion (triggered
-    // instantly when the IPC connection drops) — can re-create the socket
-    // file in the kill→block window, so retry removing + blocking until
-    // the directory actually sticks. Once it does, no future bind can
-    // recreate a file (bind on a directory path fails immediately).
-    let blocked = false;
-    for (let i = 0; i < 50 && !blocked; i++) {
-      fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
+
+    // The killed leader's socket may linger briefly (TIME_WAIT), so retry
+    // binding until the squat actually sticks. Once bound, nothing else can
+    // bind the port — promotion is impossible until we release it.
+    let blocker: net.Server | null = null;
+    for (let i = 0; i < 100 && !blocker; i++) {
       try {
-        fs.mkdirSync(ipcPath);
-        blocked = true;
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-        // Socket file reappeared mid-block — loop removes it again.
+        const srv = net.createServer((socket) => socket.destroy());
+        await new Promise<void>((resolve, reject) => {
+          srv.once("error", reject);
+          srv.listen(port, "127.0.0.1", resolve);
+        });
+        blocker = srv;
+      } catch {
+        // Port not yet released by the dead leader — try again.
         await new Promise((r) => setTimeout(r, 20));
       }
     }
-    expect(blocked, "should block the IPC socket path with a directory").toBe(true);
+    expect(blocker, "should block the leader port with a silent server").toBeTruthy();
 
     try {
-      // Leader is dead and the socket is blocked: MCP must be down.
+      // Leader is dead and the port is blocked: MCP must be down.
       await expectServerDown(port);
 
       // Hold the block long enough for the first bootstrap to exhaust its
@@ -598,7 +589,7 @@ describe("cluster leader-worker (E2E)", () => {
       // Lost-leader detection is ≤5s (heartbeat), so by 28s the candidate
       // has FATALed and scheduled its first retry.
       await new Promise((r) => setTimeout(r, 28000));
-      fs.rmSync(ipcPath, { recursive: true, force: true });
+      blocker.close();
 
       // Self-heal must happen WITHOUT any reload: the retry re-runs
       // startCluster and a leader comes back. Which window becomes leader
@@ -612,8 +603,8 @@ describe("cluster leader-worker (E2E)", () => {
       const healed = await waitForLeader(15000);
       expect(healed.role).toBe("leader");
     } finally {
-      // Restore the socket path so afterAll cleanup is uncomplicated.
-      fs.rmSync(ipcPath, { recursive: true, force: true });
+      // Restore the port so afterAll cleanup is uncomplicated.
+      blocker?.close();
     }
   }, 180000);
 });

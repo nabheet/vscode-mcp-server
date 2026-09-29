@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
-import { resolveIpcPath } from "./mcp/cluster/constants";
 import {
   buildBindHosts,
   buildCrossBoundaryHosts,
@@ -25,9 +24,9 @@ let electing = false;
 let statePushTimer: ReturnType<typeof setTimeout> | undefined;
 
 /**
- * Auto-retry after a FATAL cluster startup so transient IPC races (e.g. a
- * socket file momentarily unlinked during a reload) self-heal instead of
- * leaving the window with no cluster role until a manual reload.
+ * Auto-retry after a FATAL cluster startup so transient races (e.g. the
+ * leader dying mid-handshake) self-heal instead of leaving the window with
+ * no cluster role until a manual reload.
  */
 let startupRetryAttempt = 0;
 let startupRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -96,9 +95,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const authToken = config.get<string>("authToken") || process.env.MCP_AUTH_TOKEN || "";
   const tlsCertPath = config.get<string>("tlsCertPath") || process.env.MCP_TLS_CERT_PATH || "";
   const tlsKeyPath = config.get<string>("tlsKeyPath") || process.env.MCP_TLS_KEY_PATH || "";
-  // IPC path precedence: explicit setting → env var → default (see
-  // resolveIpcPath). All windows in the cluster must share the same value.
-  const ipcPath = resolveIpcPath(config.get<string>("ipcPath"), process.env.VSCODE_MCP_IPC_PATH);
   // Host to reach a Leader outside this container (Docker Desktop resolves
   // host.docker.internal to the host loopback). Setting/env only needed when
   // the default is wrong for the user's container networking.
@@ -138,7 +134,6 @@ export function activate(context: vscode.ExtensionContext): void {
   if (useTls) {
     outputChannel.appendLine(`[mcp] TLS enabled — using cert: ${tlsCertPath}`);
   }
-  outputChannel.appendLine(`[mcp] Cluster IPC path: ${ipcPath}`);
 
   // This window's cluster identity. The id must be unique per window (even
   // for two windows on the same folder) — the pid disambiguates.
@@ -170,7 +165,6 @@ export function activate(context: vscode.ExtensionContext): void {
     executor,
     metrics,
     logger: fileLog,
-    ipcPath,
     workspaceId,
     workspacePaths: workspaceFolders,
     displayName,
@@ -229,8 +223,6 @@ interface ClusterStartOptions {
   authToken: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
-  /** IPC socket/named-pipe path shared by all cluster windows. */
-  ipcPath?: string;
   executor: ToolExecutor;
   metrics: Metrics;
   logger?: ServerLog;
@@ -266,10 +258,10 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     // Seamless discovery: container windows probe the host leader through an
     // ordered chain (explicit leaderHost → host.docker.internal → detected
     // default gateway); host windows reach a container leader via the
-    // loopback valid-probe + HTTP-join fallback, so they need no
-    // cross-boundary hosts. host.docker.internal is only a valid default for
-    // Docker dev containers; any other remote only probes when leaderHost is
-    // set explicitly.
+    // loopback valid-probe + HTTP join, so they need no cross-boundary
+    // hosts. host.docker.internal is only a valid default for Docker dev
+    // containers; any other remote only probes when leaderHost is set
+    // explicitly.
     const gateway = opts.isDevContainer ? (opts.detectGateway ?? detectDefaultGateway)() : null;
     // Host leaders additionally bind detected Docker bridge addresses so
     // containers can reach them at <gateway>:port (Linux native Docker has
@@ -283,7 +275,6 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
       ...(bindHosts.length > 1 ? { hosts: bindHosts } : {}),
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
-      ...(opts.ipcPath ? { ipcPath: opts.ipcPath } : {}),
       ...(opts.isDevContainer
         ? { crossBoundaryHosts: buildCrossBoundaryHosts(opts.leaderHost, gateway) }
         : opts.leaderHost
@@ -336,9 +327,9 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     updateStatusBar(newMember);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Transient FATALs (e.g. the IPC socket file momentarily unlinked during a
-    // simultaneous reload) self-heal: retry with exponential backoff so the
-    // window still gets a cluster role without a manual reload.
+    // Transient FATALs (e.g. the leader dying mid-handshake) self-heal:
+    // retry with exponential backoff so the window still gets a cluster
+    // role without a manual reload.
     const delay = Math.min(STARTUP_RETRY_BASE_MS * 2 ** startupRetryAttempt, STARTUP_RETRY_MAX_MS);
     startupRetryAttempt += 1;
     opts.log(

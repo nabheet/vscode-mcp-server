@@ -81,8 +81,8 @@ jobs:
 
   # macOS e2e coverage: VS Code's darwin launch path is distinct (app binary
   # spawned directly, no CLI wrapper). Runners have a real windowserver
-  # session, so no xvfb needed; the self-heal test blocks the Unix socket
-  # with a directory exactly like local macOS runs.
+  # session, so no xvfb needed; the self-heal test squats on the leader port
+  # with a silent TCP server exactly like local macOS runs.
   test-e2e-macos:
     runs-on: macos-latest
     needs: build

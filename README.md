@@ -16,10 +16,9 @@ over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 2. **Reload VS Code** — the extension starts automatically on startup. The first window becomes the
    **leader** and listens on `http://127.0.0.1:9876`; additional windows on the same machine join as
-   **workers** over an IPC socket at `<tmpdir>/vscode-mcp/ipc.sock` (POSIX; named pipe on Windows) and
-   share the same port (the MCP client targets a window via a `workspace` argument). The socket path
-   is configurable via the `vscode-mcp-server.ipcPath` setting or `VSCODE_MCP_IPC_PATH` env var.
-   Windows in a dev container and windows on the host join the same cluster over an HTTP member
+   **workers** over the leader's HTTP member channel and share the same port (the MCP client targets
+   a window via a `workspace` argument).
+   Windows in a dev container and windows on the host join the same cluster over the same HTTP member
    channel instead — see [Cross-host clusters](#cross-host-clusters).
 
 3. **Configure your AI tool** (e.g., opencode) to connect via SSE:
@@ -52,16 +51,14 @@ VS Code Extension (onStartupFinished)
        ├─ server.ts            — HTTP server: CORS, auth, TLS, SSE transport, JSON-RPC dispatch
        ├─ transport.ts         — JSON-RPC 2.0 handler + MCP protocol lifecycle
        ├─ cluster/
-       │    ├─ election.ts     — Port probing (/health + IPC liveness) → valid | free | foreign | zombie
-       │    ├─ constants.ts    — Port/IPC/heartbeat/timeout constants + MSG protocol types
+       │    ├─ election.ts     — Port probing (/health) → valid | free | foreign | timeout
+       │    ├─ constants.ts    — Port/heartbeat/timeout constants + MSG protocol types
        │    ├─ leader.ts       — LeaderCoordinator: owns the HTTP port, routes tools/call
        │    │                    to workers, serves list_workspaces
-       │    ├─ worker.ts       — WorkerCoordinator: joins leader via IPC or HTTP
-       │    │                    member channel, heartbeat failover + re-election
+       │    ├─ worker.ts       — WorkerCoordinator: joins leader via HTTP member channel,
+       │    │                    heartbeat failover + re-election
        │    ├─ bootstrap.ts    — Bounded retry loop: promote (leader) or join (worker), with backoff
-       │    ├─ protocol.ts     — Length-prefixed JSON framing + WindowState for the IPC pipe
-       │    ├─ ipc.ts          — Unix-socket helpers (stale-socket recovery, liveness checks)
-       │    └─ memberTransport.ts — HTTP member channel (SSE stream + POST) for cross-host workers
+       │    └─ memberTransport.ts — HTTP member channel (SSE stream + POST) for all workers
        └─ tools/
             ├─ commands.ts     — Execute/catalog VS Code commands, get code actions
             ├─ navigation.ts   — Open files, jump to line/col, select, reveal, close editors
@@ -135,24 +132,15 @@ VS Code Extension (onStartupFinished)
 
 Every VS Code window runs one cluster member. Exactly one window (the
 **leader**) owns the HTTP port; every other window (a **worker**) connects to
-it over a local IPC pipe (or an HTTP member channel when it can't reach the
-IPC socket — see below). Clients connect to the single leader port and target
+it over the **HTTP member channel** — the same mechanism on one machine and
+across hosts (see below). Clients connect to the single leader port and target
 a specific window via the `workspace` argument on `tools/call` / `tools/list`,
 or via a `workspaceFolder` tool argument (see below).
-
-Workers join the leader over one of two transports:
-
-- **IPC** (default) — a Unix socket / named pipe on the same machine. The fast
-  path for multiple windows on one host.
-- **HTTP member channel** (cross-host) — used when a worker cannot reach the
-  leader's IPC socket, e.g. a dev-container window joining a leader on the
-  host, or a host window joining a leader inside a container.
 
 ### Cross-host clusters
 
 A VS Code **dev container** window and a window on the **host machine** join
-the same cluster automatically. Because containers do not share the host's IPC
-socket namespace, the worker joins the leader over HTTP instead:
+the same cluster automatically over the same HTTP member channel:
 
 - The leader publishes two extra routes on its HTTP port (only when cluster
   membership is enabled):
@@ -170,8 +158,8 @@ socket namespace, the worker joins the leader over HTTP instead:
 
 - A **Docker dev container** window probes the host leader through an ordered
   candidate chain, taking the first host that answers (or the first that is
-  free, in which case the container window promotes and the host window later
-  joins it via the loopback `valid` probe + HTTP join fallback):
+free, in which case the container window promotes and the host window later
+   joins it via the loopback `valid` probe + HTTP join):
   1. `vscode-mcp-server.leaderHost` / `MCP_LEADER_HOST` — explicit override
      (always wins when set);
   2. `host.docker.internal` — Docker Desktop / OrbStack resolve this to the
@@ -220,14 +208,14 @@ plus live editor state:
 ]
 ```
 
-- `role` — `"leader"` (owns the port) or `"worker"` (joined over IPC).
+- `role` — `"leader"` (owns the port) or `"worker"` (joined over HTTP).
 - `state.activeFile` — absolute path of the active editor, when one is open
   (omitted otherwise).
 - `state.openEditors` — absolute paths of all open editor tabs; always present.
 
 State is refreshed automatically as editors open, close, or change focus
-(debounced, pushed over IPC for workers), so two windows on the same folder
-are distinguishable by which files they have open.
+(debounced, pushed over the member channel for workers), so two windows on the
+same folder are distinguishable by which files they have open.
 
 ### Targeting a window
 
@@ -602,7 +590,7 @@ If the default port (9876) is busy, the leader scans up to 5 consecutive ports
 (9876..9880, controlled by `MCP_SERVER_MAX_RETRIES`). If a port is occupied by
 a non-MCP process, the next port is tried. The election loop retries the whole
 scan up to 8 times with exponential backoff; workers re-join the elected leader
-over IPC rather than taking their own port.
+over HTTP rather than taking their own port.
 
 ## Configuration
 
@@ -614,7 +602,6 @@ All settings under `vscode-mcp-server.*`:
 | `authToken` | `""` | Bearer token (empty = no auth). Warns if set without TLS |
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
-| `ipcPath` | `""` | Cluster IPC socket: `<tmpdir>/vscode-mcp/ipc.sock` POSIX, pipe Windows |
 | `leaderHost` | `""` | Container→host probe override; default `host.docker.internal` + gateway |
 
 Settings fall back to environment variables:
@@ -625,7 +612,6 @@ Settings fall back to environment variables:
 | `MCP_AUTH_TOKEN` | `authToken` | (none) |
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
 | `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
-| `VSCODE_MCP_IPC_PATH` | `ipcPath` | (none — `<tmpdir>/vscode-mcp/ipc.sock` POSIX) |
 | `MCP_LEADER_HOST` | `leaderHost` | (none — `host.docker.internal`, then gateway) |
 | `MCP_SERVER_MAX_RETRIES` | ports scanned per election (default 5, 9876–9880) | `5` |
 

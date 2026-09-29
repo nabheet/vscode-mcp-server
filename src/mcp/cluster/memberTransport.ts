@@ -4,33 +4,27 @@
  * The cluster protocol (REGISTER / WELCOME / CALL / RESULT / PING / PONG /
  * UPDATE) is transport-agnostic: the WorkerCoordinator talks to whichever
  * transport the bootstrap step chose, and the Leader talks to whichever
- * transport a peer connected over. Two implementations:
+ * transport a peer connected over.
  *
- *  - IpcMemberTransport: the local unix socket / named pipe, using the
- *    length-prefixed framing (connectIpc + encodeMessage / createDecoder).
- *    Used whenever both windows share a mount namespace.
- *  - HttpMemberTransport: the TCP/HTTP "member channel" for windows that
- *    CANNOT share the IPC pipe (dev container ↔ host). It rides the
- *    Leader's single HTTP port: SSE receive leg + POST send leg.
+ * Every Worker connects over the HTTP "member channel" on the Leader's
+ * single port — the same port the server already listens on, so no extra
+ * port or firewall rule is needed. This works for same-host windows AND
+ * across mount namespaces (dev container ↔ host). The channel is:
  *
- * The channel carries the exact same IpcMessage JSON; only the framing
- * differs. v1 has no cluster-specific auth: the channel relies on the same
- * origin/CORS guards as the rest of the server, plus the shared
+ *   Worker → Leader:  POST /cluster/message?id=<sessionId> (send leg)
+ *   Leader → Worker:  GET  /cluster/stream?id=<sessionId>  (SSE receive leg)
+ *
+ * The channel carries the exact same IpcMessage JSON; only the direction of
+ * the two legs differs. v1 has no cluster-specific auth: the channel relies
+ * on the same origin/CORS guards as the rest of the server, plus the shared
  * `authToken` when the server is configured with one.
  */
 import { randomUUID } from "node:crypto";
-import type * as net from "node:net";
-import {
-  CLUSTER_MESSAGE_PATH,
-  CLUSTER_STREAM_PATH,
-  IPC_CONNECT_TIMEOUT_MS,
-  MEMBER_HTTP_TIMEOUT_MS,
-} from "./constants";
-import { connectIpc } from "./ipc";
-import { createDecoder, encodeMessage, type IpcMessage } from "./protocol";
+import { CLUSTER_MESSAGE_PATH, CLUSTER_STREAM_PATH, MEMBER_HTTP_TIMEOUT_MS } from "./constants";
+import type { IpcMessage } from "./protocol";
 
 export interface MemberTransport {
-  readonly kind: "ipc" | "http";
+  readonly kind: "http";
   /** Set by the coordinator before connect(): a message arrived. */
   onMessage: ((msg: IpcMessage) => void) | null;
   /** Set by the coordinator before connect(): the channel is gone. */
@@ -54,56 +48,7 @@ export function memberBaseUrl(scheme: string, host: string, port: number): strin
   return `${scheme}://${h}:${port}`;
 }
 
-// ── IPC transport ────────────────────────────────────────────────────
-
-export class IpcMemberTransport implements MemberTransport {
-  readonly kind = "ipc" as const;
-  onMessage: ((msg: IpcMessage) => void) | null = null;
-  onClose: ((reason: string) => void) | null = null;
-  private socket: net.Socket | null = null;
-
-  constructor(
-    private readonly ipcPath: string,
-    private readonly connectTimeoutMs = IPC_CONNECT_TIMEOUT_MS,
-  ) {}
-
-  get destroyed(): boolean {
-    return this.socket === null || this.socket.destroyed;
-  }
-
-  async connect(): Promise<void> {
-    const socket = await connectIpc(this.ipcPath, this.connectTimeoutMs);
-    this.socket = socket;
-    socket.setNoDelay(true);
-
-    const decode = createDecoder((msg) => this.onMessage?.(msg));
-    socket.on("data", (chunk: Buffer) => {
-      try {
-        decode(chunk);
-      } catch {
-        this.onClose?.("corrupt IPC frame from leader");
-      }
-    });
-    socket.on("close", () => this.onClose?.("IPC socket closed"));
-    socket.on("error", () => this.onClose?.("IPC socket error"));
-  }
-
-  send(msg: IpcMessage): void {
-    if (!this.socket || this.socket.destroyed) return;
-    try {
-      this.socket.write(encodeMessage(msg));
-    } catch {
-      /* peer gone — close handler owns cleanup */
-    }
-  }
-
-  close(): void {
-    this.socket?.destroy();
-    this.socket = null;
-  }
-}
-
-// ── HTTP member transport (cross-namespace) ──────────────────────────
+// ── HTTP member transport ─────────────────────────────────────────────
 
 export interface HttpMemberTransportOptions {
   /** e.g. `http://127.0.0.1:9876` or `http://host.docker.internal:9876`. */

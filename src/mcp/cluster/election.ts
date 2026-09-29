@@ -4,22 +4,22 @@
  * Before binding a port (or joining an existing Leader), a candidate probes
  * `GET /health` on the port. The four outcomes map to distinct actions:
  *
- *  - valid    → our service: join it as a Worker.
+ *  - valid    → our service: join it as a Worker over the HTTP member channel.
  *  - free     → nothing listening: try to promote to Leader.
  *  - foreign  → an unrelated app: increment the port and retry.
- *  - zombie   → occupied, no HTTP signature, but the IPC socket is alive:
- *               this is a frozen/starting Leader. Do NOT increment the port
- *               (that would fragment the cluster); retry registration.
+ *  - timeout  → occupied but silent (a frozen/starting Leader, or a
+ *               non-HTTP app that ignores /health). Do NOT increment the
+ *               port and do NOT promote — that would fragment the cluster;
+ *               retry the same port on the next attempt.
  */
 import * as http from "http";
 import { HEALTH_SERVICE, PROBE_TIMEOUT_MS } from "./constants";
-import { isIpcAlive } from "./ipc";
 
 export type PortProbe =
   | { status: "valid" }
   | { status: "free" }
   | { status: "foreign" }
-  | { status: "zombie" };
+  | { status: "timeout" };
 
 interface HealthResult {
   kind: "service" | "other" | "refused" | "timeout";
@@ -58,11 +58,7 @@ function getHealth(port: number, host = "127.0.0.1"): Promise<HealthResult> {
   });
 }
 
-export async function probePort(
-  port: number,
-  ipcPath: string,
-  host = "127.0.0.1",
-): Promise<PortProbe> {
+export async function probePort(port: number, host = "127.0.0.1"): Promise<PortProbe> {
   const health = await getHealth(port, host);
   switch (health.kind) {
     case "service":
@@ -71,30 +67,22 @@ export async function probePort(
       return { status: "free" };
     case "other":
       return { status: "foreign" };
-    case "timeout": {
-      // Occupied but silent. Could be an unrelated app that ignores /health
-      // OR a frozen Leader. The IPC socket disambiguates — but only when the
-      // IPC path is reachable from THIS namespace (it is for a same-namespace
-      // probe). Cross-boundary probes cannot use IPC; they call probeHost.
-      const alive = await isIpcAlive(ipcPath);
-      return alive ? { status: "zombie" } : { status: "foreign" };
-    }
+    case "timeout":
+      // Occupied but silent: a frozen/starting Leader or an unrelated app
+      // that ignores /health. Indistinguishable over the member channel, so
+      // the caller retries the SAME port (never increments, never promotes).
+      return { status: "timeout" };
   }
 }
 
-export type HostProbe =
-  | { status: "valid" }
-  | { status: "free" }
-  | { status: "foreign" }
-  | { status: "timeout" };
-
 /**
  * Probe /health on a specific host:port (used for cross-boundary discovery,
- * where the local IPC pipe is NOT shared and zombie disambiguation is
- * impossible). A timeout is reported distinctly: it may be a frozen Leader,
- * so the caller should retry the same port rather than promote or skip.
+ * where the Leader is reachable over the member channel but not through any
+ * local socket). A timeout is reported distinctly: it may be a frozen
+ * Leader, so the caller should retry the same port rather than promote or
+ * skip.
  */
-export async function probeHost(port: number, host: string): Promise<HostProbe> {
+export async function probeHost(port: number, host: string): Promise<PortProbe> {
   const health = await getHealth(port, host);
   switch (health.kind) {
     case "service":

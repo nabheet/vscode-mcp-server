@@ -4,7 +4,7 @@
  * Responsibilities:
  *  - Serve the HTTP endpoint via McpServer (health, metrics, SSE, direct
  *    JSON-RPC) and execute calls targeting its own workspace locally.
- *  - Run the local IPC pipe that Workers connect to.
+ *  - Serve the HTTP member channel that Workers connect over.
  *  - Keep a routing table of connected Workers and proxy tool calls to the
  *    Worker whose workspace the request targets.
  *  - Respond to Worker heartbeats (PING → PONG).
@@ -15,51 +15,24 @@
 
 import { randomUUID } from "node:crypto";
 import type * as http from "node:http";
-import type * as net from "node:net";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { JsonRpcResponse } from "../../utils/types";
 import type { ToolExecutor } from "../executor";
 import { type McpRouter, type McpRouterResult, McpServer, type MemberChannel } from "../server";
 import { defineTool } from "../tools/index";
-import {
-  getIpcPath,
-  HEARTBEAT_INTERVAL_MS,
-  MSG,
-  PROXY_TIMEOUT_MS,
-  REGISTER_TIMEOUT_MS,
-} from "./constants";
-import { closeIpcServer, createIpcServer } from "./ipc";
-import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
+import { HEARTBEAT_INTERVAL_MS, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
+import type { IpcMessage, WindowState } from "./protocol";
 
 /**
- * A connected member (Worker) from the Leader's point of view. The protocol
- * is identical over IPC and the HTTP member channel — only framing differs.
+ * A connected member (Worker) from the Leader's point of view. Every member
+ * connects over the HTTP member channel (SSE receive leg + POST send leg).
  */
 interface MemberPeer {
-  readonly kind: "ipc" | "http";
+  readonly kind: "http";
   send(msg: IpcMessage): void;
   close(): void;
   readonly destroyed: boolean;
-}
-
-/** IPC peer: length-prefixed frames on the local socket. */
-class IpcPeer implements MemberPeer {
-  readonly kind = "ipc" as const;
-  constructor(private readonly socket: net.Socket) {}
-  get destroyed(): boolean {
-    return this.socket.destroyed;
-  }
-  send(msg: IpcMessage): void {
-    try {
-      this.socket.write(encodeMessage(msg));
-    } catch {
-      /* peer gone */
-    }
-  }
-  close(): void {
-    this.socket.destroy();
-  }
 }
 
 /** HTTP peer: SSE frames (`event: message`) on the member-channel stream. */
@@ -95,7 +68,7 @@ interface WorkerEntry {
   /** Latest window state (active file / open editors) from MSG.UPDATE. */
   state?: WindowState;
   peer: MemberPeer;
-  /** Session id for HTTP member peers (routes POST /cluster/message). */
+  /** Session id for the member channel (routes POST /cluster/message). */
   sessionId?: string;
 }
 
@@ -111,7 +84,6 @@ export interface LeaderOptions {
   host: string;
   /** Secondary bind addresses for the leader's HTTP server (Linux hosts). */
   hosts?: string[];
-  ipcPath?: string;
   authToken?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
@@ -134,10 +106,7 @@ type Target = "local" | { workerId: string } | { error: JsonRpcResponse };
 export class LeaderCoordinator implements McpRouter, MemberChannel {
   readonly role = "leader" as const;
   private readonly opts: LeaderOptions;
-  private readonly ipcPath: string;
   private server: McpServer;
-  private ipcServer: net.Server | null = null;
-  private sockets = new Set<net.Socket>();
   private localState: WindowState = { openEditors: [] };
   /** Per-peer connection state: registration status + worker id (REGISTER). */
   private peerState = new Map<MemberPeer, { registered: boolean; entryId: string | null }>();
@@ -148,7 +117,6 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
 
   constructor(opts: LeaderOptions) {
     this.opts = opts;
-    this.ipcPath = opts.ipcPath ?? getIpcPath();
     if (opts.state) this.localState = opts.state;
 
     this.server = new McpServer({
@@ -217,23 +185,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
   }
 
   async start(): Promise<void> {
-    // NOTE: no pre-unlink here. createIpcServer already recovers stale
-    // socket files safely (EADDRINUSE -> isIpcAlive -> unlink only if the
-    // holder is dead). Unlinking unconditionally would let a promoting
-    // window steal the IPC path from a LIVE leader — the split-brain bug.
-    this.ipcServer = await createIpcServer(this.ipcPath);
-    this.ipcServer.on("connection", (socket) => this.onIpcConnection(socket));
-    try {
-      await this.server.start();
-    } catch (err) {
-      // HTTP bind lost the race — undo the IPC server and let bootstrap
-      // re-probe (it will find the winner as a valid leader and join).
-      if (this.ipcServer) {
-        await closeIpcServer(this.ipcServer, this.sockets);
-        this.ipcServer = null;
-      }
-      throw err;
-    }
+    await this.server.start();
   }
 
   async stop(timeoutMs = 5000): Promise<void> {
@@ -245,18 +197,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     for (const peer of this.httpPeers.values()) peer.close();
     this.httpPeers.clear();
     await this.server.stop(timeoutMs);
-    if (this.ipcServer) {
-      await closeIpcServer(this.ipcServer, this.sockets);
-      this.ipcServer = null;
-    }
     this.workers.clear();
-    // Do NOT unlink this.ipcPath here. The socket path is cluster-shared, not
-    // owned by one leader: during a split-brain two leaders can exist, and one
-    // stopping must not remove the path the other is actively serving (that
-    // strands every worker in a permanent ENOENT loop). Stale-file recovery
-    // lives in createIpcServer (EADDRINUSE -> isIpcAlive -> unlink only when
-    // the holder is dead); if this process is dying the kernel closes the
-    // socket and the next promotion reclaims the path.
   }
 
   // ── Cluster routing (McpRouter) ────────────────────────────────────
@@ -408,48 +349,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     });
   }
 
-  // ── Peer connection side (IPC socket + HTTP member channel) ────────
-
-  private onIpcConnection(socket: net.Socket): void {
-    this.sockets.add(socket);
-    socket.setNoDelay(true);
-
-    const peer = new IpcPeer(socket);
-    const state = { registered: false, entryId: null as string | null };
-    this.peerState.set(peer, state);
-    const decode = createDecoder((msg) => {
-      try {
-        this.onPeerMessage(peer, msg);
-      } catch (err) {
-        this.log(`[leader] IPC handler error: ${err instanceof Error ? err.message : String(err)}`);
-        peer.close();
-      }
-    });
-
-    const regTimer = setTimeout(() => {
-      if (!state.registered) {
-        this.log("[leader] IPC peer did not REGISTER in time — closing");
-        peer.close();
-      }
-    }, REGISTER_TIMEOUT_MS);
-
-    socket.on("data", (chunk: Buffer) => {
-      try {
-        decode(chunk);
-      } catch {
-        peer.close(); // corrupt framing — drop the peer
-      }
-    });
-    socket.on("close", () => {
-      clearTimeout(regTimer);
-      this.peerState.delete(peer);
-      this.sockets.delete(socket);
-      if (state.entryId) this.dropWorker(state.entryId);
-    });
-    socket.on("error", () => {
-      /* close handler cleans up */
-    });
-  }
+  // ── Peer connection side (HTTP member channel) ──────────────────────
 
   /** Member channel SSE leg: registers a new HTTP peer for a session. */
   handleStream(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void {
@@ -568,7 +468,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
           instanceName: typeof msg.instanceName === "string" ? msg.instanceName : undefined,
           state: this.normalizeWindowState(msg.state),
           peer,
-          ...(peer.kind === "http" ? { sessionId: this.httpSessionId(peer) } : {}),
+          sessionId: this.httpSessionId(peer),
         };
         this.workers.set(id, entry);
         const state = this.peerState.get(peer);
@@ -614,7 +514,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     }
   }
 
-  /** Find the session id routing to an HTTP peer (for REGISTER bookkeeping). */
+  /** Find the session id routing to a member peer (for REGISTER bookkeeping). */
   private httpSessionId(peer: MemberPeer): string | undefined {
     for (const [sessionId, p] of this.httpPeers) {
       if (p === peer) return sessionId;
@@ -644,8 +544,9 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
 
   /**
    * Publish the leader window's own state (active file / open editors).
-   * The leader row in list_workspaces reflects the latest value. No IPC
-   * message is needed — the leader already owns its row locally.
+   * The leader row in list_workspaces reflects the latest value. No
+   * member-channel message is needed — the leader already owns its row
+   * locally.
    */
   updateState(state: WindowState): void {
     this.localState = state;

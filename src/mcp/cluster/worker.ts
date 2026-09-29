@@ -2,36 +2,28 @@
  * WorkerCoordinator — a non-leader VS Code window.
  *
  * Responsibilities:
- *  - Connect to the Leader over a MemberTransport (IPC socket, or the HTTP
- *    member channel for cross-namespace windows) and register this window's
- *    workspace.
+ *  - Connect to the Leader over the HTTP member channel and register this
+ *    window's workspace.
  *  - Execute forwarded tool payloads locally (this process's vscode API).
  *  - Send a heartbeat (PING) and watch for PONG; two missed PONGs mean the
  *    Leader's event loop is frozen, so tear the transport down and trigger
  *    re-election.
  *  - On transport close/error, immediately trigger re-election.
  *
- * The coordinator is transport-agnostic: only the framing differs between
- * IPC and the member channel. Pure Node (no vscode API); workspace identity,
- * executor, and the re-election callback are injected by extension.ts.
+ * The coordinator talks to the Leader purely over the HTTP member channel
+ * (SSE receive leg + POST send leg) on the Leader's single port. Pure Node
+ * (no vscode API); workspace identity, executor, and the re-election
+ * callback are injected by extension.ts.
  */
 import type { JsonRpcResponse } from "../../utils/types";
 import { BusyError, type ToolExecutor } from "../executor";
-import {
-  getIpcPath,
-  HEARTBEAT_INTERVAL_MS,
-  HEARTBEAT_MISS_LIMIT,
-  MSG,
-  REGISTER_TIMEOUT_MS,
-} from "./constants";
-import { IpcMemberTransport, type MemberTransport } from "./memberTransport";
+import { HEARTBEAT_INTERVAL_MS, HEARTBEAT_MISS_LIMIT, MSG, REGISTER_TIMEOUT_MS } from "./constants";
+import type { MemberTransport } from "./memberTransport";
 import type { IpcMessage, WindowState } from "./protocol";
 
 export interface WorkerOptions {
-  ipcPath?: string;
-  connectTimeoutMs?: number;
-  /** Override the default IPC transport (e.g. HTTP member channel). */
-  transport?: MemberTransport;
+  /** The transport to the Leader (HTTP member channel). */
+  transport: MemberTransport;
   executor: ToolExecutor;
   workspaceId: string;
   workspacePaths: string[];
@@ -47,7 +39,6 @@ export interface WorkerOptions {
 export class WorkerCoordinator {
   readonly role = "worker" as const;
   private readonly opts: WorkerOptions;
-  private readonly ipcPath: string;
   private lostLeaderHandler: (reason: string) => void = () => {};
   private transport: MemberTransport | null = null;
   private stopped = false;
@@ -61,7 +52,6 @@ export class WorkerCoordinator {
 
   constructor(opts: WorkerOptions) {
     this.opts = opts;
-    this.ipcPath = opts.ipcPath ?? getIpcPath();
     if (opts.state) this.state = opts.state;
   }
 
@@ -70,8 +60,7 @@ export class WorkerCoordinator {
     this.registered = false;
     this.missedPongs = 0;
 
-    const transport =
-      this.opts.transport ?? new IpcMemberTransport(this.ipcPath, this.opts.connectTimeoutMs);
+    const transport = this.opts.transport;
     transport.onMessage = (msg) => this.onMessage(msg);
     transport.onClose = (reason) => this.failOver(reason);
     await transport.connect();

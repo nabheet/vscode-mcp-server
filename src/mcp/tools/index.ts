@@ -12,8 +12,8 @@ import { registerWorkspaceTools } from "./workspace";
 
 /**
  * Minimal surface the tool registration functions need. Satisfied by both
- * McpServer (leader HTTP layer) and ToolExecutor (worker IPC execution), so
- * every cluster member registers the exact same tool set.
+ * McpServer (leader HTTP layer) and ToolExecutor (worker member-channel
+ * execution), so every cluster member registers the exact same tool set.
  */
 export interface ToolRegistrar {
   registerTool(def: ToolDefinition): void;

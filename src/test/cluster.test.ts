@@ -1,30 +1,16 @@
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
-import * as os from "node:os";
-import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCluster } from "../mcp/cluster/bootstrap";
 import {
   CLUSTER_MESSAGE_PATH,
   CLUSTER_STREAM_PATH,
-  DEFAULT_IPC_PATH,
   HEALTH_SERVICE,
-  MAX_FRAME_BYTES,
   MSG,
-  resolveIpcPath,
 } from "../mcp/cluster/constants";
 import { probeHost, probePort } from "../mcp/cluster/election";
-import { closeIpcServer, createIpcServer, ensureIpcDir, isIpcAlive } from "../mcp/cluster/ipc";
 import { LeaderCoordinator } from "../mcp/cluster/leader";
 import { HttpMemberTransport } from "../mcp/cluster/memberTransport";
-import {
-  createDecoder,
-  encodeMessage,
-  FrameDecodeError,
-  type IpcMessage,
-} from "../mcp/cluster/protocol";
 import { WorkerCoordinator } from "../mcp/cluster/worker";
 import { ToolExecutor } from "../mcp/executor";
 import { McpServer } from "../mcp/server";
@@ -71,13 +57,6 @@ function findFreePort(): Promise<number> {
       srv.close(() => resolve(port));
     });
   });
-}
-
-function findFreeIpcPath(): string {
-  return path.join(
-    os.tmpdir(),
-    `vscode-mcp-cluster-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
-  );
 }
 
 function post(url: string, body: unknown): Promise<{ status: number; body: RpcResponseBody }> {
@@ -215,111 +194,6 @@ function rawRequest(url: string, method: "GET" | "POST", body?: unknown): Promis
   });
 }
 
-// ── Framing protocol ─────────────────────────────────────────────────
-
-describe("cluster protocol framing", () => {
-  it("round-trips a message through encode + decode in one chunk", () => {
-    const seen: IpcMessage[] = [];
-    const decode = createDecoder((m) => seen.push(m));
-    decode(
-      encodeMessage({ type: MSG.REGISTER, id: "w1", workspacePaths: ["/a"], displayName: "W1" }),
-    );
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatchObject({
-      type: MSG.REGISTER,
-      id: "w1",
-      workspacePaths: ["/a"],
-      displayName: "W1",
-    });
-  });
-
-  it("decodes a message fed byte-by-byte across many chunks", () => {
-    const seen: IpcMessage[] = [];
-    const decode = createDecoder((m) => seen.push(m));
-    const frame = encodeMessage({
-      type: MSG.CALL,
-      callId: "abc",
-      rawBody: '{"jsonrpc":"2.0","id":1}',
-    });
-    for (let i = 0; i < frame.length; i++) {
-      decode(frame.subarray(i, i + 1));
-    }
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatchObject({ type: MSG.CALL, callId: "abc" });
-  });
-
-  it("decodes multiple messages packed into one chunk", () => {
-    const seen: IpcMessage[] = [];
-    const decode = createDecoder((m) => seen.push(m));
-    decode(
-      Buffer.concat([
-        encodeMessage({ type: MSG.PING }),
-        encodeMessage({ type: MSG.PONG }),
-        encodeMessage({ type: MSG.PING }),
-      ]),
-    );
-    expect(seen.map((m) => m.type)).toEqual([MSG.PING, MSG.PONG, MSG.PING]);
-  });
-
-  it("decodes a split message where the length header spans two chunks", () => {
-    const seen: IpcMessage[] = [];
-    const decode = createDecoder((m) => seen.push(m));
-    const frame = encodeMessage({
-      type: MSG.RESULT,
-      callId: "x",
-      response: { jsonrpc: "2.0", id: 1 },
-    });
-    // Header = 4 bytes; split after 2 bytes so the header itself is partial.
-    decode(frame.subarray(0, 2));
-    decode(frame.subarray(2));
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatchObject({ type: MSG.RESULT, callId: "x" });
-  });
-
-  it("round-trips a large (1 MB) payload", () => {
-    const big = "x".repeat(1024 * 1024);
-    const seen: IpcMessage[] = [];
-    const decode = createDecoder((m) => seen.push(m));
-    const frame = encodeMessage({
-      type: MSG.RESULT,
-      callId: "big",
-      response: { jsonrpc: "2.0", id: 1, result: { text: big } },
-    });
-    expect(frame.length).toBeGreaterThan(1024 * 1024);
-    // Feed in 64 KB chunks like a real socket would.
-    for (let i = 0; i < frame.length; i += 64 * 1024) {
-      decode(frame.subarray(i, i + 64 * 1024));
-    }
-    expect(seen).toHaveLength(1);
-    expect((seen[0].response as { result: { text: string } }).result.text).toBe(big);
-  });
-
-  it("rejects frames whose header declares a size over the cap", () => {
-    const decode = createDecoder(() => {});
-    const bad = Buffer.alloc(8);
-    bad.writeUInt32BE(MAX_FRAME_BYTES + 1, 0);
-    expect(() => decode(bad)).toThrow(FrameDecodeError);
-  });
-
-  it("rejects non-JSON frame bodies", () => {
-    const decode = createDecoder(() => {});
-    const body = Buffer.from("not json at all");
-    const frame = Buffer.alloc(4 + body.length);
-    frame.writeUInt32BE(body.length, 0);
-    body.copy(frame, 4);
-    expect(() => decode(frame)).toThrow(/not valid JSON/);
-  });
-
-  it("rejects frame bodies that are not IPC messages", () => {
-    const decode = createDecoder(() => {});
-    const body = Buffer.from(JSON.stringify({ hello: "world" }));
-    const frame = Buffer.alloc(4 + body.length);
-    frame.writeUInt32BE(body.length, 0);
-    body.copy(frame, 4);
-    expect(() => decode(frame)).toThrow(/missing string "type"/);
-  });
-});
-
 // ── Port probing ─────────────────────────────────────────────────────
 
 describe("cluster port probing", () => {
@@ -328,7 +202,7 @@ describe("cluster port probing", () => {
     const srv = new McpServer({ port, host: "127.0.0.1" });
     await srv.start();
     try {
-      const probe = await probePort(port, findFreeIpcPath());
+      const probe = await probePort(port);
       expect(probe.status).toBe("valid");
     } finally {
       await srv.stop(1000);
@@ -337,7 +211,7 @@ describe("cluster port probing", () => {
 
   it("probePort returns free for an unbound port", async () => {
     const port = await findFreePort();
-    const probe = await probePort(port, findFreeIpcPath());
+    const probe = await probePort(port);
     expect(probe.status).toBe("free");
   });
 
@@ -349,36 +223,21 @@ describe("cluster port probing", () => {
     });
     await new Promise<void>((resolve) => srv.listen(port, "127.0.0.1", resolve));
     try {
-      const probe = await probePort(port, findFreeIpcPath());
+      const probe = await probePort(port);
       expect(probe.status).toBe("foreign");
     } finally {
       srv.close();
     }
   });
 
-  it("probePort returns zombie for a silent port with a live IPC pipe", async () => {
+  it("probePort returns timeout for a silent port", async () => {
     const port = await findFreePort();
-    const ipcPath = findFreeIpcPath();
     // A TCP server that accepts but never answers HTTP → health probe times out.
     const silent = net.createServer(() => {});
     await new Promise<void>((resolve) => silent.listen(port, "127.0.0.1", resolve));
-    const ipc = await createIpcServer(ipcPath);
     try {
-      const probe = await probePort(port, ipcPath);
-      expect(probe.status).toBe("zombie");
-    } finally {
-      silent.close();
-      await closeIpcServer(ipc, new Set());
-    }
-  }, 10_000);
-
-  it("probePort returns foreign for a silent port with no IPC pipe", async () => {
-    const port = await findFreePort();
-    const silent = net.createServer(() => {});
-    await new Promise<void>((resolve) => silent.listen(port, "127.0.0.1", resolve));
-    try {
-      const probe = await probePort(port, findFreeIpcPath());
-      expect(probe.status).toBe("foreign");
+      const probe = await probePort(port);
+      expect(probe.status).toBe("timeout");
     } finally {
       silent.close();
     }
@@ -414,7 +273,7 @@ describe("cluster port probing", () => {
     }
   });
 
-  it("probeHost returns timeout for a silent port (no IPC disambiguation)", async () => {
+  it("probeHost returns timeout for a silent port", async () => {
     const port = await findFreePort();
     const silent = net.createServer(() => {});
     await new Promise<void>((resolve) => silent.listen(port, "127.0.0.1", resolve));
@@ -426,209 +285,10 @@ describe("cluster port probing", () => {
   }, 10_000);
 });
 
-// ── IPC helpers ──────────────────────────────────────────────────────
-
-describe("cluster IPC helpers", () => {
-  it("isIpcAlive is false when nothing listens on the path", async () => {
-    expect(await isIpcAlive(findFreeIpcPath(), 300)).toBe(false);
-  });
-
-  it("createIpcServer recovers from a stale socket file left by a crash", async () => {
-    // Stale socket in the nested <dir>/<name> layout (the production default):
-    // the parent dir already exists from a prior healthy run, a hard crash
-    // leaves the socket file behind, and recovery must unlink it and re-bind.
-    const dir = path.join(
-      os.tmpdir(),
-      `vscode-mcp-stale-${process.pid}-${Math.random().toString(36).slice(2)}`,
-    );
-    fs.mkdirSync(dir, { recursive: true });
-    const ipcPath = path.join(dir, "ipc.sock");
-    // Simulate a hard crash: a child binds the socket then SIGKILLs itself.
-    // Node's normal close() auto-unlinks, so only a real crash leaves a
-    // stale socket file behind — this is the exact scenario the recovery
-    // path guards against.
-    const readyFile = `${ipcPath}.ready`;
-    const child = spawn(
-      process.execPath,
-      [
-        "-e",
-        `
-      const net = require('net');
-      const fs = require('fs');
-      const s = net.createServer(() => {});
-      s.listen(process.argv[1], () => {
-        fs.writeFileSync(process.argv[2], 'ready');
-        setTimeout(() => process.kill(process.pid, 'SIGKILL'), 50);
-      });
-    `,
-        ipcPath,
-        readyFile,
-      ],
-      { stdio: ["ignore", "ignore", "ignore"] },
-    );
-    try {
-      await vi.waitFor(() => expect(fs.existsSync(readyFile)).toBe(true), { timeout: 5000 });
-      await new Promise<void>((resolve) => child.on("exit", () => resolve()));
-      expect(fs.existsSync(ipcPath)).toBe(true); // stale file survives the crash
-      const srv = await createIpcServer(ipcPath);
-      expect(srv.listening).toBe(true);
-      await closeIpcServer(srv, new Set());
-    } finally {
-      child.kill("SIGKILL");
-      try {
-        fs.unlinkSync(readyFile);
-      } catch {
-        /* already gone */
-      }
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        /* already gone */
-      }
-    }
-  }, 10_000);
-
-  it("createIpcServer rejects when a live peer owns the path", async () => {
-    const ipcPath = findFreeIpcPath();
-    const srv = await createIpcServer(ipcPath);
-    try {
-      await expect(createIpcServer(ipcPath)).rejects.toThrow();
-    } finally {
-      await closeIpcServer(srv, new Set());
-    }
-  });
-
-  it("leader stop() never unlinks the shared IPC path (split-brain safety)", async () => {
-    const ipcPath = findFreeIpcPath();
-    // Leader A owns the shared socket (e.g. promoted on port 9876).
-    const holder = await createIpcServer(ipcPath);
-    // Leader B tries to promote on another port (transient split: 9877).
-    // Its start() must reject — A holds the IPC path — and bootstrap then
-    // calls B.stop(). stop() must NOT unlink the shared path, or A's socket
-    // disappears and every worker enters a permanent ENOENT loop.
-    const exec = new ToolExecutor();
-    const loser = new LeaderCoordinator({
-      port: await findFreePort(),
-      host: "127.0.0.1",
-      ipcPath,
-      executor: exec,
-      workspaceId: "leader-loser",
-      workspacePaths: ["/mnt/loser"],
-      displayName: "Leader Loser",
-    });
-    try {
-      await expect(loser.start()).rejects.toThrow();
-      await loser.stop(500);
-      // The socket file must still exist and accept connections.
-      expect(fs.existsSync(ipcPath)).toBe(true);
-      expect(await isIpcAlive(ipcPath, 800)).toBe(true);
-    } finally {
-      await loser.stop(500).catch(() => {});
-      await closeIpcServer(holder, new Set());
-    }
-  });
-
-  it("resolveIpcPath precedence: explicit setting > env var > default", () => {
-    const setting = "/opt/vscode-mcp/ipc.sock";
-    const env = "/tmp/custom/ipc.sock";
-    expect(resolveIpcPath(setting, env)).toBe(setting);
-    expect(resolveIpcPath("", env)).toBe(env);
-    expect(resolveIpcPath(undefined, env)).toBe(env);
-    expect(resolveIpcPath("", "")).toBe(DEFAULT_IPC_PATH);
-    expect(resolveIpcPath(undefined, undefined)).toBe(DEFAULT_IPC_PATH);
-    // A hand-edited settings.json can hold a non-string; it must be ignored
-    // rather than flowing into net.listen() as a TCP port.
-    expect(resolveIpcPath(123, env)).toBe(env);
-    expect(resolveIpcPath(false, env)).toBe(env);
-    // Numeric strings are the same hazard: net.listen("18099") binds an
-    // unauthenticated TCP listener on all interfaces, not a unix socket.
-    expect(resolveIpcPath("18099", env)).toBe(env);
-    expect(resolveIpcPath("0", env)).toBe(env);
-    expect(resolveIpcPath(undefined, "9876")).toBe(DEFAULT_IPC_PATH);
-    // Whitespace-only is a settings.json mistake — treated as unset.
-    expect(resolveIpcPath("   ", env)).toBe(env);
-    expect(resolveIpcPath(undefined, "   ")).toBe(DEFAULT_IPC_PATH);
-    if (process.platform !== "win32") {
-      // Relative paths bind in the process CWD and silently split the cluster.
-      expect(resolveIpcPath("ipc.sock", env)).toBe(env);
-      // Trailing slashes are normalized so dirname() and listen() agree.
-      expect(resolveIpcPath("/tmp/foo/", env)).toBe("/tmp/foo");
-    }
-  });
-
-  it("POSIX default IPC path lives in a dedicated subdirectory (not the tmp root)", () => {
-    if (process.platform === "win32") return; // named pipes have no directory
-    const dir = path.dirname(DEFAULT_IPC_PATH);
-    const base = path.basename(DEFAULT_IPC_PATH);
-    expect(base).toBe("ipc.sock");
-    expect(dir).not.toBe(os.tmpdir()); // not a bare file in the tmp root
-    expect(path.basename(dir)).toBe("vscode-mcp");
-  });
-
-  it("createIpcServer creates a missing parent dir (nested <dir>/<name> layout)", async () => {
-    if (process.platform === "win32") return; // named pipes have no filesystem dir
-    const dir = path.join(
-      os.tmpdir(),
-      `vscode-mcp-dir-${process.pid}-${Math.random().toString(36).slice(2)}`,
-    );
-    const ipcPath = path.join(dir, "ipc.sock");
-    let srv: net.Server | undefined;
-    try {
-      expect(fs.existsSync(dir)).toBe(false); // parent must not exist yet
-      srv = await createIpcServer(ipcPath);
-      expect(srv.listening).toBe(true);
-      expect(fs.existsSync(dir)).toBe(true);
-      expect(fs.existsSync(ipcPath)).toBe(true);
-      // Socket lives at <dir>/<name> and the dir is private to the cluster.
-      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("700");
-      expect(await isIpcAlive(ipcPath, 800)).toBe(true);
-    } finally {
-      if (srv) await closeIpcServer(srv, new Set());
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        /* already gone */
-      }
-    }
-  });
-
-  it("ensureIpcDir tightens a pre-existing loose parent dir to 0700", () => {
-    if (process.platform === "win32") return; // named pipes have no filesystem dir
-    const dir = path.join(
-      os.tmpdir(),
-      `vscode-mcp-loose-${process.pid}-${Math.random().toString(36).slice(2)}`,
-    );
-    try {
-      // Simulate a pre-existing dir with looser perms (0755 default umask).
-      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
-      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("755");
-      ensureIpcDir(path.join(dir, "ipc.sock"));
-      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe("700");
-    } finally {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        /* already gone */
-      }
-    }
-  });
-});
-
 // ── Leader + Worker integration ──────────────────────────────────────
 
 describe("leader-worker cluster", () => {
   let port: number;
-  let ipcPath: string;
   let leader: LeaderCoordinator;
   let worker: WorkerCoordinator;
   let leaderExec: ToolExecutor;
@@ -637,7 +297,6 @@ describe("leader-worker cluster", () => {
 
   beforeEach(async () => {
     port = await findFreePort();
-    ipcPath = findFreeIpcPath();
     lostReasons = [];
 
     leaderExec = new ToolExecutor();
@@ -649,7 +308,6 @@ describe("leader-worker cluster", () => {
     leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath,
       executor: leaderExec,
       workspaceId: "leader-ws",
       workspacePaths: ["/mnt/leader"],
@@ -658,7 +316,7 @@ describe("leader-worker cluster", () => {
     await leader.start();
 
     worker = new WorkerCoordinator({
-      ipcPath,
+      transport: new HttpMemberTransport({ baseUrl: `http://127.0.0.1:${port}` }),
       executor: workerExec,
       workspaceId: "worker-ws",
       workspacePaths: ["/mnt/worker"],
@@ -672,13 +330,6 @@ describe("leader-worker cluster", () => {
   afterEach(async () => {
     if (worker) await worker.stop(500).catch(() => {});
     if (leader) await leader.stop(1000).catch(() => {});
-    if (process.platform !== "win32") {
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
-    }
   });
 
   const url = () => `http://127.0.0.1:${port}/mcp`;
@@ -796,55 +447,15 @@ describe("leader-worker cluster", () => {
     expect(workerEntry.role).toBe("worker");
   });
 
-  it("answers PING with PONG on a raw IPC socket", async () => {
-    const socket = net.createConnection(ipcPath);
-    const msgs: IpcMessage[] = [];
-    const decode = createDecoder((m) => msgs.push(m));
-    socket.on("data", (c: Buffer) => decode(c));
-    socket.on("error", () => {
-      /* probe is best-effort; waits will fail if it errors */
-    });
-    const welcome = new Promise<void>((resolve) => {
-      socket.on("connect", () => {
-        socket.write(
-          encodeMessage({
-            type: MSG.REGISTER,
-            id: "probe",
-            workspacePaths: [],
-            displayName: "Probe",
-          }),
-        );
-        resolve();
-      });
-    });
-    await welcome;
-    await vi.waitFor(() => expect(msgs.some((m) => m.type === MSG.WELCOME)).toBe(true), {
-      timeout: 3000,
-    });
-    socket.write(encodeMessage({ type: MSG.PING }));
-    await vi.waitFor(() => expect(msgs.some((m) => m.type === MSG.PONG)).toBe(true), {
-      timeout: 3000,
-    });
-    socket.destroy();
-  }, 10_000);
-
   it("fires the lost-leader handler when the leader goes away", async () => {
     await leader.stop(500);
     await vi.waitFor(() => expect(lostReasons.length).toBeGreaterThan(0), { timeout: 3000 });
   });
-
-  it("leader stop unlinks the IPC socket file (POSIX)", async () => {
-    expect(fs.existsSync(ipcPath)).toBe(true);
-    await leader.stop(500);
-    if (process.platform !== "win32") {
-      expect(fs.existsSync(ipcPath)).toBe(false);
-    }
-  });
 });
 
 // ── HTTP member channel cluster (issue #94) ─────────────────────────
-// A worker joined over the SSE/POST member channel behaves exactly like an
-// IPC worker: REGISTER/WELCOME, CALL/RESULT, PING/PONG, UPDATE, failover.
+// A worker joined over the SSE/POST member channel behaves like a native
+// member: REGISTER/WELCOME, CALL/RESULT, PING/PONG, UPDATE, failover.
 
 describe("HTTP member channel cluster", () => {
   let port: number;
@@ -869,7 +480,6 @@ describe("HTTP member channel cluster", () => {
     leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       executor: leaderExec,
       workspaceId: "leader-ws",
       workspacePaths: ["/mnt/leader"],
@@ -997,7 +607,6 @@ describe("member channel HTTP guards", () => {
     const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       executor: new ToolExecutor(),
       workspaceId: "l",
       workspacePaths: ["/mnt/l"],
@@ -1021,7 +630,6 @@ describe("member channel HTTP guards", () => {
     const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       executor: new ToolExecutor(),
       workspaceId: "l",
       workspacePaths: ["/mnt/l"],
@@ -1046,7 +654,6 @@ describe("member channel HTTP guards", () => {
     const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       executor: new ToolExecutor(),
       workspaceId: "l",
       workspacePaths: ["/mnt/l"],
@@ -1072,7 +679,6 @@ describe("member channel HTTP guards", () => {
     const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       executor: new ToolExecutor(),
       workspaceId: "l",
       workspacePaths: ["/mnt/l"],
@@ -1106,7 +712,6 @@ describe("member channel HTTP guards", () => {
 
 describe("window state descriptor", () => {
   let port: number;
-  let ipcPath: string;
   let leader: LeaderCoordinator;
   let worker: WorkerCoordinator;
   let leaderExec: ToolExecutor;
@@ -1114,7 +719,6 @@ describe("window state descriptor", () => {
 
   beforeEach(async () => {
     port = await findFreePort();
-    ipcPath = findFreeIpcPath();
 
     leaderExec = new ToolExecutor();
     leaderExec.registerTool(makeTool("echo", (a) => `echo from leader: ${a.msg ?? ""}`));
@@ -1124,7 +728,6 @@ describe("window state descriptor", () => {
     leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath,
       executor: leaderExec,
       workspaceId: "leader-ws",
       workspacePaths: ["/mnt/leader"],
@@ -1134,7 +737,7 @@ describe("window state descriptor", () => {
     await leader.start();
 
     worker = new WorkerCoordinator({
-      ipcPath,
+      transport: new HttpMemberTransport({ baseUrl: `http://127.0.0.1:${port}` }),
       executor: workerExec,
       workspaceId: "worker-ws",
       workspacePaths: ["/mnt/worker"],
@@ -1147,13 +750,6 @@ describe("window state descriptor", () => {
   afterEach(async () => {
     if (worker) await worker.stop(500).catch(() => {});
     if (leader) await leader.stop(1000).catch(() => {});
-    if (process.platform !== "win32") {
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
-    }
   });
 
   const url = () => `http://127.0.0.1:${port}/mcp`;
@@ -1184,31 +780,24 @@ describe("window state descriptor", () => {
   });
 
   it("defaults state to empty openEditors when not provided", async () => {
-    const socket = net.createConnection(ipcPath);
-    const msgs: IpcMessage[] = [];
-    const decode = createDecoder((m) => msgs.push(m));
-    socket.on("data", (c: Buffer) => decode(c));
-    socket.on("error", () => {});
-    await new Promise<void>((resolve) => {
-      socket.on("connect", () => {
-        socket.write(
-          encodeMessage({
-            type: MSG.REGISTER,
-            id: "bare-ws",
-            workspacePaths: [],
-            displayName: "Bare",
-          }),
-        );
-        resolve();
-      });
-    });
-    await vi.waitFor(() => expect(msgs.some((m) => m.type === MSG.WELCOME)).toBe(true), {
-      timeout: 3000,
-    });
-    const rows = await listRows();
-    const bare = rows.find((e) => e.id === "bare-ws");
-    expect(bare.state).toEqual({ openEditors: [] });
-    socket.destroy();
+    const sessionId = "bare-sess";
+    const stream = await openMemberStream(port, sessionId);
+    try {
+      const welcomePromise = readSseEvent(stream);
+      const status = await rawRequest(
+        `http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=${sessionId}`,
+        "POST",
+        { type: MSG.REGISTER, id: "bare-ws", workspacePaths: [], displayName: "Bare" },
+      );
+      expect(status).toBe(202);
+      const data = await welcomePromise;
+      expect(JSON.parse(data)).toMatchObject({ type: MSG.WELCOME });
+      const rows = await listRows();
+      const bare = rows.find((e) => e.id === "bare-ws");
+      expect(bare.state).toEqual({ openEditors: [] });
+    } finally {
+      stream.destroy();
+    }
   }, 10_000);
 
   it("propagates worker state updates via MSG.UPDATE", async () => {
@@ -1227,20 +816,19 @@ describe("window state descriptor", () => {
     );
   }, 10_000);
 
-  it("ignores state updates from an unregistered socket", async () => {
-    const socket = net.createConnection(ipcPath);
-    socket.on("error", () => {});
-    await new Promise<void>((resolve) => {
-      socket.on("connect", () => resolve());
-    });
-    // No REGISTER: MSG.UPDATE must be dropped, not crash the leader.
-    socket.write(encodeMessage({ type: MSG.UPDATE, state: { openEditors: ["/x/y.ts"] } }));
-    await new Promise((r) => setTimeout(r, 300));
+  it("ignores state updates from an unregistered session", async () => {
+    // No REGISTER for this session: the leader has no peer for it, the POST
+    // 404s, and the worker's stored state is untouched.
+    const status = await rawRequest(
+      `http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=ghost`,
+      "POST",
+      { type: MSG.UPDATE, state: { openEditors: ["/x/y.ts"] } },
+    );
+    expect(status).toBe(404);
     const rows = await listRows();
     expect(rows.find((e) => e.id === "worker-ws").state).toEqual({
       openEditors: ["/mnt/worker/a.ts"],
     });
-    socket.destroy();
   }, 10_000);
 
   it("lets the leader publish its own window state", async () => {
@@ -1253,32 +841,29 @@ describe("window state descriptor", () => {
   });
 
   it("sanitizes malformed worker state on the wire", async () => {
-    const socket = net.createConnection(ipcPath);
-    const msgs: IpcMessage[] = [];
-    const decode = createDecoder((m) => msgs.push(m));
-    socket.on("data", (c: Buffer) => decode(c));
-    socket.on("error", () => {});
-    await new Promise<void>((resolve) => {
-      socket.on("connect", () => {
-        socket.write(
-          encodeMessage({
-            type: MSG.REGISTER,
-            id: "dirty-ws",
-            workspacePaths: [],
-            displayName: "Dirty",
-            state: { activeFile: 42, openEditors: ["/ok.ts", 7] },
-          }),
-        );
-        resolve();
-      });
-    });
-    await vi.waitFor(() => expect(msgs.some((m) => m.type === MSG.WELCOME)).toBe(true), {
-      timeout: 3000,
-    });
-    const rows = await listRows();
-    const dirty = rows.find((e) => e.id === "dirty-ws");
-    expect(dirty.state).toEqual({ openEditors: ["/ok.ts"] });
-    socket.destroy();
+    const sessionId = "dirty-sess";
+    const stream = await openMemberStream(port, sessionId);
+    try {
+      const welcomePromise = readSseEvent(stream);
+      const status = await rawRequest(
+        `http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=${sessionId}`,
+        "POST",
+        {
+          type: MSG.REGISTER,
+          id: "dirty-ws",
+          workspacePaths: [],
+          displayName: "Dirty",
+          state: { activeFile: 42, openEditors: ["/ok.ts", 7] },
+        },
+      );
+      expect(status).toBe(202);
+      await welcomePromise;
+      const rows = await listRows();
+      const dirty = rows.find((e) => e.id === "dirty-ws");
+      expect(dirty.state).toEqual({ openEditors: ["/ok.ts"] });
+    } finally {
+      stream.destroy();
+    }
   }, 10_000);
 });
 
@@ -1287,14 +872,12 @@ describe("window state descriptor", () => {
 describe("cluster bootstrap", () => {
   it("promotes a single window to leader and serves the port", async () => {
     const port = await findFreePort();
-    const ipcPath = findFreeIpcPath();
     const exec = new ToolExecutor();
     exec.registerTool(makeTool("echo", (a) => `local: ${a.msg ?? ""}`));
 
     const member = await bootstrapCluster({
       basePort: port,
       host: "127.0.0.1",
-      ipcPath,
       executor: exec,
       workspaceId: "ws-a",
       workspacePaths: ["/mnt/a"],
@@ -1310,20 +893,15 @@ describe("cluster bootstrap", () => {
     });
     expect(res.body.result.content[0].text).toBe("local: hi");
     await member.stop(500);
-    if (process.platform !== "win32") {
-      expect(fs.existsSync(ipcPath)).toBe(false);
-    }
   });
 
   it("joins an existing leader as a worker", async () => {
     const port = await findFreePort();
-    const ipcPath = findFreeIpcPath();
     const leaderExec = new ToolExecutor();
     leaderExec.registerTool(makeTool("echo", (a) => `leader: ${a.msg ?? ""}`));
     const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath,
       executor: leaderExec,
       workspaceId: "m1",
       workspacePaths: ["/mnt/m"],
@@ -1336,50 +914,6 @@ describe("cluster bootstrap", () => {
     const worker = await bootstrapCluster({
       basePort: port,
       host: "127.0.0.1",
-      ipcPath,
-      executor: workerExec,
-      workspaceId: "w1",
-      workspacePaths: ["/mnt/w"],
-      displayName: "W",
-    });
-
-    expect(worker.role).toBe("worker");
-    const res = await post(`http://127.0.0.1:${port}/mcp`, {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: { name: "echo", arguments: { msg: "hi" }, workspace: "w1" },
-    });
-    expect(res.body.result.content[0].text).toBe("worker: hi");
-    await worker.stop(500);
-    await leader.stop(500);
-  });
-
-  it("joins a leader over HTTP when the IPC join fails (remote fallback)", async () => {
-    const port = await findFreePort();
-    const leaderExec = new ToolExecutor();
-    leaderExec.registerTool(makeTool("echo", (a) => `leader: ${a.msg ?? ""}`));
-    const leader = new LeaderCoordinator({
-      port,
-      host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
-      executor: leaderExec,
-      workspaceId: "m1",
-      workspacePaths: ["/mnt/m"],
-      displayName: "M",
-    });
-    await leader.start();
-
-    const workerExec = new ToolExecutor();
-    workerExec.registerTool(makeTool("echo", (a) => `worker: ${a.msg ?? ""}`));
-    // Deliberately different IPC path: the valid-port probe sees the leader,
-    // the IPC join fails (nothing listens at OUR path), and bootstrap must
-    // fall back to the HTTP member channel on the same host:port — the
-    // container→host scenario where the port is forwarded but the pipe is not.
-    const worker = await bootstrapCluster({
-      basePort: port,
-      host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       executor: workerExec,
       workspaceId: "w1",
       workspacePaths: ["/mnt/w"],
@@ -1413,7 +947,6 @@ describe("cluster bootstrap", () => {
     const leader = new LeaderCoordinator({
       port,
       host: hostIp,
-      ipcPath: findFreeIpcPath(),
       executor: leaderExec,
       workspaceId: "host-leader",
       workspacePaths: ["/mnt/host"],
@@ -1426,7 +959,6 @@ describe("cluster bootstrap", () => {
     const worker = await bootstrapCluster({
       basePort: port,
       host: "127.0.0.1",
-      ipcPath: findFreeIpcPath(),
       crossBoundaryHosts: [hostIp],
       executor: workerExec,
       workspaceId: "container-w",
@@ -1448,29 +980,28 @@ describe("cluster bootstrap", () => {
 
   it("does not promote to the next port when a valid leader rejects the join", async () => {
     const port = await findFreePort();
-    const ipcPath = findFreeIpcPath();
     const logs: string[] = [];
 
-    // Fake "valid" leader: answers /health with our service signature, but
-    // its IPC pipe destroys every connection, so the join handshake always
-    // fails. Split-brain repro: the old code advanced to the next port and
+    // Fake "valid" leader: answers /health with our service signature but
+    // serves no member channel, so the HTTP join handshake always fails.
+    // Split-brain repro: the old code advanced to the next port and
     // promoted, fragmenting the cluster into two leaders.
-    const httpServer = http.createServer((_req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ service: HEALTH_SERVICE }));
+    const httpServer = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ service: HEALTH_SERVICE }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no member channel" }));
     });
     await new Promise<void>((resolve) => httpServer.listen(port, "127.0.0.1", resolve));
-    const ipcServer = net.createServer((socket) => {
-      setImmediate(() => socket.destroy()); // REGISTER dies immediately
-    });
-    await new Promise<void>((resolve) => ipcServer.listen(ipcPath, resolve));
 
     try {
       await expect(
         bootstrapCluster({
           basePort: port,
           host: "127.0.0.1",
-          ipcPath,
           executor: new ToolExecutor(),
           workspaceId: "ws-join-fail",
           workspacePaths: ["/mnt/join-fail"],
@@ -1482,7 +1013,7 @@ describe("cluster bootstrap", () => {
       // Every attempt must target the live leader's port — never a
       // promotion on a higher port.
       expect(logs.filter((l) => l.includes("Promoted to leader"))).toHaveLength(0);
-      expect(logs.some((l) => l.includes(`Join on port ${port} failed`))).toBe(true);
+      expect(logs.some((l) => l.includes(`HTTP join on 127.0.0.1:${port} failed`))).toBe(true);
 
       // And the next port was never bound for promotion.
       const nextPortFree = await new Promise<boolean>((resolve) => {
@@ -1492,69 +1023,9 @@ describe("cluster bootstrap", () => {
       });
       expect(nextPortFree).toBe(true);
     } finally {
-      await new Promise<void>((resolve) => ipcServer.close(() => resolve()));
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
     }
   }, 10_000);
-
-  it("a second leader cannot steal a live leader's IPC socket", async () => {
-    const port = await findFreePort();
-    const ipcPath = findFreeIpcPath();
-    const exec1 = new ToolExecutor();
-    exec1.registerTool(makeTool("echo", (a) => `m1: ${a.msg ?? ""}`));
-    const leader1 = new LeaderCoordinator({
-      port,
-      host: "127.0.0.1",
-      ipcPath,
-      executor: exec1,
-      workspaceId: "m1",
-      workspacePaths: ["/mnt/m1"],
-      displayName: "M1",
-    });
-    await leader1.start();
-
-    const exec2 = new ToolExecutor();
-    exec2.registerTool(makeTool("echo", (a) => `m2: ${a.msg ?? ""}`));
-    const leader2 = new LeaderCoordinator({
-      port: port + 1,
-      host: "127.0.0.1",
-      ipcPath, // same path — a promoting window must NOT steal it
-      executor: exec2,
-      workspaceId: "m2",
-      workspacePaths: ["/mnt/m2"],
-      displayName: "M2",
-    });
-
-    let worker: WorkerCoordinator | null = null;
-    try {
-      await expect(leader2.start()).rejects.toThrow();
-
-      // The live leader's pipe must still serve workers normally.
-      worker = new WorkerCoordinator({
-        ipcPath,
-        executor: exec1,
-        workspaceId: "w1",
-        workspacePaths: ["/mnt/w"],
-        displayName: "W",
-      });
-      await worker.start();
-      expect(fs.existsSync(ipcPath)).toBe(true);
-    } finally {
-      if (worker) await worker.stop(300).catch(() => {});
-      await leader2.stop(300).catch(() => {});
-      await leader1.stop(500).catch(() => {});
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
-    }
-  });
 });
 
 // ── Wire-level instance identity ────────────────────────────────────
@@ -1563,7 +1034,6 @@ describe("wire-level instance identity", () => {
   const LEADER_INSTANCE = "11111111-1111-1111-1111-111111111111";
   const WORKER_INSTANCE = "22222222-2222-2222-2222-222222222222";
   let port: number;
-  let ipcPath: string;
   let leader: LeaderCoordinator;
   let worker: WorkerCoordinator;
   let leaderExec: ToolExecutor;
@@ -1572,7 +1042,6 @@ describe("wire-level instance identity", () => {
 
   beforeEach(async () => {
     port = await findFreePort();
-    ipcPath = findFreeIpcPath();
     lostReasons = [];
 
     // Mirrors extension.ts: the shared executor carries the window identity,
@@ -1585,7 +1054,6 @@ describe("wire-level instance identity", () => {
     leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
-      ipcPath,
       executor: leaderExec,
       workspaceId: "leader-ws",
       workspacePaths: ["/mnt/leader"],
@@ -1596,7 +1064,7 @@ describe("wire-level instance identity", () => {
     await leader.start();
 
     worker = new WorkerCoordinator({
-      ipcPath,
+      transport: new HttpMemberTransport({ baseUrl: `http://127.0.0.1:${port}` }),
       executor: workerExec,
       workspaceId: "worker-ws",
       workspacePaths: ["/mnt/worker"],
@@ -1611,13 +1079,6 @@ describe("wire-level instance identity", () => {
   afterEach(async () => {
     if (worker) await worker.stop(500).catch(() => {});
     if (leader) await leader.stop(1000).catch(() => {});
-    if (process.platform !== "win32") {
-      try {
-        fs.unlinkSync(ipcPath);
-      } catch {
-        /* already gone */
-      }
-    }
   });
 
   const url = () => `http://127.0.0.1:${port}/mcp`;
