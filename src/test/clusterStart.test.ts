@@ -80,6 +80,10 @@ function makeOpts(
     state: { openEditors: [] } as WindowState,
     isRemoteContainer: false,
     isDevContainer: false,
+    // Deterministic detectors so tests don't depend on the host platform
+    // (real detection reads /proc/net/route and os.networkInterfaces()).
+    detectGateway: () => null,
+    detectBridges: () => [],
     log,
     ...overrides,
   };
@@ -272,7 +276,7 @@ describe("startCluster FATAL retry", () => {
     await p;
   });
 
-  it("uses the explicit leaderHost override in a dev container", async () => {
+  it("uses the explicit leaderHost override in a dev container, keeping defaults as fallback", async () => {
     const log = vi.fn();
     vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
     const p = startCluster(
@@ -280,7 +284,9 @@ describe("startCluster FATAL retry", () => {
     );
     await settle();
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
-      expect.objectContaining({ crossBoundaryHosts: ["192.168.1.10"] }),
+      expect.objectContaining({
+        crossBoundaryHosts: ["192.168.1.10", "host.docker.internal"],
+      }),
     );
     await p;
   });
@@ -308,6 +314,82 @@ describe("startCluster FATAL retry", () => {
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
       expect.objectContaining({ crossBoundaryHosts: ["10.0.0.5"] }),
     );
+    await p;
+  });
+
+  it("appends the detected default gateway to the dev-container probe chain", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        isDevContainer: true,
+        leaderHost: "",
+        detectGateway: () => "172.17.0.1",
+      }),
+    );
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        crossBoundaryHosts: ["host.docker.internal", "172.17.0.1"],
+      }),
+    );
+    await p;
+  });
+
+  it("keeps leaderHost first in the dev-container probe chain", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        isDevContainer: true,
+        leaderHost: "192.168.1.10",
+        detectGateway: () => "172.17.0.1",
+      }),
+    );
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        crossBoundaryHosts: ["192.168.1.10", "host.docker.internal", "172.17.0.1"],
+      }),
+    );
+    await p;
+  });
+
+  it("binds detected Docker bridge addresses on a Linux-style host window", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(makeOpts(log, { detectBridges: () => ["127.0.0.2"] }));
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({ hosts: ["127.0.0.1", "127.0.0.2"] }),
+    );
+    await p;
+  });
+
+  it("omits hosts when no bridge addresses are detected", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(makeOpts(log));
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("hosts");
+    await p;
+  });
+
+  it("does not bind bridge addresses inside a container window", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        detectBridges: () => ["127.0.0.2"],
+      }),
+    );
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("hosts");
     await p;
   });
 });

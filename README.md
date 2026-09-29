@@ -167,29 +167,35 @@ socket namespace, the worker joins the leader over HTTP instead:
 
 **Host ↔ container discovery:**
 
-- A **Docker dev container** window probes the host leader at
-  `host.docker.internal:<port>` (Docker Desktop / OrbStack resolve this to the
-  host loopback). If the host is unreachable, the container window promotes
-  itself to leader and the host window later joins it via the loopback
-  `valid` probe + HTTP join fallback (the leader binds `0.0.0.0` inside the
-  container, and VS Code's `forwardPorts` maps it back to `127.0.0.1`).
+- A **Docker dev container** window probes the host leader through an ordered
+  candidate chain, taking the first host that answers (or the first that is
+  free, in which case the container window promotes and the host window later
+  joins it via the loopback `valid` probe + HTTP join fallback):
+  1. `vscode-mcp-server.leaderHost` / `MCP_LEADER_HOST` — explicit override
+     (always wins when set);
+  2. `host.docker.internal` — Docker Desktop / OrbStack resolve this to the
+     host loopback;
+  3. the container's **default gateway** — Linux native Docker routes the
+     container's default traffic to the host's bridge interface, so no
+     `extra_hosts` or `devcontainer.json` networking config is needed.
+- The reverse direction (host window joining a container leader) works out of
+  the box: a container leader binds `0.0.0.0` inside the container, VS Code's
+  `forwardPorts` maps it back to `127.0.0.1`, and a container leader
+  additionally calls `vscode.env.asExternalUri` to make VS Code establish the
+  host→container tunnel automatically.
+- On **Linux** hosts, a host leader binds `127.0.0.1` **plus** its detected
+  Docker bridge address(es) (`docker0`, `br-*`, `cni-podman0`, …), so
+  containers reach it at `<bridge-ip>:<port>` with zero configuration.
 - `host.docker.internal` is only a valid default inside a Docker dev
   container. Other remote environments (attached container, SSH, WSL, …) do
   **not** probe for a host leader unless you set
   `vscode-mcp-server.leaderHost` (or `MCP_LEADER_HOST`) explicitly.
-- On **Linux** Docker daemons, `host.docker.internal` is not resolved by
-  default — add this to your `devcontainer.json`:
-
-  ```json
-  {
-    "forwardPorts": [9876],
-    "extra_hosts": ["host.docker.internal:host-gateway"]
-  }
-  ```
-
-- If your container networking does not provide `host.docker.internal`, point
-  the container window at the right address with the
-  `vscode-mcp-server.leaderHost` setting or the `MCP_LEADER_HOST` env var.
+- If your container networking still can't reach the host (WSL2 without
+  Docker Desktop, rootless Podman with a custom bridge name, …), point the
+  container window at the right address with the
+  `vscode-mcp-server.leaderHost` setting or the `MCP_LEADER_HOST` env var, or
+  add `"extra_hosts": ["host.docker.internal:host-gateway"]` to
+  `devcontainer.json`.
 
 ### list_workspaces
 
@@ -567,7 +573,7 @@ All settings under `vscode-mcp-server.*`:
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
 | `ipcPath` | `""` | Cluster IPC socket: `<tmpdir>/vscode-mcp/ipc.sock` POSIX, pipe Windows |
-| `leaderHost` | `""` | Docker dev-container probe host for a host Leader (`host.docker.internal`) |
+| `leaderHost` | `""` | Container→host probe override; default `host.docker.internal` + gateway |
 
 Settings fall back to environment variables:
 
@@ -578,7 +584,7 @@ Settings fall back to environment variables:
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
 | `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
 | `VSCODE_MCP_IPC_PATH` | `ipcPath` | (none — `<tmpdir>/vscode-mcp/ipc.sock` POSIX) |
-| `MCP_LEADER_HOST` | `leaderHost` | `host.docker.internal` |
+| `MCP_LEADER_HOST` | `leaderHost` | (none — `host.docker.internal`, then gateway) |
 | `MCP_SERVER_MAX_RETRIES` | ports scanned per election (default 5, 9876–9880) | `5` |
 
 VS Code settings take priority over env vars.

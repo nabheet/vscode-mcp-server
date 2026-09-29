@@ -109,6 +109,8 @@ interface PendingCall {
 export interface LeaderOptions {
   port: number;
   host: string;
+  /** Secondary bind addresses for the leader's HTTP server (Linux hosts). */
+  hosts?: string[];
   ipcPath?: string;
   authToken?: string;
   tlsCertPath?: string;
@@ -152,6 +154,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     this.server = new McpServer({
       port: opts.port,
       host: opts.host,
+      ...(opts.hosts && opts.hosts.length > 0 ? { hosts: opts.hosts } : {}),
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath && opts.tlsKeyPath
         ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath }

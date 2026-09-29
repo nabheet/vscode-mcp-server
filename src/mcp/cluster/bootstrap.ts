@@ -39,6 +39,8 @@ export type ClusterMember = LeaderCoordinator | WorkerCoordinator;
 export interface BootstrapOptions {
   basePort: number;
   host: string;
+  /** Secondary bind addresses for the leader's HTTP server (Linux hosts). */
+  hosts?: string[];
   ipcPath?: string;
   authToken?: string;
   tlsCertPath?: string;
@@ -227,6 +229,7 @@ async function tryPromote(
   const leader = new LeaderCoordinator({
     port,
     host: opts.host,
+    ...(opts.hosts && opts.hosts.length > 0 ? { hosts: opts.hosts } : {}),
     ipcPath,
     ...(opts.authToken ? { authToken: opts.authToken } : {}),
     ...(opts.tlsCertPath && opts.tlsKeyPath

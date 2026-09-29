@@ -62,6 +62,14 @@ export interface MemberChannel {
 export interface McpServerOptions {
   port: number;
   host: string;
+  /**
+   * Additional addresses to bind, on top of `host` (which stays the primary:
+   * it is what gets logged and used for origin checks). Used by Linux host
+   * leaders so Docker containers can reach them at the bridge gateway while
+   * loopback-only exposure is preserved. A secondary bind failure is
+   * non-fatal (warned, not rejected); the primary bind failure rejects.
+   */
+  hosts?: string[];
   /** Path to TLS certificate file (enables HTTPS) */
   tlsCertPath?: string;
   /** Path to TLS private key file (enables HTTPS) */
@@ -96,10 +104,11 @@ const SSE_KEEPALIVE_MS = 15_000;
 const LAG_INTERVAL_MS = 1_000;
 
 export class McpServer {
-  private server: http.Server | https.Server | null = null;
+  private servers: Array<http.Server | https.Server> = [];
   private activeRequests = 0;
   private shuttingDown = false;
   private options: McpServerOptions;
+  private bindHosts: string[];
   private onListen?: (url: string) => void;
   private useTls: boolean;
   private sessions = new Map<string, SseSession>();
@@ -128,6 +137,10 @@ export class McpServer {
         "[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.",
       );
     }
+    // Primary bind host is always `options.host`; additional `options.hosts`
+    // are best-effort secondary binds (see McpServerOptions.hosts).
+    const extra = (options.hosts ?? []).filter((h) => h && h !== options.host);
+    this.bindHosts = [options.host, ...extra];
   }
 
   registerTool(def: ToolDefinition): void {
@@ -154,27 +167,38 @@ export class McpServer {
 
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.useTls) {
-        try {
+      const createServer = (): http.Server | https.Server => {
+        if (this.useTls) {
           const tlsOpts: https.ServerOptions = {
             cert: fs.readFileSync(this.options.tlsCertPath!, "utf-8"),
             key: fs.readFileSync(this.options.tlsKeyPath!, "utf-8"),
             minVersion: "TLSv1.2",
           };
-          this.server = https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
-        } catch (err) {
-          reject(
-            new Error(
-              `Failed to load TLS cert/key: ${err instanceof Error ? err.message : String(err)}`,
-            ),
-          );
-          return;
+          return https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
         }
-      } else {
-        this.server = http.createServer((req, res) => this.onRequest(req, res));
-      }
+        return http.createServer((req, res) => this.onRequest(req, res));
+      };
 
-      this.server.on("error", (err: NodeJS.ErrnoException) => {
+      let primary: http.Server | https.Server;
+      try {
+        primary = createServer();
+      } catch (err) {
+        reject(
+          new Error(
+            `Failed to load TLS cert/key: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+        return;
+      }
+      this.servers.push(primary);
+
+      const cleanup = () => {
+        for (const server of this.servers) server.close();
+        this.servers = [];
+      };
+
+      primary.on("error", (err: NodeJS.ErrnoException) => {
+        cleanup();
         if (err.code === "EADDRINUSE") {
           reject(new Error(`Port ${this.options.port} is already in use`));
         } else {
@@ -182,12 +206,33 @@ export class McpServer {
         }
       });
 
-      this.server.listen(this.options.port, this.options.host, () => {
+      primary.listen(this.options.port, this.bindHosts[0], () => {
         const scheme = this.useTls ? "https" : "http";
         this.onListen?.(`${scheme}://${this.options.host}:${this.options.port}/mcp`);
         this.startLagMonitor();
         resolve();
       });
+
+      // Secondary binds are best-effort: a foreign process squatting the
+      // bridge port must not take down a leader that still serves loopback.
+      for (const host of this.bindHosts.slice(1)) {
+        let extra: http.Server | https.Server;
+        try {
+          extra = createServer();
+        } catch (err) {
+          console.warn(
+            `[mcp] Failed to create secondary listener for ${host}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          continue;
+        }
+        this.servers.push(extra);
+        extra.on("error", (err: NodeJS.ErrnoException) => {
+          console.warn(`[mcp] Failed to bind port ${this.options.port} on ${host}: ${err.message}`);
+        });
+        extra.listen(this.options.port, host);
+      }
     });
   }
 
@@ -208,30 +253,36 @@ export class McpServer {
       clearInterval(this.lagTimer);
       this.lagTimer = null;
     }
-    if (!this.server) return;
+    const servers = this.servers;
+    this.servers = [];
+    if (servers.length === 0) return;
 
     // server.close() stops accepting new connections and waits for existing
     // ones to finish naturally. We add a timeout fallback to force-close.
     return new Promise((resolve) => {
+      let remaining = servers.length;
       let done = false;
       const finish = () => {
         if (done) return;
         done = true;
-        this.server = null;
         resolve();
       };
 
       const timer = setTimeout(() => {
-        if (this.server) this.server.close();
+        for (const server of servers) server.close();
         finish();
       }, timeoutMs);
 
-      this.server?.once("close", () => {
-        clearTimeout(timer);
-        finish();
-      });
-
-      this.server?.close();
+      for (const server of servers) {
+        server.once("close", () => {
+          remaining -= 1;
+          if (remaining === 0) {
+            clearTimeout(timer);
+            finish();
+          }
+        });
+        server.close();
+      }
     });
   }
 

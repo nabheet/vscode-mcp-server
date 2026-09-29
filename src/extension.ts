@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
-import { CROSS_BOUNDARY_HOST_DEFAULT, resolveIpcPath } from "./mcp/cluster/constants";
+import { resolveIpcPath } from "./mcp/cluster/constants";
+import {
+  buildBindHosts,
+  buildCrossBoundaryHosts,
+  detectBridgeAddresses,
+  detectDefaultGateway,
+} from "./mcp/cluster/gateway";
 import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
@@ -118,9 +124,9 @@ export function activate(context: vscode.ExtensionContext): void {
     outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
     outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
     if (isDevContainer) {
-      const boundary = leaderHost || CROSS_BOUNDARY_HOST_DEFAULT;
+      const chain = buildCrossBoundaryHosts(leaderHost || undefined, detectDefaultGateway());
       outputChannel.appendLine(
-        `[mcp] Cross-boundary discovery enabled — will probe ${boundary}:${port} for a host Leader`,
+        `[mcp] Cross-boundary discovery enabled — probing host leader at: ${chain.join(", ") || "(none)"}`,
       );
     }
   }
@@ -239,6 +245,9 @@ interface ClusterStartOptions {
   isDevContainer: boolean;
   /** Override for the cross-boundary host (container → host leader). */
   leaderHost?: string;
+  /** Injectable gateway/bridge detection (defaults to the real detectors). */
+  detectGateway?: () => string | null;
+  detectBridges?: () => string[];
   log: (msg: string) => void;
 }
 
@@ -254,20 +263,29 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
   const generation = ++startupGeneration;
   electing = true;
   try {
+    // Seamless discovery: container windows probe the host leader through an
+    // ordered chain (explicit leaderHost → host.docker.internal → detected
+    // default gateway); host windows reach a container leader via the
+    // loopback valid-probe + HTTP-join fallback, so they need no
+    // cross-boundary hosts. host.docker.internal is only a valid default for
+    // Docker dev containers; any other remote only probes when leaderHost is
+    // set explicitly.
+    const gateway = opts.isDevContainer ? (opts.detectGateway ?? detectDefaultGateway)() : null;
+    // Host leaders additionally bind detected Docker bridge addresses so
+    // containers can reach them at <gateway>:port (Linux native Docker has
+    // no host.docker.internal magic). Container leaders keep binding 0.0.0.0.
+    const bindHosts = opts.isRemoteContainer
+      ? [opts.host]
+      : buildBindHosts(opts.host, (opts.detectBridges ?? detectBridgeAddresses)());
     const newMember = await bootstrapCluster({
       basePort: opts.basePort,
       host: opts.host,
+      ...(bindHosts.length > 1 ? { hosts: bindHosts } : {}),
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
       ...(opts.ipcPath ? { ipcPath: opts.ipcPath } : {}),
-      // Container windows probe the host leader before promoting; host
-      // windows reach a container leader via the loopback valid-probe +
-      // HTTP-join fallback, so they need no cross-boundary hosts.
-      // host.docker.internal is only a valid default for Docker dev
-      // containers; any other remote only probes when leaderHost is set
-      // explicitly.
       ...(opts.isDevContainer
-        ? { crossBoundaryHosts: [opts.leaderHost || CROSS_BOUNDARY_HOST_DEFAULT] }
+        ? { crossBoundaryHosts: buildCrossBoundaryHosts(opts.leaderHost, gateway) }
         : opts.leaderHost
           ? { crossBoundaryHosts: [opts.leaderHost] }
           : {}),
@@ -306,7 +324,10 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     } else {
       newMember.setOnListen((url: string) => {
         let msg = `MCP server listening on ${url}`;
-        if (opts.isRemoteContainer) msg += " (remote container — use forwarded port)";
+        if (opts.isRemoteContainer) {
+          msg += " (remote container — use forwarded port)";
+          void ensureContainerForward(opts.basePort, opts.log);
+        }
         if (opts.authToken) msg += " [auth enabled]";
         opts.log(msg);
         console.log(`[vscode-mcp-server] ${msg}`);
@@ -331,6 +352,30 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     }, delay);
   } finally {
     electing = false;
+  }
+}
+
+/**
+ * Remote-container leaders: ask VS Code to establish the host→container port
+ * forwarding tunnel. `asExternalUri` "automatically establishes a port
+ * forwarding tunnel from the local machine to target on the remote" and
+ * returns the host-local URL — so host windows can reach the container leader
+ * even when devcontainer.json omits `forwardPorts`. VS Code usually picks the
+ * same port on the host; when it picks a different one, the log line below
+ * shows the actual host URL, and `forwardPorts` remains the deterministic
+ * opt-in. No-op when the tunnel already exists; only called for container
+ * leaders (this process runs inside the container).
+ */
+async function ensureContainerForward(port: number, log: (msg: string) => void): Promise<void> {
+  try {
+    const local = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${port}`));
+    log(`Container leader tunneled to host at ${local.toString()}`);
+  } catch (err) {
+    log(
+      `Could not establish host→container tunnel: ${
+        err instanceof Error ? err.message : String(err)
+      } — add "forwardPorts": [${port}] to devcontainer.json as fallback`,
+    );
   }
 }
 
