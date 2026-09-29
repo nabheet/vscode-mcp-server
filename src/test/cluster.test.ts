@@ -7,15 +7,18 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCluster } from "../mcp/cluster/bootstrap";
 import {
+  CLUSTER_MESSAGE_PATH,
+  CLUSTER_STREAM_PATH,
   DEFAULT_IPC_PATH,
   HEALTH_SERVICE,
   MAX_FRAME_BYTES,
   MSG,
   resolveIpcPath,
 } from "../mcp/cluster/constants";
-import { probePort } from "../mcp/cluster/election";
+import { probeHost, probePort } from "../mcp/cluster/election";
 import { closeIpcServer, createIpcServer, ensureIpcDir, isIpcAlive } from "../mcp/cluster/ipc";
 import { LeaderCoordinator } from "../mcp/cluster/leader";
+import { HttpMemberTransport } from "../mcp/cluster/memberTransport";
 import {
   createDecoder,
   encodeMessage,
@@ -144,6 +147,72 @@ function makeTool(
     inputSchema: { type: "object", properties: {} },
     handler: async (args) => ({ content: [{ type: "text", text: handler(args) }], isError: false }),
   };
+}
+
+// ── HTTP member-channel helpers (issue #94) ─────────────────────────
+
+/** Open the worker-side SSE receive leg for a session; resolves with headers. */
+function openMemberStream(port: number, sessionId: string): Promise<http.IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      `http://127.0.0.1:${port}${CLUSTER_STREAM_PATH}?id=${encodeURIComponent(sessionId)}`,
+      (res) => resolve(res),
+    );
+    req.on("error", reject);
+  });
+}
+
+/** Resolve with the first `data:` payload of an SSE stream, then close it. */
+function readSseEvent(res: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    res.on("data", (c: Buffer) => {
+      buffer += c.toString("utf-8");
+      let idx = buffer.indexOf("\n\n");
+      while (idx !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
+        if (dataLine) {
+          resolve(dataLine.slice(5).trim());
+          res.destroy();
+          return;
+        }
+        // Comment-only block (e.g. ": connected") — skip and keep reading.
+        idx = buffer.indexOf("\n\n");
+      }
+    });
+    res.on("error", reject);
+    res.on("end", () => reject(new Error("stream ended before an event")));
+  });
+}
+
+/** Minimal HTTP request that resolves with the status code. */
+function rawRequest(url: string, method: "GET" | "POST", body?: unknown): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const data = body === undefined ? undefined : JSON.stringify(body);
+    const req = http.request(
+      url,
+      {
+        method,
+        ...(data !== undefined
+          ? {
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(data),
+              },
+            }
+          : {}),
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode ?? 0));
+      },
+    );
+    req.on("error", reject);
+    if (data !== undefined) req.write(data);
+    req.end();
+  });
 }
 
 // ── Framing protocol ─────────────────────────────────────────────────
@@ -310,6 +379,47 @@ describe("cluster port probing", () => {
     try {
       const probe = await probePort(port, findFreeIpcPath());
       expect(probe.status).toBe("foreign");
+    } finally {
+      silent.close();
+    }
+  }, 10_000);
+
+  it("probeHost returns valid for a live MCP server", async () => {
+    const port = await findFreePort();
+    const srv = new McpServer({ port, host: "127.0.0.1" });
+    await srv.start();
+    try {
+      expect(await probeHost(port, "127.0.0.1")).toEqual({ status: "valid" });
+    } finally {
+      await srv.stop(1000);
+    }
+  });
+
+  it("probeHost returns free for an unbound port", async () => {
+    const port = await findFreePort();
+    expect(await probeHost(port, "127.0.0.1")).toEqual({ status: "free" });
+  });
+
+  it("probeHost returns foreign for an occupied non-MCP HTTP server", async () => {
+    const port = await findFreePort();
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "nothing here" }));
+    });
+    await new Promise<void>((resolve) => srv.listen(port, "127.0.0.1", resolve));
+    try {
+      expect(await probeHost(port, "127.0.0.1")).toEqual({ status: "foreign" });
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("probeHost returns timeout for a silent port (no IPC disambiguation)", async () => {
+    const port = await findFreePort();
+    const silent = net.createServer(() => {});
+    await new Promise<void>((resolve) => silent.listen(port, "127.0.0.1", resolve));
+    try {
+      expect(await probeHost(port, "127.0.0.1")).toEqual({ status: "timeout" });
     } finally {
       silent.close();
     }
@@ -696,6 +806,266 @@ describe("leader-worker cluster", () => {
   });
 });
 
+// ── HTTP member channel cluster (issue #94) ─────────────────────────
+// A worker joined over the SSE/POST member channel behaves exactly like an
+// IPC worker: REGISTER/WELCOME, CALL/RESULT, PING/PONG, UPDATE, failover.
+
+describe("HTTP member channel cluster", () => {
+  let port: number;
+  let leader: LeaderCoordinator;
+  let worker: WorkerCoordinator;
+  let leaderExec: ToolExecutor;
+  let workerExec: ToolExecutor;
+  let lostReasons: string[];
+  let logs: string[];
+
+  beforeEach(async () => {
+    port = await findFreePort();
+    lostReasons = [];
+    logs = [];
+
+    leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (a) => `echo from leader: ${a.msg ?? ""}`));
+    workerExec = new ToolExecutor();
+    workerExec.registerTool(makeTool("echo", (a) => `echo from worker: ${a.msg ?? ""}`));
+    workerExec.registerTool(makeTool("whoami_worker", () => "worker"));
+
+    leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: leaderExec,
+      workspaceId: "leader-ws",
+      workspacePaths: ["/mnt/leader"],
+      displayName: "Leader Window",
+      log: (m) => logs.push(m),
+    });
+    await leader.start();
+
+    worker = new WorkerCoordinator({
+      transport: new HttpMemberTransport({
+        baseUrl: `http://127.0.0.1:${port}`,
+        log: (m) => logs.push(m),
+      }),
+      executor: workerExec,
+      workspaceId: "worker-ws",
+      workspacePaths: ["/mnt/worker"],
+      displayName: "Worker Window",
+    });
+    worker.setOnLostLeader((reason) => lostReasons.push(reason));
+    await worker.start();
+  });
+
+  afterEach(async () => {
+    if (worker) await worker.stop(500).catch(() => {});
+    if (leader) await leader.stop(1000).catch(() => {});
+  });
+
+  const url = () => `http://127.0.0.1:${port}/mcp`;
+
+  function toolCall(name: string, args: Record<string, unknown>, extra?: Record<string, unknown>) {
+    return post(url(), {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args, ...extra },
+    });
+  }
+
+  it("registers the worker over the HTTP member channel", async () => {
+    const res = await toolCall("list_workspaces", {});
+    const parsed = JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
+    const ids = parsed.map((e) => e.id).sort();
+    expect(ids).toEqual(["leader-ws", "worker-ws"]);
+    const workerEntry = parsed.find((e) => e.id === "worker-ws");
+    expect(workerEntry?.displayName).toBe("Worker Window");
+  });
+
+  it("routes a call to the HTTP worker and ships the result back", async () => {
+    const res = await toolCall("echo", { msg: "hi" }, { workspace: "worker-ws" });
+    expect(res.status).toBe(200);
+    expect(res.body.result.content[0].text).toBe("echo from worker: hi");
+  });
+
+  it("keeps leader-local calls local when a worker is over HTTP", async () => {
+    const res = await toolCall("echo", { msg: "hi" }, { workspace: "leader-ws" });
+    expect(res.body.result.content[0].text).toBe("echo from leader: hi");
+  });
+
+  it("propagates window-state updates over the member channel", async () => {
+    worker.updateState({
+      activeFile: "/mnt/worker/src/main.ts",
+      openEditors: ["/mnt/worker/src/main.ts"],
+    });
+    await vi.waitFor(
+      async () => {
+        const res = await toolCall("list_workspaces", {});
+        const parsed = JSON.parse(res.body.result.content[0].text) as WorkspaceRow[];
+        const workerEntry = parsed.find((e) => e.id === "worker-ws");
+        expect(workerEntry?.state.activeFile).toBe("/mnt/worker/src/main.ts");
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("answers PING with PONG on the raw member channel", async () => {
+    const sessionId = "sess-raw-ping";
+    const stream = await openMemberStream(port, sessionId);
+    try {
+      const pongPromise = readSseEvent(stream);
+      const status = await rawRequest(
+        `http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=${sessionId}`,
+        "POST",
+        { type: MSG.PING },
+      );
+      expect(status).toBe(202);
+      const data = await pongPromise;
+      expect(JSON.parse(data)).toMatchObject({ type: MSG.PONG });
+    } finally {
+      stream.destroy();
+    }
+  }, 10_000);
+
+  it("fires the lost-leader handler when the leader stops (SSE closes)", async () => {
+    await leader.stop(500);
+    await vi.waitFor(() => expect(lostReasons.length).toBeGreaterThan(0), { timeout: 3000 });
+  });
+});
+
+// ── Member channel HTTP guards (issue #94) ──────────────────────────
+// The two /cluster routes mount only when the Leader opts in via
+// memberChannel, and are guarded like the rest of the server: origin
+// checks, bearer auth, session id, body cap.
+
+describe("member channel HTTP guards", () => {
+  it("returns 404 for the member channel when the server has no memberChannel", async () => {
+    const port = await findFreePort();
+    const srv = new McpServer({ port, host: "127.0.0.1" });
+    await srv.start();
+    try {
+      expect(await rawRequest(`http://127.0.0.1:${port}${CLUSTER_STREAM_PATH}?id=x`, "GET")).toBe(
+        404,
+      );
+      expect(
+        await rawRequest(`http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=x`, "POST", {
+          type: MSG.PING,
+        }),
+      ).toBe(404);
+    } finally {
+      await srv.stop(1000);
+    }
+  });
+
+  it("rejects member requests without a session id", async () => {
+    const port = await findFreePort();
+    const leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: new ToolExecutor(),
+      workspaceId: "l",
+      workspacePaths: ["/mnt/l"],
+      displayName: "L",
+    });
+    await leader.start();
+    try {
+      expect(await rawRequest(`http://127.0.0.1:${port}${CLUSTER_STREAM_PATH}`, "GET")).toBe(400);
+      expect(
+        await rawRequest(`http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}`, "POST", {
+          type: MSG.PING,
+        }),
+      ).toBe(400);
+    } finally {
+      await leader.stop(500);
+    }
+  });
+
+  it("returns 404 for a POST to an unknown member session", async () => {
+    const port = await findFreePort();
+    const leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: new ToolExecutor(),
+      workspaceId: "l",
+      workspacePaths: ["/mnt/l"],
+      displayName: "L",
+    });
+    await leader.start();
+    try {
+      expect(
+        await rawRequest(
+          `http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=never-registered`,
+          "POST",
+          { type: MSG.PING },
+        ),
+      ).toBe(404);
+    } finally {
+      await leader.stop(500);
+    }
+  });
+
+  it("rejects an oversized member POST body with 413", async () => {
+    const port = await findFreePort();
+    const leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: new ToolExecutor(),
+      workspaceId: "l",
+      workspacePaths: ["/mnt/l"],
+      displayName: "L",
+    });
+    await leader.start();
+    try {
+      const big = { type: MSG.PING, pad: "x".repeat(11 * 1024 * 1024) };
+      expect(
+        await rawRequest(
+          `http://127.0.0.1:${port}${CLUSTER_MESSAGE_PATH}?id=whatever`,
+          "POST",
+          big,
+        ),
+      ).toBe(413);
+    } finally {
+      await leader.stop(500);
+    }
+  }, 15_000);
+
+  it("rejects member requests from a browser origin (DNS-rebinding guard)", async () => {
+    const port = await findFreePort();
+    const leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: new ToolExecutor(),
+      workspaceId: "l",
+      workspacePaths: ["/mnt/l"],
+      displayName: "L",
+    });
+    await leader.start();
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.get(
+          {
+            host: "127.0.0.1",
+            port,
+            path: `${CLUSTER_STREAM_PATH}?id=x`,
+            headers: { Origin: "http://evil.example" },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on("error", reject);
+      });
+      expect(status).toBe(403);
+    } finally {
+      await leader.stop(500);
+    }
+  });
+});
+
 // ── Window state descriptor (issue #76) ─────────────────────────────
 
 describe("window state descriptor", () => {
@@ -945,6 +1315,97 @@ describe("cluster bootstrap", () => {
       params: { name: "echo", arguments: { msg: "hi" }, workspace: "w1" },
     });
     expect(res.body.result.content[0].text).toBe("worker: hi");
+    await worker.stop(500);
+    await leader.stop(500);
+  });
+
+  it("joins a leader over HTTP when the IPC join fails (remote fallback)", async () => {
+    const port = await findFreePort();
+    const leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (a) => `leader: ${a.msg ?? ""}`));
+    const leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: leaderExec,
+      workspaceId: "m1",
+      workspacePaths: ["/mnt/m"],
+      displayName: "M",
+    });
+    await leader.start();
+
+    const workerExec = new ToolExecutor();
+    workerExec.registerTool(makeTool("echo", (a) => `worker: ${a.msg ?? ""}`));
+    // Deliberately different IPC path: the valid-port probe sees the leader,
+    // the IPC join fails (nothing listens at OUR path), and bootstrap must
+    // fall back to the HTTP member channel on the same host:port — the
+    // container→host scenario where the port is forwarded but the pipe is not.
+    const worker = await bootstrapCluster({
+      basePort: port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      executor: workerExec,
+      workspaceId: "w1",
+      workspacePaths: ["/mnt/w"],
+      displayName: "W",
+    });
+
+    expect(worker.role).toBe("worker");
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "echo", arguments: { msg: "hi" }, workspace: "w1" },
+    });
+    expect(res.body.result.content[0].text).toBe("worker: hi");
+    await worker.stop(500);
+    await leader.stop(500);
+  });
+
+  it("joins a leader in another namespace via crossBoundaryHosts", async () => {
+    // The leader lives on a second loopback address ("the host"). The
+    // bootstrap window probes 127.0.0.1 (free), then the cross-boundary host,
+    // and joins over the HTTP member channel instead of promoting — the
+    // container→host.docker.internal scenario.
+    const port = await findFreePort();
+    // IPv6 loopback as the "other namespace" address: always bindable without
+    // root, unlike 127.x aliases on macOS. Bracket it in URLs per RFC 3986.
+    const hostIp = "::1";
+    const origin = `http://[${hostIp}]:${port}`;
+    const leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (a) => `host leader: ${a.msg ?? ""}`));
+    const leader = new LeaderCoordinator({
+      port,
+      host: hostIp,
+      ipcPath: findFreeIpcPath(),
+      executor: leaderExec,
+      workspaceId: "host-leader",
+      workspacePaths: ["/mnt/host"],
+      displayName: "Host Leader",
+    });
+    await leader.start();
+
+    const workerExec = new ToolExecutor();
+    workerExec.registerTool(makeTool("echo", (a) => `container worker: ${a.msg ?? ""}`));
+    const worker = await bootstrapCluster({
+      basePort: port,
+      host: "127.0.0.1",
+      ipcPath: findFreeIpcPath(),
+      crossBoundaryHosts: [hostIp],
+      executor: workerExec,
+      workspaceId: "container-w",
+      workspacePaths: ["/mnt/container"],
+      displayName: "Container W",
+    });
+
+    expect(worker.role).toBe("worker");
+    const res = await post(`${origin}/mcp`, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "echo", arguments: { msg: "hi" }, workspace: "container-w" },
+    });
+    expect(res.body.result.content[0].text).toBe("container worker: hi");
     await worker.stop(500);
     await leader.stop(500);
   });

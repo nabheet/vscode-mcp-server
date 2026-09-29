@@ -2,17 +2,19 @@
  * WorkerCoordinator — a non-leader VS Code window.
  *
  * Responsibilities:
- *  - Connect to the Leader's IPC pipe and register this window's workspace.
+ *  - Connect to the Leader over a MemberTransport (IPC socket, or the HTTP
+ *    member channel for cross-namespace windows) and register this window's
+ *    workspace.
  *  - Execute forwarded tool payloads locally (this process's vscode API).
  *  - Send a heartbeat (PING) and watch for PONG; two missed PONGs mean the
- *    Leader's event loop is frozen, so force-close the socket and trigger
+ *    Leader's event loop is frozen, so tear the transport down and trigger
  *    re-election.
- *  - On IPC close/error, immediately trigger re-election.
+ *  - On transport close/error, immediately trigger re-election.
  *
- * Pure Node (no vscode API); workspace identity, executor, and the
- * re-election callback are injected by extension.ts.
+ * The coordinator is transport-agnostic: only the framing differs between
+ * IPC and the member channel. Pure Node (no vscode API); workspace identity,
+ * executor, and the re-election callback are injected by extension.ts.
  */
-import type * as net from "node:net";
 import type { JsonRpcResponse } from "../../utils/types";
 import { BusyError, type ToolExecutor } from "../executor";
 import {
@@ -22,12 +24,14 @@ import {
   MSG,
   REGISTER_TIMEOUT_MS,
 } from "./constants";
-import { connectIpc } from "./ipc";
-import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
+import { IpcMemberTransport, type MemberTransport } from "./memberTransport";
+import type { IpcMessage, WindowState } from "./protocol";
 
 export interface WorkerOptions {
   ipcPath?: string;
   connectTimeoutMs?: number;
+  /** Override the default IPC transport (e.g. HTTP member channel). */
+  transport?: MemberTransport;
   executor: ToolExecutor;
   workspaceId: string;
   workspacePaths: string[];
@@ -45,7 +49,7 @@ export class WorkerCoordinator {
   private readonly opts: WorkerOptions;
   private readonly ipcPath: string;
   private lostLeaderHandler: (reason: string) => void = () => {};
-  private socket: net.Socket | null = null;
+  private transport: MemberTransport | null = null;
   private stopped = false;
   private registered = false;
   private state: WindowState = { openEditors: [] };
@@ -66,42 +70,32 @@ export class WorkerCoordinator {
     this.registered = false;
     this.missedPongs = 0;
 
-    const socket = await connectIpc(this.ipcPath, this.opts.connectTimeoutMs);
+    const transport =
+      this.opts.transport ?? new IpcMemberTransport(this.ipcPath, this.opts.connectTimeoutMs);
+    transport.onMessage = (msg) => this.onMessage(msg);
+    transport.onClose = (reason) => this.failOver(reason);
+    await transport.connect();
     if (this.stopped) {
-      socket.destroy();
+      transport.close();
       throw new Error("Worker stopped while connecting");
     }
-    this.socket = socket;
+    this.transport = transport;
     this.lastPongAt = Date.now();
-    socket.setNoDelay(true);
-
-    const decode = createDecoder((msg) => this.onMessage(msg));
-    socket.on("data", (chunk: Buffer) => {
-      try {
-        decode(chunk);
-      } catch {
-        this.failOver("corrupt IPC frame from leader");
-      }
-    });
-    socket.on("close", () => this.failOver("IPC socket closed"));
-    socket.on("error", () => this.failOver("IPC socket error"));
 
     // Register with the Leader and wait for WELCOME.
     const welcome = new Promise<void>((resolve, reject) => {
       this.welcomeResolve = resolve;
       this.welcomeReject = reject;
     });
-    socket.write(
-      encodeMessage({
-        type: MSG.REGISTER,
-        id: this.opts.workspaceId,
-        workspacePaths: this.opts.workspacePaths,
-        displayName: this.opts.displayName,
-        instanceId: this.opts.instanceId,
-        instanceName: this.opts.instanceName,
-        state: this.state,
-      }),
-    );
+    transport.send({
+      type: MSG.REGISTER,
+      id: this.opts.workspaceId,
+      workspacePaths: this.opts.workspacePaths,
+      displayName: this.opts.displayName,
+      instanceId: this.opts.instanceId,
+      instanceName: this.opts.instanceName,
+      state: this.state,
+    });
     await Promise.race([
       welcome,
       new Promise<never>((_, reject) => {
@@ -120,7 +114,7 @@ export class WorkerCoordinator {
     this.heartbeatTimer = setInterval(() => this.heartbeatTick(), HEARTBEAT_INTERVAL_MS);
     this.heartbeatTimer.unref?.();
     this.opts.log?.(
-      `[worker] registered with leader on ${this.ipcPath} as ${this.opts.displayName}`,
+      `[worker] registered with leader via ${transport.kind} transport as ${this.opts.displayName}`,
     );
   }
 
@@ -133,44 +127,32 @@ export class WorkerCoordinator {
    * Publish a window-state change (active file / open editors) to the
    * Leader. Before registration the value is only stored locally — it is
    * carried in the REGISTER payload so the Leader never sees a window
-   * without state. After REGISTERED, each call sends MSG.UPDATE over IPC.
+   * without state. After REGISTERED, each call sends MSG.UPDATE.
    */
   updateState(state: WindowState): void {
     this.state = state;
-    if (!this.registered || !this.socket || this.socket.destroyed) return;
-    try {
-      this.socket.write(encodeMessage({ type: MSG.UPDATE, state }));
-    } catch {
-      this.failOver("UPDATE write failed");
-    }
+    if (!this.registered || !this.transport || this.transport.destroyed) return;
+    this.transport.send({ type: MSG.UPDATE, state });
   }
 
-  async stop(timeoutMs = 3000): Promise<void> {
+  async stop(_timeoutMs = 3000): Promise<void> {
     this.stopped = true;
     this.rejectWelcome(new Error("Worker stopped"));
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
-    const socket = this.socket;
-    this.socket = null;
-    if (socket && !socket.destroyed) {
-      socket.destroy();
-      await Promise.race([
-        new Promise<void>((resolve) => socket.once("close", () => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, timeoutMs).unref?.()),
-      ]);
+    const transport = this.transport;
+    this.transport = null;
+    if (transport) {
+      transport.close();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0).unref?.());
     }
   }
 
   private heartbeatTick(): void {
-    if (this.stopped || !this.socket || this.socket.destroyed) return;
-    try {
-      this.socket.write(encodeMessage({ type: MSG.PING }));
-    } catch {
-      this.failOver("PING write failed");
-      return;
-    }
+    if (this.stopped || !this.transport || this.transport.destroyed) return;
+    this.transport.send({ type: MSG.PING });
     if (Date.now() - this.lastPongAt > HEARTBEAT_INTERVAL_MS) {
       this.missedPongs++;
       if (this.missedPongs >= HEARTBEAT_MISS_LIMIT) {
@@ -216,12 +198,8 @@ export class WorkerCoordinator {
       const code = err instanceof BusyError ? -32050 : -32603;
       response = { jsonrpc: "2.0", id: extractRequestId(rawBody), error: { code, message: msg } };
     }
-    if (this.stopped || !this.socket || this.socket.destroyed) return;
-    try {
-      this.socket.write(encodeMessage({ type: MSG.RESULT, callId, response }));
-    } catch {
-      this.failOver("RESULT write failed");
-    }
+    if (this.stopped || !this.transport || this.transport.destroyed) return;
+    this.transport.send({ type: MSG.RESULT, callId, response });
   }
 
   private failOver(reason: string): void {
@@ -232,10 +210,8 @@ export class WorkerCoordinator {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
-    if (this.socket && !this.socket.destroyed) {
-      this.socket.destroy();
-    }
-    this.socket = null;
+    this.transport?.close();
+    this.transport = null;
     this.opts.log?.(`[worker] lost leader: ${reason}`);
     this.lostLeaderHandler(reason);
   }

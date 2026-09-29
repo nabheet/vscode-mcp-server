@@ -74,6 +74,12 @@
           "default": "",
           "scope": "machine-overridable",
           "description": "Path to the cluster IPC socket (POSIX) or named pipe (Windows) shared by all VS Code windows. Empty string = auto: VSCODE_MCP_IPC_PATH env var, then a dedicated subdirectory of the OS temp dir on POSIX (<tmpdir>/vscode-mcp/ipc.sock) or the well-known named pipe on Windows. All windows in the cluster must use the same value."
+        },
+        "vscode-mcp-server.leaderHost": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Host a Docker dev-container window probes to find a Leader running on the host (empty string = auto: MCP_LEADER_HOST env var, then host.docker.internal). Only needed when the container cannot reach the host loopback via host.docker.internal (e.g. Linux Docker with a custom extra_hosts entry), or for non-dev-container remotes that want cross-boundary discovery."
         }
       }
     }

@@ -1,10 +1,11 @@
-import * as crypto from "crypto";
-import * as fs from "fs";
-import * as http from "http";
-import * as https from "https";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as https from "node:https";
 import { Metrics } from "../utils/metrics";
 import type { ServerLog } from "../utils/serverLog";
 import type { JsonRpcResponse, ToolDefinition, ToolListItem } from "../utils/types";
+import { CLUSTER_MESSAGE_PATH, CLUSTER_STREAM_PATH } from "./cluster/constants";
 import { BusyError, ToolExecutor } from "./executor";
 
 export { BusyError };
@@ -40,6 +41,24 @@ export interface McpRouter {
   route(rawBody: string): Promise<McpRouterResult | null>;
 }
 
+/**
+ * Cluster "member channel" (Leader only). Bridges the Worker↔Leader protocol
+ * across mount namespaces (dev container ↔ host) over HTTP/SSE on the same
+ * port the server already listens on:
+ *
+ *   GET  /cluster/stream?id=<sessionId>   SSE — leader→worker
+ *   POST /cluster/message?id=<sessionId>  one JSON IpcMessage — worker→leader
+ *
+ * The Leader's cluster layer owns the routing (who is a member, session
+ * bookkeeping); the server only parses the session id and hands off.
+ */
+export interface MemberChannel {
+  /** Leader→worker SSE stream for a worker-chosen session id. */
+  handleStream(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void;
+  /** Worker→leader protocol message POST. Must write its own response. */
+  handleMessage(sessionId: string, rawBody: string, res: http.ServerResponse): void;
+}
+
 export interface McpServerOptions {
   port: number;
   host: string;
@@ -61,6 +80,9 @@ export interface McpServerOptions {
   logger?: ServerLog;
   /** Cluster routing hook (Leader only). */
   router?: McpRouter;
+  /** Cluster member channel (Leader only) — HTTP/SSE bridge for
+   *  cross-namespace workers (dev container ↔ host). */
+  memberChannel?: MemberChannel;
   /**
    * Shared tool executor (single instance per process, created in
    * extension.ts and reused by the Leader's server, the Leader's router,
@@ -143,7 +165,7 @@ export class McpServer {
         } catch (err) {
           reject(
             new Error(
-              "Failed to load TLS cert/key: " + (err instanceof Error ? err.message : String(err)),
+              `Failed to load TLS cert/key: ${err instanceof Error ? err.message : String(err)}`,
             ),
           );
           return;
@@ -154,7 +176,7 @@ export class McpServer {
 
       this.server.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") {
-          reject(new Error("Port " + this.options.port + " is already in use"));
+          reject(new Error(`Port ${this.options.port} is already in use`));
         } else {
           reject(err);
         }
@@ -162,7 +184,7 @@ export class McpServer {
 
       this.server.listen(this.options.port, this.options.host, () => {
         const scheme = this.useTls ? "https" : "http";
-        this.onListen?.(scheme + "://" + this.options.host + ":" + this.options.port + "/mcp");
+        this.onListen?.(`${scheme}://${this.options.host}:${this.options.port}/mcp`);
         this.startLagMonitor();
         resolve();
       });
@@ -204,12 +226,12 @@ export class McpServer {
         finish();
       }, timeoutMs);
 
-      this.server!.once("close", () => {
+      this.server?.once("close", () => {
         clearTimeout(timer);
         finish();
       });
 
-      this.server!.close();
+      this.server?.close();
     });
   }
 
@@ -218,7 +240,7 @@ export class McpServer {
   /** Get the base URL for the server (scheme + host + port). */
   private getServerBase(): string {
     const scheme = this.useTls ? "https" : "http";
-    return scheme + "://" + this.options.host + ":" + this.options.port;
+    return `${scheme}://${this.options.host}:${this.options.port}`;
   }
 
   /** Check if a request origin is allowed. Only loopback origins are valid. */
@@ -249,8 +271,8 @@ export class McpServer {
   /** Verify bearer token using timing-safe comparison. */
   private authFailed(req: http.IncomingMessage, res: http.ServerResponse): boolean {
     if (!this.options.authToken) return false;
-    const auth = req.headers["authorization"] || "";
-    const origin = req.headers["origin"] as string | undefined;
+    const auth = req.headers.authorization || "";
+    const origin = req.headers.origin as string | undefined;
     if (!auth.startsWith("Bearer ")) {
       this.writeCorsHeaders(res, origin);
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -311,7 +333,7 @@ export class McpServer {
   }
 
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const origin = req.headers["origin"] as string | undefined;
+    const origin = req.headers.origin as string | undefined;
     const pathname = (req.url || "").split("?")[0];
 
     // Health check — carries the cluster signature so other instances can
@@ -350,6 +372,21 @@ export class McpServer {
     const msgMatch = pathname.match(/^\/mcp\/session\/([a-f0-9-]+)\/message$/);
     if (req.method === "POST" && msgMatch) {
       this.handleSseMessage(req, res, msgMatch[1]);
+      return;
+    }
+
+    // ── Cluster member channel (cross-namespace workers) ─────────────
+    // Worker→Leader SSE stream (GET) and protocol messages (POST). Mounted
+    // only when the Leader opts in via the memberChannel option; the two
+    // legs are intentionally cheap to guard: origin checks reject
+    // DNS-rebinding browser traffic, and the existing bearer check applies
+    // when authToken is configured.
+    if (req.method === "GET" && pathname === CLUSTER_STREAM_PATH) {
+      this.handleMemberStream(req, res);
+      return;
+    }
+    if (req.method === "POST" && pathname === CLUSTER_MESSAGE_PATH) {
+      this.handleMemberMessage(req, res);
       return;
     }
 
@@ -466,7 +503,7 @@ export class McpServer {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const code = err instanceof BusyError ? -32050 : -32603;
-        const message = err instanceof BusyError ? msg : "Internal error: " + msg;
+        const message = err instanceof BusyError ? msg : `Internal error: ${msg}`;
         session.sendEvent(
           "message",
           JSON.stringify({
@@ -479,6 +516,99 @@ export class McpServer {
     });
 
     req.on("error", () => {});
+  }
+
+  /** Member channel SSE leg: leader→worker stream for a session. */
+  private handleMemberStream(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const origin = req.headers.origin as string | undefined;
+    // Worker GETs carry no Origin (non-browser client) and pass; a webpage
+    // EventSource carries one and is rejected unless loopback.
+    if (!this.isValidOrigin(origin)) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ error: "Forbidden: CORS requests from this origin are not allowed" }),
+      );
+      return;
+    }
+    if (this.authFailed(req, res)) return;
+
+    const member = this.options.memberChannel;
+    if (!member) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Cluster member channel is not enabled" }));
+      return;
+    }
+
+    const sessionId = McpServer.queryId(req.url);
+    if (!sessionId) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing session id" }));
+      return;
+    }
+
+    member.handleStream(req, res, sessionId);
+  }
+
+  /** Member channel POST leg: one protocol message from a worker. */
+  private handleMemberMessage(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const origin = req.headers.origin as string | undefined;
+    if (!this.isValidOrigin(origin)) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ error: "Forbidden: CORS requests from this origin are not allowed" }),
+      );
+      return;
+    }
+    if (this.authFailed(req, res)) return;
+
+    const member = this.options.memberChannel;
+    if (!member) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Cluster member channel is not enabled" }));
+      return;
+    }
+
+    const sessionId = McpServer.queryId(req.url);
+    if (!sessionId) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing session id" }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let bodySize = 0;
+    const MAX_BODY = 10 * 1024 * 1024;
+
+    req.on("data", (chunk: Buffer) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY) return;
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      if (bodySize > MAX_BODY) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload Too Large: max 10 MB" }));
+        return;
+      }
+      const rawBody = Buffer.concat(chunks).toString("utf-8");
+      member.handleMessage(sessionId, rawBody, res);
+    });
+
+    req.on("error", () => {});
+  }
+
+  /** Extract the `id` query param from a request URL ("" when absent). */
+  private static queryId(url: string | undefined): string {
+    const q = (url || "").indexOf("?");
+    if (q === -1) return "";
+    return new URLSearchParams(url?.slice(q + 1)).get("id") || "";
   }
 
   /** Direct POST /mcp — inline JSON-RPC response (backward compat). */
@@ -588,7 +718,7 @@ export class McpServer {
           JSON.stringify({
             jsonrpc: "2.0",
             id: null,
-            error: { code: -32603, message: "Internal error: " + msg },
+            error: { code: -32603, message: `Internal error: ${msg}` },
           }),
         );
       } finally {

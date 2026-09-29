@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
-import { resolveIpcPath } from "./mcp/cluster/constants";
+import { CROSS_BOUNDARY_HOST_DEFAULT, resolveIpcPath } from "./mcp/cluster/constants";
 import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
@@ -93,12 +93,17 @@ export function activate(context: vscode.ExtensionContext): void {
   // IPC path precedence: explicit setting → env var → default (see
   // resolveIpcPath). All windows in the cluster must share the same value.
   const ipcPath = resolveIpcPath(config.get<string>("ipcPath"), process.env.VSCODE_MCP_IPC_PATH);
+  // Host to reach a Leader outside this container (Docker Desktop resolves
+  // host.docker.internal to the host loopback). Setting/env only needed when
+  // the default is wrong for the user's container networking.
+  const leaderHost = config.get<string>("leaderHost") || process.env.MCP_LEADER_HOST || "";
 
   // Detect remote container
-  const isRemoteContainer =
-    vscode.env.remoteName === "dev-container" ||
-    vscode.env.remoteName === "attached-container" ||
-    false;
+  const remoteName = vscode.env.remoteName;
+  // Docker dev container — the only remote where host.docker.internal is a
+  // sensible default for reaching the host leader.
+  const isDevContainer = remoteName === "dev-container";
+  const isRemoteContainer = isDevContainer || remoteName === "attached-container";
   const host = isRemoteContainer ? "0.0.0.0" : "127.0.0.1";
 
   // Validate TLS config
@@ -112,6 +117,12 @@ export function activate(context: vscode.ExtensionContext): void {
   if (isRemoteContainer) {
     outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
     outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
+    if (isDevContainer) {
+      const boundary = leaderHost || CROSS_BOUNDARY_HOST_DEFAULT;
+      outputChannel.appendLine(
+        `[mcp] Cross-boundary discovery enabled — will probe ${boundary}:${port} for a host Leader`,
+      );
+    }
   }
   if (authToken) {
     outputChannel.appendLine(
@@ -161,6 +172,8 @@ export function activate(context: vscode.ExtensionContext): void {
     instanceName,
     state: currentWindowState(),
     isRemoteContainer,
+    isDevContainer,
+    leaderHost,
     log: (msg: string) => outputChannel?.appendLine(`[mcp] ${msg}`),
   });
 
@@ -222,6 +235,10 @@ interface ClusterStartOptions {
   instanceName: string;
   state: WindowState;
   isRemoteContainer: boolean;
+  /** True only for Docker dev containers (host.docker.internal applies). */
+  isDevContainer: boolean;
+  /** Override for the cross-boundary host (container → host leader). */
+  leaderHost?: string;
   log: (msg: string) => void;
 }
 
@@ -243,6 +260,17 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
       ...(opts.ipcPath ? { ipcPath: opts.ipcPath } : {}),
+      // Container windows probe the host leader before promoting; host
+      // windows reach a container leader via the loopback valid-probe +
+      // HTTP-join fallback, so they need no cross-boundary hosts.
+      // host.docker.internal is only a valid default for Docker dev
+      // containers; any other remote only probes when leaderHost is set
+      // explicitly.
+      ...(opts.isDevContainer
+        ? { crossBoundaryHosts: [opts.leaderHost || CROSS_BOUNDARY_HOST_DEFAULT] }
+        : opts.leaderHost
+          ? { crossBoundaryHosts: [opts.leaderHost] }
+          : {}),
       executor: opts.executor,
       metrics: opts.metrics,
       logger: opts.logger,

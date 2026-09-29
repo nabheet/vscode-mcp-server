@@ -117,3 +117,42 @@ export const MSG = {
   /** Worker → Leader: window state changed (active file / open editors). */
   UPDATE: "UPDATE",
 } as const;
+
+// ── Member channel (HTTP/SSE) ────────────────────────────────────────
+//
+// The same Leader-Worker protocol travels over a TCP/HTTP "member channel"
+// when the two windows cannot share the IPC pipe (different mount
+// namespaces — a dev-container window joining the host leader and vice
+// versa). The channel reuses the Leader's single HTTP port, so no extra
+// port or firewall rule is needed:
+//
+//   Worker → Leader:  POST /cluster/message?id=<sessionId>
+//                     body = one JSON IpcMessage; Leader acks 202.
+//   Leader → Worker:  GET  /cluster/stream?id=<sessionId>   (SSE)
+//                     event: message, one JSON IpcMessage per data: line.
+//
+// sessionId is a worker-generated UUID; both legs of the channel carry it
+// so the Leader can associate the SSE stream with the POSTs that target it.
+//
+// v1 ships WITHOUT cluster-specific auth (issue #94 scope decision). Two
+// cheap guards apply: CORS/origin checks (a malicious webpage cannot drive
+// the channel via DNS rebinding) and the existing bearer-token check when
+// the server is configured with authToken (all cluster windows must share
+// that token). Mutual-auth + TLS is planned as an opt-in v2.
+
+/** SSE receive leg of the member channel. */
+export const CLUSTER_STREAM_PATH = "/cluster/stream";
+
+/** POST send leg of the member channel. */
+export const CLUSTER_MESSAGE_PATH = "/cluster/message";
+
+/** Timeout for member-channel HTTP POSTs (REGISTER / CALL / PING / UPDATE). */
+export const MEMBER_HTTP_TIMEOUT_MS = 10_000;
+
+/**
+ * Default cross-boundary host a container window probes to reach the host
+ * leader (Docker Desktop / OrbStack resolve this to the host loopback).
+ * Linux docker daemons need `extra_hosts: ["host.docker.internal:host-gateway"]`
+ * in devcontainer.json — see the README.
+ */
+export const CROSS_BOUNDARY_HOST_DEFAULT = "host.docker.internal";
