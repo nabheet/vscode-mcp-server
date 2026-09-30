@@ -133,10 +133,42 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
       router: this,
       memberChannel: this,
     });
+  }
 
-    // Discovery tool: lets MCP clients enumerate the windows in the cluster
-    // and target a specific one via the `workspace` argument on tools/call.
-    opts.executor.registerTool(
+  get url(): string {
+    const scheme = this.opts.tlsCertPath && this.opts.tlsKeyPath ? "https" : "http";
+    return `${scheme}://${this.opts.host}:${this.opts.port}/mcp`;
+  }
+
+  get port(): number {
+    return this.opts.port;
+  }
+
+  setOnListen(cb: (url: string) => void): void {
+    this.server.setOnListen(cb);
+  }
+
+  async start(): Promise<void> {
+    this.registerDiscoveryTool();
+    try {
+      await this.server.start();
+    } catch (err) {
+      // Promotion lost (port already bound by a live leader). The window
+      // falls back to joining as a worker on the same shared executor, so
+      // the leader-only tool must not linger on it.
+      this.unregisterDiscoveryTool();
+      throw err;
+    }
+  }
+
+  /**
+   * Leader-only discovery tool: lets MCP clients enumerate the windows in the
+   * cluster and target a specific one via the `workspace` argument on
+   * tools/call. Registered when serving starts (not in the constructor) so a
+   * window that loses the promotion race never advertises it.
+   */
+  private registerDiscoveryTool(): void {
+    this.opts.executor.registerTool(
       defineTool(
         "list_workspaces",
         "List all VS Code windows/workspaces served by this MCP endpoint. Each entry has an id, display name, and workspace folders. Pass the id or a folder path as the `workspace` argument to tools/call or tools/list to target that window.",
@@ -144,11 +176,11 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
         async () => {
           const rows = [
             {
-              id: opts.workspaceId,
-              instanceId: opts.instanceId,
-              instanceName: opts.instanceName,
-              displayName: opts.displayName,
-              folders: opts.workspacePaths,
+              id: this.opts.workspaceId,
+              instanceId: this.opts.instanceId,
+              instanceName: this.opts.instanceName,
+              displayName: this.opts.displayName,
+              folders: this.opts.workspacePaths,
               role: "leader",
               state: this.localState,
             },
@@ -171,21 +203,9 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     );
   }
 
-  get url(): string {
-    const scheme = this.opts.tlsCertPath && this.opts.tlsKeyPath ? "https" : "http";
-    return `${scheme}://${this.opts.host}:${this.opts.port}/mcp`;
-  }
-
-  get port(): number {
-    return this.opts.port;
-  }
-
-  setOnListen(cb: (url: string) => void): void {
-    this.server.setOnListen(cb);
-  }
-
-  async start(): Promise<void> {
-    await this.server.start();
+  /** Drop the discovery tool when this window stops serving as leader. */
+  private unregisterDiscoveryTool(): void {
+    this.opts.executor.unregisterTool("list_workspaces");
   }
 
   async stop(timeoutMs = 5000): Promise<void> {
@@ -198,6 +218,9 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     this.httpPeers.clear();
     await this.server.stop(timeoutMs);
     this.workers.clear();
+    // The window is no longer a leader; drop the leader-only tool from the
+    // shared executor so it does not leak into a subsequent worker role.
+    this.unregisterDiscoveryTool();
   }
 
   // ── Cluster routing (McpRouter) ────────────────────────────────────

@@ -1189,3 +1189,45 @@ describe("wire-level instance identity", () => {
     expect(names).not.toContain("list_workspaces");
   });
 });
+
+describe("promotion failure cleanup", () => {
+  it("unregisters the leader-only discovery tool when the HTTP bind fails", async () => {
+    const port = await findFreePort();
+
+    const exec1 = new ToolExecutor();
+    exec1.registerTool(makeTool("echo", (a) => `m1: ${a.msg ?? ""}`));
+    const leader1 = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      executor: exec1,
+      workspaceId: "m1",
+      workspacePaths: ["/mnt/m1"],
+      displayName: "M1",
+    });
+    await leader1.start();
+
+    const exec2 = new ToolExecutor();
+    exec2.registerTool(makeTool("echo", (a) => `m2: ${a.msg ?? ""}`));
+    const leader2 = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      executor: exec2,
+      workspaceId: "m2",
+      workspacePaths: ["/mnt/m2"],
+      displayName: "M2",
+    });
+
+    try {
+      // Same HTTP port: the live leader holds it, so the second promotion
+      // fails with EADDRINUSE. The window then falls back to joining as a
+      // worker on the same shared executor — the leader-only tool must not
+      // linger on it.
+      await expect(leader2.start()).rejects.toThrow(/already in use/);
+      expect(exec2.hasTool("list_workspaces")).toBe(false);
+      expect(exec1.hasTool("list_workspaces")).toBe(true);
+    } finally {
+      await leader2.stop(300).catch(() => {});
+      await leader1.stop(500).catch(() => {});
+    }
+  });
+});
