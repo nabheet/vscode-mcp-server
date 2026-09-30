@@ -10,9 +10,17 @@
  *    • free    → if crossBoundaryHosts is configured, probe each candidate
  *                host (e.g. host.docker.internal) before promoting:
  *                - valid   → join over HTTP. Join failure → retry same port.
- *                - timeout → possible frozen Leader → retry same port.
+ *                - timeout → possible frozen Leader in the other namespace,
+ *                            but only for CROSS_BOUNDARY_TIMEOUT_LIMIT
+ *                            consecutive attempts. A host that never answers
+ *                            (e.g. Docker Desktop's VM gateway silently
+ *                            dropping SYNs to unforwarded ports) is treated as
+ *                            absent after that, and we promote locally — a
+ *                            container with no host Leader must be able to
+ *                            elect itself.
  *                - free/foreign → try the next candidate host.
- *                Only when every candidate is free/foreign do we promote.
+ *                Only when every candidate is free/foreign (or the timeout
+ *                patience window has been exhausted) do we promote.
  *    • foreign → unrelated app squatting the port → try next port
  *    • timeout → occupied, no HTTP signature: a frozen/starting Leader or a
  *                non-HTTP app. Retry the SAME port (never increment — that
@@ -26,7 +34,12 @@
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { ToolExecutor } from "../executor";
-import { MAX_ELECTION_ATTEMPTS, MAX_PORT_SCAN, REELECT_JITTER_MS } from "./constants";
+import {
+  CROSS_BOUNDARY_TIMEOUT_LIMIT,
+  MAX_ELECTION_ATTEMPTS,
+  MAX_PORT_SCAN,
+  REELECT_JITTER_MS,
+} from "./constants";
 import { jitter, probeHost, probePort, sleep } from "./election";
 import { LeaderCoordinator } from "./leader";
 import { HttpMemberTransport, memberBaseUrl } from "./memberTransport";
@@ -70,6 +83,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
   const maxPorts = Math.max(1, MAX_PORT_SCAN);
   const crossHosts = opts.crossBoundaryHosts ?? [];
   let delay = 250;
+  let crossBoundaryTimeoutStreak = 0;
 
   for (let attempt = 0; attempt < MAX_ELECTION_ATTEMPTS; attempt++) {
     for (let offset = 0; offset < maxPorts; offset++) {
@@ -115,9 +129,28 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
               break;
             }
             if (hp.status === "timeout") {
-              // Occupied but silent — possibly a frozen Leader in the other
-              // namespace. Do NOT promote or skip; retry the same port.
-              joinedOrRetry = true;
+              // Occupied but silent. Locally this means a frozen Leader and we
+              // must keep retrying the same port. Cross-boundary, a host that
+              // silently drops SYNs (Docker Desktop's VM gateway) also looks
+              // like this — but there may be no Leader at all. Give a real
+              // (frozen or starting) host Leader a bounded window, then treat
+              // the host as absent and promote locally.
+              crossBoundaryTimeoutStreak += 1;
+              if (crossBoundaryTimeoutStreak < CROSS_BOUNDARY_TIMEOUT_LIMIT) {
+                opts.log?.(
+                  `[mcp] Cross-boundary probe ${host}:${port} timed out ` +
+                    `(${crossBoundaryTimeoutStreak}/${CROSS_BOUNDARY_TIMEOUT_LIMIT}) — ` +
+                    `retrying same port`,
+                );
+                joinedOrRetry = true;
+                break;
+              }
+              opts.log?.(
+                `[mcp] Cross-boundary probe ${host}:${port} timed out ` +
+                  `${CROSS_BOUNDARY_TIMEOUT_LIMIT} consecutive attempts — ` +
+                  `no host leader reachable, promoting locally`,
+              );
+              crossBoundaryTimeoutStreak = 0;
               break;
             }
             // free / foreign → try the next candidate host
@@ -127,6 +160,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
 
         const leader = await tryPromote(port, opts);
         if (leader) {
+          crossBoundaryTimeoutStreak = 0;
           opts.log?.(`[mcp] Promoted to leader on port ${port}`);
           return leader;
         }

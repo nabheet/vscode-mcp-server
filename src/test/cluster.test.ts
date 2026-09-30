@@ -978,6 +978,55 @@ describe("cluster bootstrap", () => {
     await leader.stop(500);
   });
 
+  it("promotes locally after cross-boundary hosts time out (container with no host leader)", async () => {
+    // Container-alone repro: local port free, but every cross-boundary probe
+    // times out — Docker Desktop's VM gateway silently drops SYNs to
+    // unforwarded ports, so the "host" looks occupied but silent forever.
+    // The bootstrap must wait a bounded patience window (frozen-leader
+    // safety) and then promote locally instead of retrying the same port
+    // until MAX_ELECTION_ATTEMPTS and dying without a leader.
+    const port = await findFreePort();
+    const logs: string[] = [];
+    const silentConns = new Set<net.Socket>();
+
+    // Silent TCP listener on the "host" namespace (::1): accepts but never
+    // answers /health → probeHost reports timeout, like the VM gateway.
+    // Connections are tracked so the listener can be torn down: accepted-but-
+    // unread sockets keep close() waiting forever otherwise.
+    const silentHost = net.createServer((sock) => {
+      silentConns.add(sock);
+      sock.on("close", () => silentConns.delete(sock));
+    });
+    await new Promise<void>((resolve) => silentHost.listen(port, "::1", resolve));
+
+    const exec = new ToolExecutor();
+    exec.registerTool(makeTool("echo", (a) => `local: ${a.msg ?? ""}`));
+
+    try {
+      const member = await bootstrapCluster({
+        basePort: port,
+        host: "127.0.0.1",
+        crossBoundaryHosts: ["::1"],
+        executor: exec,
+        workspaceId: "ws-alone",
+        workspacePaths: ["/mnt/alone"],
+        displayName: "Window Alone",
+        log: (m) => logs.push(m),
+      });
+
+      expect(member.role).toBe("leader");
+      await member.stop(500);
+      // It waited the bounded patience window (did not promote on the first
+      // timeout — a frozen host leader must get its chance)...
+      expect(logs.filter((l) => l.includes("retrying same port")).length).toBeGreaterThan(0);
+      // ...then fell through to local promotion.
+      expect(logs.some((l) => l.includes("promoting locally"))).toBe(true);
+    } finally {
+      for (const sock of silentConns) sock.destroy();
+      await new Promise<void>((resolve) => silentHost.close(() => resolve()));
+    }
+  }, 30_000);
+
   it("does not promote to the next port when a valid leader rejects the join", async () => {
     const port = await findFreePort();
     const logs: string[] = [];

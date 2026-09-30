@@ -49,7 +49,16 @@ function getHealth(port: number, host = "127.0.0.1"): Promise<HealthResult> {
       resolve({ kind: "timeout" });
     });
     req.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" || err.code === "EADDRNOTAVAIL") {
+      if (
+        err.code === "ECONNREFUSED" ||
+        err.code === "ENOTFOUND" ||
+        err.code === "EADDRNOTAVAIL" ||
+        // Cross-boundary probes: no route to the host/network means there is
+        // no Leader there (a silently-dropping gateway surfaces as ETIMEDOUT
+        // instead, which stays a timeout and is bounded by the caller).
+        err.code === "EHOSTUNREACH" ||
+        err.code === "ENETUNREACH"
+      ) {
         resolve({ kind: "refused" });
       } else {
         resolve({ kind: "timeout" });

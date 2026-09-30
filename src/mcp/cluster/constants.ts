@@ -23,6 +23,19 @@ export const MAX_ELECTION_ATTEMPTS = 8;
 /** HTTP GET timeout when probing a candidate leader's /health. */
 export const PROBE_TIMEOUT_MS = 2000;
 
+/**
+ * Consecutive cross-boundary probe timeouts (a candidate host that neither
+ * refuses nor answers — e.g. Docker Desktop's VM gateway silently dropping
+ * SYNs to unforwarded ports) tolerated before a container promotes itself.
+ *
+ * A real host leader answers within one probe, so the first timeout usually
+ * means "no leader there (or unreachable)" rather than "frozen leader". The
+ * bound exists so a container with no host leader still elects itself instead
+ * of retrying the same port forever. Each timeout costs up to PROBE_TIMEOUT_MS,
+ * so 3 ≈ 6s of patience before promoting locally.
+ */
+export const CROSS_BOUNDARY_TIMEOUT_LIMIT = 3;
+
 /** How long a Worker waits for the Leader's WELCOME after registering. */
 export const REGISTER_TIMEOUT_MS = 5000;
 
