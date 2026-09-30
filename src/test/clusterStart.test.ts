@@ -3,10 +3,6 @@ import type { WindowState } from "../mcp/cluster/protocol";
 import type { ToolExecutor } from "../mcp/executor";
 import type { Metrics } from "../utils/metrics";
 
-// The setting value activate() reads from getConfiguration("ipcPath"). It is
-// mutable so tests can exercise the setting → env → default precedence.
-const mockIpcPathSetting = vi.hoisted(() => ({ current: undefined as unknown }));
-
 // extension.ts (and the tool modules it imports) binds the vscode module;
 // provide a stub sufficient for the startCluster paths under test.
 vi.mock("vscode", () => ({
@@ -32,8 +28,7 @@ vi.mock("vscode", () => ({
   },
   workspace: {
     getConfiguration: (_section: string) => ({
-      get: <T>(key: string, defaultValue?: T): T | undefined =>
-        key === "ipcPath" ? (mockIpcPathSetting.current as T) : defaultValue,
+      get: <T>(_key: string, defaultValue?: T): T | undefined => defaultValue,
     }),
     name: undefined,
     workspaceFolders: [],
@@ -57,9 +52,8 @@ vi.mock("../mcp/tools/index", () => ({
   registerAllTools: vi.fn(),
 }));
 
-import { activate, deactivate, startCluster } from "../extension";
+import { deactivate, startCluster } from "../extension";
 import { bootstrapCluster, type ClusterMember } from "../mcp/cluster/bootstrap";
-import { DEFAULT_IPC_PATH } from "../mcp/cluster/constants";
 
 function makeOpts(
   log: (msg: string) => void,
@@ -71,7 +65,6 @@ function makeOpts(
     authToken: "",
     executor: {} as ToolExecutor,
     metrics: {} as Metrics,
-    ipcPath: "/tmp/vscode-mcp/ipc.sock",
     workspaceId: "ws",
     workspacePaths: ["/mnt/ws"],
     displayName: "W",
@@ -79,6 +72,11 @@ function makeOpts(
     instanceName: "Inst",
     state: { openEditors: [] } as WindowState,
     isRemoteContainer: false,
+    isDevContainer: false,
+    // Deterministic detectors so tests don't depend on the host platform
+    // (real detection reads /proc/net/route and os.networkInterfaces()).
+    detectGateway: () => null,
+    detectBridges: () => [],
     log,
     ...overrides,
   };
@@ -227,77 +225,143 @@ describe("startCluster FATAL retry", () => {
     await p;
   });
 
-  it("threads the configured ipcPath into bootstrapCluster", async () => {
+  it("passes no crossBoundaryHosts for a plain local window", async () => {
     const log = vi.fn();
     vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
-    const p = startCluster(makeOpts(log, { ipcPath: "/opt/vscode-mcp/ipc.sock" }));
+    const p = startCluster(makeOpts(log));
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("crossBoundaryHosts");
+    await p;
+  });
+
+  it("probes host.docker.internal by default only in a Docker dev container", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, { isRemoteContainer: true, isDevContainer: true, leaderHost: "" }),
+    );
     await settle();
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
-      expect.objectContaining({ ipcPath: "/opt/vscode-mcp/ipc.sock" }),
+      expect.objectContaining({ crossBoundaryHosts: ["host.docker.internal"] }),
     );
     await p;
   });
 
-  it("omits ipcPath from bootstrapCluster when not configured", async () => {
+  it("uses the explicit leaderHost override in a dev container, keeping defaults as fallback", async () => {
     const log = vi.fn();
     vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
-    const p = startCluster(makeOpts(log, { ipcPath: undefined }));
+    const p = startCluster(
+      makeOpts(log, { isRemoteContainer: true, isDevContainer: true, leaderHost: "192.168.1.10" }),
+    );
     await settle();
-    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
-    expect(callArgs).not.toHaveProperty("ipcPath");
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        crossBoundaryHosts: ["192.168.1.10", "host.docker.internal"],
+      }),
+    );
     await p;
   });
-});
 
-// ── activate() IPC path wiring ────────────────────────────────────────
-
-describe("activate IPC path wiring", () => {
-  const context = () =>
-    ({ subscriptions: [], logUri: undefined }) as Parameters<typeof activate>[0];
-
-  beforeEach(() => {
-    vi.mocked(bootstrapCluster).mockReset();
+  it("does not default to host.docker.internal for non-dev-container remotes", async () => {
+    const log = vi.fn();
     vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
-    mockIpcPathSetting.current = undefined;
-    delete process.env.VSCODE_MCP_IPC_PATH;
+    // Attached container (or SSH/WSL) without an explicit leaderHost: the
+    // host.docker.internal default must NOT be used — host.docker.internal
+    // is only valid inside a Docker dev container.
+    const p = startCluster(makeOpts(log, { isRemoteContainer: true, isDevContainer: false }));
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("crossBoundaryHosts");
+    await p;
   });
 
-  afterEach(() => {
-    deactivate();
-    delete process.env.VSCODE_MCP_IPC_PATH;
+  it("probes an explicit leaderHost even for non-dev-container remotes", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, { isRemoteContainer: true, isDevContainer: false, leaderHost: "10.0.0.5" }),
+    );
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({ crossBoundaryHosts: ["10.0.0.5"] }),
+    );
+    await p;
   });
 
-  async function waitForBootstrapCall() {
-    await vi.waitFor(() => expect(vi.mocked(bootstrapCluster)).toHaveBeenCalled());
-    return vi.mocked(bootstrapCluster).mock.calls[0][0];
-  }
-
-  it("threads the resolved ipcPath from the vscode-mcp-server.ipcPath setting into the cluster", async () => {
-    mockIpcPathSetting.current = "/opt/vscode-mcp/ipc.sock";
-    activate(context());
-    const callArgs = await waitForBootstrapCall();
-    expect(callArgs).toMatchObject({ ipcPath: "/opt/vscode-mcp/ipc.sock" });
+  it("appends the detected default gateway to the dev-container probe chain", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        isDevContainer: true,
+        leaderHost: "",
+        detectGateway: () => "172.17.0.1",
+      }),
+    );
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        crossBoundaryHosts: ["host.docker.internal", "172.17.0.1"],
+      }),
+    );
+    await p;
   });
 
-  it("falls back to the VSCODE_MCP_IPC_PATH env var when the setting is empty", async () => {
-    mockIpcPathSetting.current = "";
-    process.env.VSCODE_MCP_IPC_PATH = "/tmp/env-ipc/ipc.sock";
-    activate(context());
-    const callArgs = await waitForBootstrapCall();
-    expect(callArgs).toMatchObject({ ipcPath: "/tmp/env-ipc/ipc.sock" });
+  it("keeps leaderHost first in the dev-container probe chain", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        isDevContainer: true,
+        leaderHost: "192.168.1.10",
+        detectGateway: () => "172.17.0.1",
+      }),
+    );
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        crossBoundaryHosts: ["192.168.1.10", "host.docker.internal", "172.17.0.1"],
+      }),
+    );
+    await p;
   });
 
-  it("falls back to the default IPC path when neither setting nor env is set", async () => {
-    activate(context());
-    const callArgs = await waitForBootstrapCall();
-    expect(callArgs).toMatchObject({ ipcPath: DEFAULT_IPC_PATH });
+  it("binds detected Docker bridge addresses on a Linux-style host window", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(makeOpts(log, { detectBridges: () => ["127.0.0.2"] }));
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
+      expect.objectContaining({ hosts: ["127.0.0.1", "127.0.0.2"] }),
+    );
+    await p;
   });
 
-  it("ignores a non-string setting value (hand-edited settings.json)", async () => {
-    mockIpcPathSetting.current = 123;
-    process.env.VSCODE_MCP_IPC_PATH = "/tmp/env-ipc/ipc.sock";
-    activate(context());
-    const callArgs = await waitForBootstrapCall();
-    expect(callArgs).toMatchObject({ ipcPath: "/tmp/env-ipc/ipc.sock" });
+  it("omits hosts when no bridge addresses are detected", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(makeOpts(log));
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("hosts");
+    await p;
+  });
+
+  it("does not bind bridge addresses inside a container window", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        detectBridges: () => ["127.0.0.2"],
+      }),
+    );
+    await settle();
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("hosts");
+    await p;
   });
 });

@@ -32,9 +32,10 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         // Resolve target folder
         let rootUri: vscode.Uri;
         if (args.workspaceFolder) {
-          const folder = folders.find((f) => f.name === args.workspaceFolder);
+          const ref = String(args.workspaceFolder);
+          const folder = folders.find((f) => f.name === ref || f.uri.fsPath === ref);
           if (!folder) {
-            const names = folders.map((f) => f.name).join(", ");
+            const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
             return {
               content: [
                 {
@@ -453,13 +454,15 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         if (!folders || folders.length === 0) {
           return { content: [{ type: "text", text: "No workspace folders open" }], isError: true };
         }
-        const idx = folders.findIndex((f) => f.name === String(args.name));
+        const idx = folders.findIndex(
+          (f) => f.name === String(args.name) || f.uri.fsPath === String(args.name),
+        );
         if (idx === -1) {
           return {
             content: [
               {
                 type: "text",
-                text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => f.name).join(", ")}`,
+                text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ")}`,
               },
             ],
             isError: true,
@@ -533,13 +536,15 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         if (!folders || folders.length === 0) {
           return { content: [{ type: "text", text: "No workspace folders open" }], isError: true };
         }
-        const idx = folders.findIndex((f) => f.name === String(args.name));
+        const idx = folders.findIndex(
+          (f) => f.name === String(args.name) || f.uri.fsPath === String(args.name),
+        );
         if (idx === -1) {
           return {
             content: [
               {
                 type: "text",
-                text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => f.name).join(", ")}`,
+                text: `Workspace folder '${args.name}' not found. Available folders: ${folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ")}`,
               },
             ],
             isError: true,

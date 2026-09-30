@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { bootstrapCluster, type ClusterMember } from "./mcp/cluster/bootstrap";
-import { resolveIpcPath } from "./mcp/cluster/constants";
+import {
+  buildBindHosts,
+  buildCrossBoundaryHosts,
+  detectBridgeAddresses,
+  detectDefaultGateway,
+} from "./mcp/cluster/gateway";
 import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
@@ -19,9 +24,9 @@ let electing = false;
 let statePushTimer: ReturnType<typeof setTimeout> | undefined;
 
 /**
- * Auto-retry after a FATAL cluster startup so transient IPC races (e.g. a
- * socket file momentarily unlinked during a reload) self-heal instead of
- * leaving the window with no cluster role until a manual reload.
+ * Auto-retry after a FATAL cluster startup so transient races (e.g. the
+ * leader dying mid-handshake) self-heal instead of leaving the window with
+ * no cluster role until a manual reload.
  */
 let startupRetryAttempt = 0;
 let startupRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -90,15 +95,17 @@ export function activate(context: vscode.ExtensionContext): void {
   const authToken = config.get<string>("authToken") || process.env.MCP_AUTH_TOKEN || "";
   const tlsCertPath = config.get<string>("tlsCertPath") || process.env.MCP_TLS_CERT_PATH || "";
   const tlsKeyPath = config.get<string>("tlsKeyPath") || process.env.MCP_TLS_KEY_PATH || "";
-  // IPC path precedence: explicit setting → env var → default (see
-  // resolveIpcPath). All windows in the cluster must share the same value.
-  const ipcPath = resolveIpcPath(config.get<string>("ipcPath"), process.env.VSCODE_MCP_IPC_PATH);
+  // Host to reach a Leader outside this container (Docker Desktop resolves
+  // host.docker.internal to the host loopback). Setting/env only needed when
+  // the default is wrong for the user's container networking.
+  const leaderHost = config.get<string>("leaderHost") || process.env.MCP_LEADER_HOST || "";
 
   // Detect remote container
-  const isRemoteContainer =
-    vscode.env.remoteName === "dev-container" ||
-    vscode.env.remoteName === "attached-container" ||
-    false;
+  const remoteName = vscode.env.remoteName;
+  // Docker dev container — the only remote where host.docker.internal is a
+  // sensible default for reaching the host leader.
+  const isDevContainer = remoteName === "dev-container";
+  const isRemoteContainer = isDevContainer || remoteName === "attached-container";
   const host = isRemoteContainer ? "0.0.0.0" : "127.0.0.1";
 
   // Validate TLS config
@@ -112,6 +119,12 @@ export function activate(context: vscode.ExtensionContext): void {
   if (isRemoteContainer) {
     outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
     outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
+    if (isDevContainer) {
+      const chain = buildCrossBoundaryHosts(leaderHost || undefined, detectDefaultGateway());
+      outputChannel.appendLine(
+        `[mcp] Cross-boundary discovery enabled — probing host leader at: ${chain.join(", ") || "(none)"}`,
+      );
+    }
   }
   if (authToken) {
     outputChannel.appendLine(
@@ -121,7 +134,6 @@ export function activate(context: vscode.ExtensionContext): void {
   if (useTls) {
     outputChannel.appendLine(`[mcp] TLS enabled — using cert: ${tlsCertPath}`);
   }
-  outputChannel.appendLine(`[mcp] Cluster IPC path: ${ipcPath}`);
 
   // This window's cluster identity. The id must be unique per window (even
   // for two windows on the same folder) — the pid disambiguates.
@@ -153,7 +165,6 @@ export function activate(context: vscode.ExtensionContext): void {
     executor,
     metrics,
     logger: fileLog,
-    ipcPath,
     workspaceId,
     workspacePaths: workspaceFolders,
     displayName,
@@ -161,6 +172,8 @@ export function activate(context: vscode.ExtensionContext): void {
     instanceName,
     state: currentWindowState(),
     isRemoteContainer,
+    isDevContainer,
+    leaderHost,
     log: (msg: string) => outputChannel?.appendLine(`[mcp] ${msg}`),
   });
 
@@ -210,8 +223,6 @@ interface ClusterStartOptions {
   authToken: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
-  /** IPC socket/named-pipe path shared by all cluster windows. */
-  ipcPath?: string;
   executor: ToolExecutor;
   metrics: Metrics;
   logger?: ServerLog;
@@ -222,6 +233,13 @@ interface ClusterStartOptions {
   instanceName: string;
   state: WindowState;
   isRemoteContainer: boolean;
+  /** True only for Docker dev containers (host.docker.internal applies). */
+  isDevContainer: boolean;
+  /** Override for the cross-boundary host (container → host leader). */
+  leaderHost?: string;
+  /** Injectable gateway/bridge detection (defaults to the real detectors). */
+  detectGateway?: () => string | null;
+  detectBridges?: () => string[];
   log: (msg: string) => void;
 }
 
@@ -237,12 +255,31 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
   const generation = ++startupGeneration;
   electing = true;
   try {
+    // Seamless discovery: container windows probe the host leader through an
+    // ordered chain (explicit leaderHost → host.docker.internal → detected
+    // default gateway); host windows reach a container leader via the
+    // loopback valid-probe + HTTP join, so they need no cross-boundary
+    // hosts. host.docker.internal is only a valid default for Docker dev
+    // containers; any other remote only probes when leaderHost is set
+    // explicitly.
+    const gateway = opts.isDevContainer ? (opts.detectGateway ?? detectDefaultGateway)() : null;
+    // Host leaders additionally bind detected Docker bridge addresses so
+    // containers can reach them at <gateway>:port (Linux native Docker has
+    // no host.docker.internal magic). Container leaders keep binding 0.0.0.0.
+    const bindHosts = opts.isRemoteContainer
+      ? [opts.host]
+      : buildBindHosts(opts.host, (opts.detectBridges ?? detectBridgeAddresses)());
     const newMember = await bootstrapCluster({
       basePort: opts.basePort,
       host: opts.host,
+      ...(bindHosts.length > 1 ? { hosts: bindHosts } : {}),
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
-      ...(opts.ipcPath ? { ipcPath: opts.ipcPath } : {}),
+      ...(opts.isDevContainer
+        ? { crossBoundaryHosts: buildCrossBoundaryHosts(opts.leaderHost, gateway) }
+        : opts.leaderHost
+          ? { crossBoundaryHosts: [opts.leaderHost] }
+          : {}),
       executor: opts.executor,
       metrics: opts.metrics,
       logger: opts.logger,
@@ -278,7 +315,10 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     } else {
       newMember.setOnListen((url: string) => {
         let msg = `MCP server listening on ${url}`;
-        if (opts.isRemoteContainer) msg += " (remote container — use forwarded port)";
+        if (opts.isRemoteContainer) {
+          msg += " (remote container — use forwarded port)";
+          void ensureContainerForward(opts.basePort, opts.log);
+        }
         if (opts.authToken) msg += " [auth enabled]";
         opts.log(msg);
         console.log(`[vscode-mcp-server] ${msg}`);
@@ -287,9 +327,9 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     updateStatusBar(newMember);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Transient FATALs (e.g. the IPC socket file momentarily unlinked during a
-    // simultaneous reload) self-heal: retry with exponential backoff so the
-    // window still gets a cluster role without a manual reload.
+    // Transient FATALs (e.g. the leader dying mid-handshake) self-heal:
+    // retry with exponential backoff so the window still gets a cluster
+    // role without a manual reload.
     const delay = Math.min(STARTUP_RETRY_BASE_MS * 2 ** startupRetryAttempt, STARTUP_RETRY_MAX_MS);
     startupRetryAttempt += 1;
     opts.log(
@@ -303,6 +343,30 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     }, delay);
   } finally {
     electing = false;
+  }
+}
+
+/**
+ * Remote-container leaders: ask VS Code to establish the host→container port
+ * forwarding tunnel. `asExternalUri` "automatically establishes a port
+ * forwarding tunnel from the local machine to target on the remote" and
+ * returns the host-local URL — so host windows can reach the container leader
+ * even when devcontainer.json omits `forwardPorts`. VS Code usually picks the
+ * same port on the host; when it picks a different one, the log line below
+ * shows the actual host URL, and `forwardPorts` remains the deterministic
+ * opt-in. No-op when the tunnel already exists; only called for container
+ * leaders (this process runs inside the container).
+ */
+async function ensureContainerForward(port: number, log: (msg: string) => void): Promise<void> {
+  try {
+    const local = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${port}`));
+    log(`Container leader tunneled to host at ${local.toString()}`);
+  } catch (err) {
+    log(
+      `Could not establish host→container tunnel: ${
+        err instanceof Error ? err.message : String(err)
+      } — add "forwardPorts": [${port}] to devcontainer.json as fallback`,
+    );
   }
 }
 

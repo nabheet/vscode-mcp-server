@@ -1,10 +1,11 @@
-import * as crypto from "crypto";
-import * as fs from "fs";
-import * as http from "http";
-import * as https from "https";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as https from "node:https";
 import { Metrics } from "../utils/metrics";
 import type { ServerLog } from "../utils/serverLog";
 import type { JsonRpcResponse, ToolDefinition, ToolListItem } from "../utils/types";
+import { CLUSTER_MESSAGE_PATH, CLUSTER_STREAM_PATH } from "./cluster/constants";
 import { BusyError, ToolExecutor } from "./executor";
 
 export { BusyError };
@@ -40,9 +41,35 @@ export interface McpRouter {
   route(rawBody: string): Promise<McpRouterResult | null>;
 }
 
+/**
+ * Cluster "member channel" (Leader only). Bridges the Worker↔Leader protocol
+ * across mount namespaces (dev container ↔ host) over HTTP/SSE on the same
+ * port the server already listens on:
+ *
+ *   GET  /cluster/stream?id=<sessionId>   SSE — leader→worker
+ *   POST /cluster/message?id=<sessionId>  one JSON IpcMessage — worker→leader
+ *
+ * The Leader's cluster layer owns the routing (who is a member, session
+ * bookkeeping); the server only parses the session id and hands off.
+ */
+export interface MemberChannel {
+  /** Leader→worker SSE stream for a worker-chosen session id. */
+  handleStream(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void;
+  /** Worker→leader protocol message POST. Must write its own response. */
+  handleMessage(sessionId: string, rawBody: string, res: http.ServerResponse): void;
+}
+
 export interface McpServerOptions {
   port: number;
   host: string;
+  /**
+   * Additional addresses to bind, on top of `host` (which stays the primary:
+   * it is what gets logged and used for origin checks). Used by Linux host
+   * leaders so Docker containers can reach them at the bridge gateway while
+   * loopback-only exposure is preserved. A secondary bind failure is
+   * non-fatal (warned, not rejected); the primary bind failure rejects.
+   */
+  hosts?: string[];
   /** Path to TLS certificate file (enables HTTPS) */
   tlsCertPath?: string;
   /** Path to TLS private key file (enables HTTPS) */
@@ -61,6 +88,9 @@ export interface McpServerOptions {
   logger?: ServerLog;
   /** Cluster routing hook (Leader only). */
   router?: McpRouter;
+  /** Cluster member channel (Leader only) — HTTP/SSE bridge for
+   *  cross-namespace workers (dev container ↔ host). */
+  memberChannel?: MemberChannel;
   /**
    * Shared tool executor (single instance per process, created in
    * extension.ts and reused by the Leader's server, the Leader's router,
@@ -74,10 +104,11 @@ const SSE_KEEPALIVE_MS = 15_000;
 const LAG_INTERVAL_MS = 1_000;
 
 export class McpServer {
-  private server: http.Server | https.Server | null = null;
+  private servers: Array<http.Server | https.Server> = [];
   private activeRequests = 0;
   private shuttingDown = false;
   private options: McpServerOptions;
+  private bindHosts: string[];
   private onListen?: (url: string) => void;
   private useTls: boolean;
   private sessions = new Map<string, SseSession>();
@@ -106,6 +137,10 @@ export class McpServer {
         "[MCP] Warning: authToken is set but TLS is not enabled. Authentication token will be transmitted in cleartext over HTTP. Set tlsCertPath and tlsKeyPath for secure HTTPS.",
       );
     }
+    // Primary bind host is always `options.host`; additional `options.hosts`
+    // are best-effort secondary binds (see McpServerOptions.hosts).
+    const extra = (options.hosts ?? []).filter((h) => h && h !== options.host);
+    this.bindHosts = [options.host, ...extra];
   }
 
   registerTool(def: ToolDefinition): void {
@@ -132,40 +167,72 @@ export class McpServer {
 
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.useTls) {
-        try {
+      const createServer = (): http.Server | https.Server => {
+        if (this.useTls) {
           const tlsOpts: https.ServerOptions = {
             cert: fs.readFileSync(this.options.tlsCertPath!, "utf-8"),
             key: fs.readFileSync(this.options.tlsKeyPath!, "utf-8"),
             minVersion: "TLSv1.2",
           };
-          this.server = https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
-        } catch (err) {
-          reject(
-            new Error(
-              "Failed to load TLS cert/key: " + (err instanceof Error ? err.message : String(err)),
-            ),
-          );
-          return;
+          return https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
         }
-      } else {
-        this.server = http.createServer((req, res) => this.onRequest(req, res));
-      }
+        return http.createServer((req, res) => this.onRequest(req, res));
+      };
 
-      this.server.on("error", (err: NodeJS.ErrnoException) => {
+      let primary: http.Server | https.Server;
+      try {
+        primary = createServer();
+      } catch (err) {
+        reject(
+          new Error(
+            `Failed to load TLS cert/key: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+        return;
+      }
+      this.servers.push(primary);
+
+      const cleanup = () => {
+        for (const server of this.servers) server.close();
+        this.servers = [];
+      };
+
+      primary.on("error", (err: NodeJS.ErrnoException) => {
+        cleanup();
         if (err.code === "EADDRINUSE") {
-          reject(new Error("Port " + this.options.port + " is already in use"));
+          reject(new Error(`Port ${this.options.port} is already in use`));
         } else {
           reject(err);
         }
       });
 
-      this.server.listen(this.options.port, this.options.host, () => {
+      primary.listen(this.options.port, this.bindHosts[0], () => {
         const scheme = this.useTls ? "https" : "http";
-        this.onListen?.(scheme + "://" + this.options.host + ":" + this.options.port + "/mcp");
+        this.onListen?.(`${scheme}://${this.options.host}:${this.options.port}/mcp`);
         this.startLagMonitor();
         resolve();
       });
+
+      // Secondary binds are best-effort: a foreign process squatting the
+      // bridge port must not take down a leader that still serves loopback.
+      for (const host of this.bindHosts.slice(1)) {
+        let extra: http.Server | https.Server;
+        try {
+          extra = createServer();
+        } catch (err) {
+          console.warn(
+            `[mcp] Failed to create secondary listener for ${host}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          continue;
+        }
+        this.servers.push(extra);
+        extra.on("error", (err: NodeJS.ErrnoException) => {
+          console.warn(`[mcp] Failed to bind port ${this.options.port} on ${host}: ${err.message}`);
+        });
+        extra.listen(this.options.port, host);
+      }
     });
   }
 
@@ -186,30 +253,36 @@ export class McpServer {
       clearInterval(this.lagTimer);
       this.lagTimer = null;
     }
-    if (!this.server) return;
+    const servers = this.servers;
+    this.servers = [];
+    if (servers.length === 0) return;
 
     // server.close() stops accepting new connections and waits for existing
     // ones to finish naturally. We add a timeout fallback to force-close.
     return new Promise((resolve) => {
+      let remaining = servers.length;
       let done = false;
       const finish = () => {
         if (done) return;
         done = true;
-        this.server = null;
         resolve();
       };
 
       const timer = setTimeout(() => {
-        if (this.server) this.server.close();
+        for (const server of servers) server.close();
         finish();
       }, timeoutMs);
 
-      this.server!.once("close", () => {
-        clearTimeout(timer);
-        finish();
-      });
-
-      this.server!.close();
+      for (const server of servers) {
+        server.once("close", () => {
+          remaining -= 1;
+          if (remaining === 0) {
+            clearTimeout(timer);
+            finish();
+          }
+        });
+        server.close();
+      }
     });
   }
 
@@ -218,7 +291,7 @@ export class McpServer {
   /** Get the base URL for the server (scheme + host + port). */
   private getServerBase(): string {
     const scheme = this.useTls ? "https" : "http";
-    return scheme + "://" + this.options.host + ":" + this.options.port;
+    return `${scheme}://${this.options.host}:${this.options.port}`;
   }
 
   /** Check if a request origin is allowed. Only loopback origins are valid. */
@@ -249,8 +322,8 @@ export class McpServer {
   /** Verify bearer token using timing-safe comparison. */
   private authFailed(req: http.IncomingMessage, res: http.ServerResponse): boolean {
     if (!this.options.authToken) return false;
-    const auth = req.headers["authorization"] || "";
-    const origin = req.headers["origin"] as string | undefined;
+    const auth = req.headers.authorization || "";
+    const origin = req.headers.origin as string | undefined;
     if (!auth.startsWith("Bearer ")) {
       this.writeCorsHeaders(res, origin);
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -311,7 +384,7 @@ export class McpServer {
   }
 
   private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const origin = req.headers["origin"] as string | undefined;
+    const origin = req.headers.origin as string | undefined;
     const pathname = (req.url || "").split("?")[0];
 
     // Health check — carries the cluster signature so other instances can
@@ -350,6 +423,21 @@ export class McpServer {
     const msgMatch = pathname.match(/^\/mcp\/session\/([a-f0-9-]+)\/message$/);
     if (req.method === "POST" && msgMatch) {
       this.handleSseMessage(req, res, msgMatch[1]);
+      return;
+    }
+
+    // ── Cluster member channel (cross-namespace workers) ─────────────
+    // Worker→Leader SSE stream (GET) and protocol messages (POST). Mounted
+    // only when the Leader opts in via the memberChannel option; the two
+    // legs are intentionally cheap to guard: origin checks reject
+    // DNS-rebinding browser traffic, and the existing bearer check applies
+    // when authToken is configured.
+    if (req.method === "GET" && pathname === CLUSTER_STREAM_PATH) {
+      this.handleMemberStream(req, res);
+      return;
+    }
+    if (req.method === "POST" && pathname === CLUSTER_MESSAGE_PATH) {
+      this.handleMemberMessage(req, res);
       return;
     }
 
@@ -466,7 +554,7 @@ export class McpServer {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const code = err instanceof BusyError ? -32050 : -32603;
-        const message = err instanceof BusyError ? msg : "Internal error: " + msg;
+        const message = err instanceof BusyError ? msg : `Internal error: ${msg}`;
         session.sendEvent(
           "message",
           JSON.stringify({
@@ -479,6 +567,99 @@ export class McpServer {
     });
 
     req.on("error", () => {});
+  }
+
+  /** Member channel SSE leg: leader→worker stream for a session. */
+  private handleMemberStream(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const origin = req.headers.origin as string | undefined;
+    // Worker GETs carry no Origin (non-browser client) and pass; a webpage
+    // EventSource carries one and is rejected unless loopback.
+    if (!this.isValidOrigin(origin)) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ error: "Forbidden: CORS requests from this origin are not allowed" }),
+      );
+      return;
+    }
+    if (this.authFailed(req, res)) return;
+
+    const member = this.options.memberChannel;
+    if (!member) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Cluster member channel is not enabled" }));
+      return;
+    }
+
+    const sessionId = McpServer.queryId(req.url);
+    if (!sessionId) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing session id" }));
+      return;
+    }
+
+    member.handleStream(req, res, sessionId);
+  }
+
+  /** Member channel POST leg: one protocol message from a worker. */
+  private handleMemberMessage(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const origin = req.headers.origin as string | undefined;
+    if (!this.isValidOrigin(origin)) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ error: "Forbidden: CORS requests from this origin are not allowed" }),
+      );
+      return;
+    }
+    if (this.authFailed(req, res)) return;
+
+    const member = this.options.memberChannel;
+    if (!member) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Cluster member channel is not enabled" }));
+      return;
+    }
+
+    const sessionId = McpServer.queryId(req.url);
+    if (!sessionId) {
+      this.writeCorsHeaders(res, origin);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing session id" }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let bodySize = 0;
+    const MAX_BODY = 10 * 1024 * 1024;
+
+    req.on("data", (chunk: Buffer) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY) return;
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      if (bodySize > MAX_BODY) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload Too Large: max 10 MB" }));
+        return;
+      }
+      const rawBody = Buffer.concat(chunks).toString("utf-8");
+      member.handleMessage(sessionId, rawBody, res);
+    });
+
+    req.on("error", () => {});
+  }
+
+  /** Extract the `id` query param from a request URL ("" when absent). */
+  private static queryId(url: string | undefined): string {
+    const q = (url || "").indexOf("?");
+    if (q === -1) return "";
+    return new URLSearchParams(url?.slice(q + 1)).get("id") || "";
   }
 
   /** Direct POST /mcp — inline JSON-RPC response (backward compat). */
@@ -588,7 +769,7 @@ export class McpServer {
           JSON.stringify({
             jsonrpc: "2.0",
             id: null,
-            error: { code: -32603, message: "Internal error: " + msg },
+            error: { code: -32603, message: `Internal error: ${msg}` },
           }),
         );
       } finally {

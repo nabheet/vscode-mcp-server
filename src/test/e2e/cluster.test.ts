@@ -22,6 +22,37 @@ function findFreePort(): Promise<number> {
   });
 }
 
+/**
+ * True when the MCP endpoint is unreachable OR accepts connections but
+ * never answers (a SIGSTOPped leader). A plain mcpRequest would hang
+ * forever on the frozen server, so this probe enforces its own socket
+ * timeout and treats a timeout as "down".
+ */
+function probePortDown(port: number, timeoutMs = 2000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    const req = http.request(
+      `http://127.0.0.1:${port}/mcp`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+      () => {
+        // Any HTTP response means the server is alive.
+        req.destroy();
+        resolve(false);
+      },
+    );
+    req.on("error", () => resolve(true)); // refused / reset → down
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve(true); // accepted but silent → frozen leader → down
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
 interface McpContentPart {
   type: string;
   text: string;
@@ -141,6 +172,16 @@ async function resolveCodeCli(): Promise<{
     if (fs.existsSync(binary)) return { cmd: binary, args: [] };
     throw new Error(`VS Code binary not found under ${appRoot}`);
   }
+  if (process.platform === "linux") {
+    // downloadAndUnzipVSCode returns the root Electron binary itself
+    // (<dir>/code). Spawn it directly — NOT the `bin/code` Node CLI wrapper
+    // that resolveCliPathFromVSCodeExecutablePath returns: that wrapper
+    // spawns the real binary and exits, so the PID we hold would be a dead
+    // script whose process group vanishes and whose child (the real app)
+    // gets reparented away from it, breaking the self-heal test's group
+    // freeze. The binary stays attached as our child.
+    return wrapForDisplay(vscodePath, []);
+  }
   const { resolveCliPathFromVSCodeExecutablePath } = await import("@vscode/test-electron");
   const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
 
@@ -179,7 +220,7 @@ function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: 
  *
  * Spawns TWO VS Code windows (distinct user-data dirs, distinct single-root
  * workspaces) sharing ONE cluster port. Election decides which becomes
- * leader; the other joins over IPC. The test then:
+ * leader; the other joins over the HTTP member channel. The test then:
  *  1. lists the cluster (2 rows, distinct instanceIds, one leader + one worker)
  *  2. targets each window BY instanceId and proves the calls land in the
  *     right window (folder listing + file content)
@@ -188,7 +229,6 @@ function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: 
 describe("cluster leader-worker (E2E)", () => {
   const procs: ChildProcess[] = [];
   let tmpDir: string | null = null;
-  let ipcPath: string;
   let port: number;
 
   beforeAll(async () => {
@@ -207,9 +247,6 @@ describe("cluster leader-worker (E2E)", () => {
 
     port = await findFreePort();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cl-"));
-    // Short socket name — macOS Unix socket paths must stay under ~103 chars
-    // (os.tmpdir() is already long: /var/folders/...).
-    ipcPath = path.join(tmpDir, "cl.sock");
 
     // Two single-root workspaces with distinct, greppable content
     const folderA = path.join(tmpDir, "alpha");
@@ -233,9 +270,9 @@ describe("cluster leader-worker (E2E)", () => {
     }
 
     // Two distinct user-data dirs = two distinct windows. BOTH windows share
-    // the SAME cluster port + IPC socket — the cluster elects exactly one
-    // leader; the other joins as worker. Settings carry the port (env vars
-    // don't reliably propagate through VS Code's extension host chain).
+    // the SAME cluster port — the cluster elects exactly one leader; the
+    // other joins as worker. Settings carry the port (env vars don't
+    // reliably propagate through VS Code's extension host chain).
     const spawns: Array<[string, string]> = [
       [folderA, "a"],
       [folderB, "b"],
@@ -271,9 +308,14 @@ describe("cluster leader-worker (E2E)", () => {
           ...process.env,
           MCP_PORT: String(port),
           MCP_SERVER_MAX_RETRIES: "1",
-          VSCODE_MCP_IPC_PATH: ipcPath,
         },
         stdio: ["ignore", "pipe", "pipe"],
+        // Each window becomes a process-group leader (its PID is its PGID)
+        // so the self-heal test can SIGSTOP/SIGCONT the entire window —
+        // main, renderer, and extension host — via kill(-pid). Without
+        // this, the children share vitest's process group and a group-wide
+        // stop would freeze the test runner itself.
+        detached: true,
       };
 
       const proc = spawn(cliCmd, launchArgs, spawnOpts);
@@ -329,12 +371,6 @@ describe("cluster leader-worker (E2E)", () => {
       }
       if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
     }
-    // Stale IPC socket may outlive the leader on crash — remove defensively.
-    try {
-      fs.unlinkSync(ipcPath);
-    } catch {
-      /* already gone */
-    }
   }, 20000);
 
   /** Poll list_workspaces until both windows have registered. */
@@ -359,47 +395,18 @@ describe("cluster leader-worker (E2E)", () => {
   }
 
   /**
-   * Assert the MCP endpoint is NOT serving — used right after killing the
+   * Assert the MCP endpoint is NOT serving — used right after freezing the
    * leader to prove the cluster is genuinely broken before self-heal.
    * Only a leader serves the HTTP port, so any success here means the
-   * kill+block did not land.
+   * freeze did not land.
    */
   async function expectServerDown(port: number, timeoutMs = 8000): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      try {
-        const res = await mcpRequest(port, "tools/list");
-        if (res?.result) {
-          throw new Error("MCP server unexpectedly up right after leader SIGKILL");
-        }
-      } catch {
-        return; // refused / no server — exactly what we want
-      }
+      if (await probePortDown(port)) return; // refused, reset, or silent
       await new Promise((r) => setTimeout(r, 250));
     }
-    throw new Error(`MCP server still responding ${timeoutMs}ms after leader SIGKILL`);
-  }
-
-  /** Poll list_workspaces until SOME window reports role "leader". */
-  async function waitForLeader(deadlineMs = 15000): Promise<Record<string, unknown>> {
-    const deadline = Date.now() + deadlineMs;
-    while (Date.now() < deadline) {
-      const res = await mcpRequest(port, "tools/call", {
-        name: "list_workspaces",
-        arguments: {},
-      });
-      if (res.result && !res.result.isError) {
-        try {
-          const rows = JSON.parse(res.result.content[0].text) as Array<Record<string, unknown>>;
-          const leader = rows.find((r) => r.role === "leader");
-          if (leader) return leader;
-        } catch {
-          /* not JSON yet */
-        }
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    throw new Error(`No window reported leader within ${deadlineMs}ms after self-heal`);
+    throw new Error(`MCP server still responding ${timeoutMs}ms after leader freeze`);
   }
 
   // ── Discovery ─────────────────────────────────────────────────────────
@@ -549,10 +556,10 @@ describe("cluster leader-worker (E2E)", () => {
 
   // ── FATAL self-heal ──────────────────────────────────────────────────
 
-  it("cluster self-heals to leader after leader death + blocked IPC socket (no reload)", async () => {
+  it("cluster self-heals to leader after leader freeze + FATAL (no reload)", async () => {
     if (!ENABLED) return;
 
-    // Identify the elected leader so we can kill it.
+    // Identify the elected leader so we can freeze its extension host.
     const rows = await waitForTwoWindows();
     const leaderIdx = rows.findIndex((r) => r.role === "leader");
     expect(leaderIdx).toBeGreaterThanOrEqual(0);
@@ -562,58 +569,71 @@ describe("cluster leader-worker (E2E)", () => {
     const leaderProc = procs[leaderFolder?.endsWith("alpha") ? 0 : 1];
     expect(leaderProc.pid, "leader process should be trackable").toBeTruthy();
 
-    // Kill the leader, then immediately block its IPC socket path with a
-    // directory: neither joining (connecting to a directory fails) nor
-    // promoting (bind fails EADDRINUSE) can succeed, so bootstrap exhausts
-    // its attempts and throws FATAL — the exact reported failure ("Could
-    // not elect or join a leader after N attempts"). Pre-fix, the window
-    // stayed dead until a manual reload.
-    leaderProc.kill("SIGKILL");
-    // Block the socket path with a directory. The killed leader's
-    // extension-host child — or the survivor's fast promotion (triggered
-    // instantly when the IPC connection drops) — can re-create the socket
-    // file in the kill→block window, so retry removing + blocking until
-    // the directory actually sticks. Once it does, no future bind can
-    // recreate a file (bind on a directory path fails immediately).
-    let blocked = false;
-    for (let i = 0; i < 50 && !blocked; i++) {
-      fs.rmSync(ipcPath, { force: true }); // stale socket file left by SIGKILL
-      try {
-        fs.mkdirSync(ipcPath);
-        blocked = true;
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-        // Socket file reappeared mid-block — loop removes it again.
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    }
-    expect(blocked, "should block the IPC socket path with a directory").toBe(true);
+    // Freeze (SIGSTOP — NOT kill) the leader window's ENTIRE process group
+    // (main + renderer + extension host). The frozen processes keep the TCP
+    // port bound but never answer, so the survivor's /health probe times
+    // out: "occupied but silent" → it must NOT promote and must NOT advance
+    // to a higher port — it retries the SAME port and FATALs ("Could not
+    // elect or join a leader after N attempts") before extension.ts's retry
+    // loop re-runs startCluster. Pre-fix, the window stayed dead until a
+    // manual reload. A kill would be useless here: the port would free up
+    // and the survivor would simply promote — and VS Code would
+    // auto-restart the killed extension host, racing it.
+    //
+    // The whole group is frozen (not just the extension host) because the
+    // extension host is an Electron "NodeService" utility process whose PID
+    // is not reliably discoverable on every platform (lsof is not guaranteed
+    // on Linux runners). Freezing the group also keeps VS Code's main
+    // process watchdog from restarting the frozen extension host. Each
+    // window is spawned with `detached: true`, so kill(-pid) targets the
+    // whole group.
+    process.kill(-leaderProc.pid, "SIGSTOP");
 
     try {
-      // Leader is dead and the socket is blocked: MCP must be down.
+      // Frozen leader accepts TCP but never answers: MCP must be down.
       await expectServerDown(port);
 
-      // Hold the block long enough for the first bootstrap to exhaust its
-      // attempts (8 attempts x up to ~5.5s backoff ≈ 28s worst case).
-      // Lost-leader detection is ≤5s (heartbeat), so by 28s the candidate
-      // has FATALed and scheduled its first retry.
-      await new Promise((r) => setTimeout(r, 28000));
-      fs.rmSync(ipcPath, { recursive: true, force: true });
-
-      // Self-heal must happen WITHOUT any reload: the retry re-runs
-      // startCluster and a leader comes back. Which window becomes leader
-      // is intentionally NOT asserted: on Linux CI the SIGKILL hits the
-      // xvfb-run wrapper, so the killed window's VS Code main survives as
-      // an orphan and VS Code auto-restarts its extension host, which hits
-      // FATAL and self-heals through the same retry path — racing the
-      // survivor's re-election. Pre-fix, every path stays dead after FATAL
-      // and the port never returns, so role=leader is the regression signal.
-      await waitForServer(port, 90000);
-      const healed = await waitForLeader(15000);
-      expect(healed.role).toBe("leader");
+      // Hold the freeze long enough for the first bootstrap to exhaust its
+      // attempts. Re-election starts ~10-15s in (2 missed PONGs at 5s
+      // heartbeat ticks); each attempt costs a 2s probe timeout plus up to
+      // 5.5s backoff, so 8 attempts ≈ 41s and FATAL#1 lands around 55-60s.
+      // Un-freezing at 70s guarantees at least one FATAL and an
+      // already-scheduled retry — that FATAL is the regression signal.
+      //
+      // The freeze must hold for the whole window: if VS Code ever
+      // auto-restarts the frozen extension host, the port comes back and
+      // the cluster heals by promotion instead of by the FATAL retry we are
+      // testing — fail loudly rather than silently pass on the wrong path.
+      const holdUntil = Date.now() + 70000;
+      while (Date.now() < holdUntil) {
+        await new Promise((r) => setTimeout(r, 5000));
+        if (!(await probePortDown(port))) {
+          throw new Error(
+            "MCP server became reachable during the freeze; SIGSTOP did not isolate the leader window",
+          );
+        }
+      }
     } finally {
-      // Restore the socket path so afterAll cleanup is uncomplicated.
-      fs.rmSync(ipcPath, { recursive: true, force: true });
+      // Thaw the leader so its port (and cluster membership) come back.
+      // The group may already be gone if VS Code exited — that is caught
+      // by the hold assertion above, not silently ignored here.
+      try {
+        process.kill(-leaderProc.pid, "SIGCONT");
+      } catch {
+        // Already exited; nothing to resume.
+      }
     }
-  }, 180000);
+
+    // Self-heal must happen WITHOUT any reload: the retry re-runs
+    // startCluster and the survivor re-joins the original leader. Which
+    // window is leader is intentionally NOT asserted — the leader never
+    // died, only froze, so it keeps its role; the regression signal is
+    // that the cluster returns to TWO windows (pre-fix, the FATALed window
+    // stayed dead and only the leader's own row ever appears).
+    await waitForServer(port, 90000);
+    const healedRows = await waitForTwoWindows(90000);
+    const healedLeader = healedRows.find((r) => r.role === "leader");
+    expect(healedLeader, "cluster should have a leader after self-heal").toBeTruthy();
+    expect(healedRows.map((r) => r.role).sort()).toEqual(["leader", "worker"]);
+  }, 240000);
 });

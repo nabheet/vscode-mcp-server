@@ -4,7 +4,7 @@
  * Responsibilities:
  *  - Serve the HTTP endpoint via McpServer (health, metrics, SSE, direct
  *    JSON-RPC) and execute calls targeting its own workspace locally.
- *  - Run the local IPC pipe that Workers connect to.
+ *  - Serve the HTTP member channel that Workers connect over.
  *  - Keep a routing table of connected Workers and proxy tool calls to the
  *    Worker whose workspace the request targets.
  *  - Respond to Worker heartbeats (PING → PONG).
@@ -14,16 +14,49 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type * as net from "node:net";
+import type * as http from "node:http";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { JsonRpcResponse } from "../../utils/types";
 import type { ToolExecutor } from "../executor";
-import { type McpRouter, type McpRouterResult, McpServer } from "../server";
+import { type McpRouter, type McpRouterResult, McpServer, type MemberChannel } from "../server";
 import { defineTool } from "../tools/index";
-import { getIpcPath, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
-import { closeIpcServer, createIpcServer } from "./ipc";
-import { createDecoder, encodeMessage, type IpcMessage, type WindowState } from "./protocol";
+import { HEARTBEAT_INTERVAL_MS, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
+import type { IpcMessage, WindowState } from "./protocol";
+
+/**
+ * A connected member (Worker) from the Leader's point of view. Every member
+ * connects over the HTTP member channel (SSE receive leg + POST send leg).
+ */
+interface MemberPeer {
+  readonly kind: "http";
+  send(msg: IpcMessage): void;
+  close(): void;
+  readonly destroyed: boolean;
+}
+
+/** HTTP peer: SSE frames (`event: message`) on the member-channel stream. */
+class HttpPeer implements MemberPeer {
+  readonly kind = "http" as const;
+  constructor(private readonly res: http.ServerResponse) {}
+  get destroyed(): boolean {
+    return this.res.destroyed;
+  }
+  send(msg: IpcMessage): void {
+    try {
+      this.res.write(`event: message\ndata: ${JSON.stringify(msg)}\n\n`);
+    } catch {
+      /* peer gone */
+    }
+  }
+  close(): void {
+    try {
+      this.res.end();
+    } catch {
+      /* peer gone */
+    }
+  }
+}
 
 interface WorkerEntry {
   id: string;
@@ -34,7 +67,9 @@ interface WorkerEntry {
   instanceName?: string;
   /** Latest window state (active file / open editors) from MSG.UPDATE. */
   state?: WindowState;
-  socket: net.Socket;
+  peer: MemberPeer;
+  /** Session id for the member channel (routes POST /cluster/message). */
+  sessionId?: string;
 }
 
 interface PendingCall {
@@ -47,7 +82,8 @@ interface PendingCall {
 export interface LeaderOptions {
   port: number;
   host: string;
-  ipcPath?: string;
+  /** Secondary bind addresses for the leader's HTTP server (Linux hosts). */
+  hosts?: string[];
   authToken?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
@@ -67,27 +103,26 @@ export interface LeaderOptions {
 
 type Target = "local" | { workerId: string } | { error: JsonRpcResponse };
 
-export class LeaderCoordinator implements McpRouter {
+export class LeaderCoordinator implements McpRouter, MemberChannel {
   readonly role = "leader" as const;
   private readonly opts: LeaderOptions;
-  private readonly ipcPath: string;
   private server: McpServer;
-  private ipcServer: net.Server | null = null;
-  private sockets = new Set<net.Socket>();
   private localState: WindowState = { openEditors: [] };
-  /** Per-connection state: registration status + worker id (set on REGISTER). */
-  private ipcPeer = new Map<net.Socket, { registered: boolean; entryId: string | null }>();
+  /** Per-peer connection state: registration status + worker id (REGISTER). */
+  private peerState = new Map<MemberPeer, { registered: boolean; entryId: string | null }>();
+  /** HTTP member-channel peers, keyed by worker-chosen session id. */
+  private httpPeers = new Map<string, HttpPeer>();
   private workers = new Map<string, WorkerEntry>();
   private pending = new Map<string, PendingCall>();
 
   constructor(opts: LeaderOptions) {
     this.opts = opts;
-    this.ipcPath = opts.ipcPath ?? getIpcPath();
     if (opts.state) this.localState = opts.state;
 
     this.server = new McpServer({
       port: opts.port,
       host: opts.host,
+      ...(opts.hosts && opts.hosts.length > 0 ? { hosts: opts.hosts } : {}),
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
       ...(opts.tlsCertPath && opts.tlsKeyPath
         ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath }
@@ -96,6 +131,7 @@ export class LeaderCoordinator implements McpRouter {
       logger: opts.logger,
       executor: opts.executor,
       router: this,
+      memberChannel: this,
     });
 
     // Discovery tool: lets MCP clients enumerate the windows in the cluster
@@ -149,23 +185,7 @@ export class LeaderCoordinator implements McpRouter {
   }
 
   async start(): Promise<void> {
-    // NOTE: no pre-unlink here. createIpcServer already recovers stale
-    // socket files safely (EADDRINUSE -> isIpcAlive -> unlink only if the
-    // holder is dead). Unlinking unconditionally would let a promoting
-    // window steal the IPC path from a LIVE leader — the split-brain bug.
-    this.ipcServer = await createIpcServer(this.ipcPath);
-    this.ipcServer.on("connection", (socket) => this.onIpcConnection(socket));
-    try {
-      await this.server.start();
-    } catch (err) {
-      // HTTP bind lost the race — undo the IPC server and let bootstrap
-      // re-probe (it will find the winner as a valid leader and join).
-      if (this.ipcServer) {
-        await closeIpcServer(this.ipcServer, this.sockets);
-        this.ipcServer = null;
-      }
-      throw err;
-    }
+    await this.server.start();
   }
 
   async stop(timeoutMs = 5000): Promise<void> {
@@ -174,19 +194,10 @@ export class LeaderCoordinator implements McpRouter {
       p.reject(new Error("Leader shutting down"));
     }
     this.pending.clear();
+    for (const peer of this.httpPeers.values()) peer.close();
+    this.httpPeers.clear();
     await this.server.stop(timeoutMs);
-    if (this.ipcServer) {
-      await closeIpcServer(this.ipcServer, this.sockets);
-      this.ipcServer = null;
-    }
     this.workers.clear();
-    // Do NOT unlink this.ipcPath here. The socket path is cluster-shared, not
-    // owned by one leader: during a split-brain two leaders can exist, and one
-    // stopping must not remove the path the other is actively serving (that
-    // strands every worker in a permanent ENOENT loop). Stale-file recovery
-    // lives in createIpcServer (EADDRINUSE -> isIpcAlive -> unlink only when
-    // the holder is dead); if this process is dying the kernel closes the
-    // socket and the next promotion reclaims the path.
   }
 
   // ── Cluster routing (McpRouter) ────────────────────────────────────
@@ -240,11 +251,25 @@ export class LeaderCoordinator implements McpRouter {
       };
     }
     if (method === "tools/list") return "local";
+    // Routing refs may also arrive as tool arguments — the only channel real
+    // MCP clients (e.g. opencode) use. Resolve id/path/basename/displayName/
+    // instanceId; fall through to path inference when unresolved so tools keep
+    // their own "folder not found" errors for genuinely unknown names.
+    const argRef = extractArgWorkspaceRef(params);
+    if (argRef) {
+      const t = this.resolveWorkspaceRef(argRef);
+      if (t === "local") return "local";
+      if (t) return { workerId: t };
+    }
     const inferred = this.inferWorker(params);
     return inferred ? { workerId: inferred } : "local";
   }
 
-  /** Resolve a `workspace` argument: id, exact folder path, or folder name. */
+  /**
+   * Resolve a workspace reference: id, instance id, display name, exact folder
+   * path, or folder name (basename). Used for the top-level `workspace` param
+   * and for `workspace`/`workspaceFolder` tool arguments alike.
+   */
   private resolveWorkspaceRef(ref: string): "local" | string | null {
     if (ref === this.opts.workspaceId || ref === this.opts.instanceId) return "local";
     if (this.opts.workspacePaths.some((p) => p === ref || basename(p) === ref)) return "local";
@@ -284,7 +309,17 @@ export class LeaderCoordinator implements McpRouter {
       for (const e of all) {
         const ws = normalize(e.path);
         if (!ws) continue;
-        if (norm === ws || norm.startsWith(`${ws}/`) || norm.startsWith(`${ws}\\`)) {
+        const base = basename(ws);
+        if (
+          norm === ws ||
+          norm.startsWith(`${ws}/`) ||
+          norm.startsWith(`${ws}\\`) ||
+          // Folder-name refs (e.g. `workspaceFolder: "worker"`) and
+          // folder-relative paths ("worker/src/main.ts") resolve to the
+          // window whose workspace basename matches.
+          (base.length > 0 &&
+            (norm === base || norm.startsWith(`${base}/`) || norm.startsWith(`${base}\\`)))
+        ) {
           if (!best || ws.length > best.len) {
             best = { id: e.id, len: ws.length };
           } else if (ws.length === best.len && best.id !== "local" && e.id === "local") {
@@ -310,59 +345,101 @@ export class LeaderCoordinator implements McpRouter {
         reject(new Error("Worker timed out"));
       }, PROXY_TIMEOUT_MS);
       this.pending.set(callId, { workerId, resolve, reject, timer });
-      try {
-        worker.socket.write(encodeMessage({ type: MSG.CALL, callId, rawBody: body }));
-      } catch (err) {
-        clearTimeout(timer);
-        this.pending.delete(callId);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
+      worker.peer.send({ type: MSG.CALL, callId, rawBody: body });
     });
   }
 
-  // ── IPC server side ────────────────────────────────────────────────
+  // ── Peer connection side (HTTP member channel) ──────────────────────
 
-  private onIpcConnection(socket: net.Socket): void {
-    this.sockets.add(socket);
-    socket.setNoDelay(true);
-
-    const state = { registered: false, entryId: null as string | null };
-    this.ipcPeer.set(socket, state);
-    const decode = createDecoder((msg) => {
-      try {
-        this.onIpcMessage(socket, msg);
-      } catch (err) {
-        this.log(`[leader] IPC handler error: ${err instanceof Error ? err.message : String(err)}`);
-        socket.destroy();
-      }
+  /** Member channel SSE leg: registers a new HTTP peer for a session. */
+  handleStream(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      // Loopback-only: browser pages on other origins were already rejected
+      // by the server's origin check before this handler ran.
+      "Access-Control-Allow-Origin": `http://127.0.0.1:${this.opts.port}`,
     });
+    // First SSE frame must be written immediately: undici's fetch() does not
+    // resolve its promise until the first body chunk arrives. A comment line
+    // is ignored by the transport parser but flushes the chunked stream so
+    // connect() completes and REGISTER can follow.
+    res.write(": connected\n\n");
+
+    const peer = new HttpPeer(res);
+    const state = { registered: false, entryId: null as string | null };
+    this.httpPeers.set(sessionId, peer);
+    this.peerState.set(peer, state);
+
+    // Keep the stream alive through silent periods (worker heartbeats only
+    // arrive every HEARTBEAT_INTERVAL_MS) so proxies don't kill it.
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(": keepalive\n\n");
+      } catch {
+        clearInterval(keepAlive);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
 
     const regTimer = setTimeout(() => {
       if (!state.registered) {
-        this.log("[leader] IPC peer did not REGISTER in time — closing");
-        socket.destroy();
+        this.log(`[leader] member ${sessionId} did not REGISTER in time — closing`);
+        this.dropHttpPeer(sessionId, peer);
       }
     }, REGISTER_TIMEOUT_MS);
 
-    socket.on("data", (chunk: Buffer) => {
-      try {
-        decode(chunk);
-      } catch {
-        socket.destroy(); // corrupt framing — drop the peer
-      }
-    });
-    socket.on("close", () => {
+    const cleanup = () => {
       clearTimeout(regTimer);
-      this.ipcPeer.delete(socket);
-      this.sockets.delete(socket);
+      clearInterval(keepAlive);
+      this.httpPeers.delete(sessionId);
+      this.peerState.delete(peer);
       if (state.entryId) this.dropWorker(state.entryId);
-    });
-    socket.on("error", () => {
+    };
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    res.on("error", () => {
       /* close handler cleans up */
     });
   }
 
-  private onIpcMessage(socket: net.Socket, msg: IpcMessage): void {
+  /** Member channel POST leg: one protocol message from a worker. */
+  handleMessage(sessionId: string, rawBody: string, res: http.ServerResponse): void {
+    const peer = this.httpPeers.get(sessionId);
+    if (!peer) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unknown member session" }));
+      return;
+    }
+    let msg: IpcMessage;
+    try {
+      msg = JSON.parse(rawBody) as IpcMessage;
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+      return;
+    }
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ accepted: true }));
+    try {
+      this.onPeerMessage(peer, msg);
+    } catch (err) {
+      this.log(
+        `[leader] member handler error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      this.dropHttpPeer(sessionId, peer);
+    }
+  }
+
+  private dropHttpPeer(sessionId: string, peer: HttpPeer): void {
+    peer.close();
+    this.httpPeers.delete(sessionId);
+    const state = this.peerState.get(peer);
+    this.peerState.delete(peer);
+    if (state?.entryId) this.dropWorker(state.entryId);
+  }
+
+  private onPeerMessage(peer: MemberPeer, msg: IpcMessage): void {
     switch (msg.type) {
       case MSG.REGISTER: {
         const id = typeof msg.id === "string" ? msg.id : undefined;
@@ -373,49 +450,47 @@ export class LeaderCoordinator implements McpRouter {
           typeof msg.displayName === "string" ? msg.displayName : (id ?? "unknown");
         if (!id) {
           this.log("[leader] REGISTER without id — closing peer");
-          socket.destroy();
+          peer.close();
           return;
         }
         // Replace a stale entry for the same window (reconnect after leader
         // restart) and fail any calls that were in flight to it.
         const existing = this.workers.get(id);
-        if (existing && existing.socket !== socket) {
-          existing.socket.destroy();
+        if (existing && existing.peer !== peer) {
+          existing.peer.close();
         }
         this.dropWorker(id);
-        this.workers.set(id, {
+        const entry: WorkerEntry = {
           id,
           workspacePaths: paths,
           displayName,
           instanceId: typeof msg.instanceId === "string" ? msg.instanceId : undefined,
           instanceName: typeof msg.instanceName === "string" ? msg.instanceName : undefined,
           state: this.normalizeWindowState(msg.state),
-          socket,
-        });
-        const state = this.ipcPeer.get(socket);
+          peer,
+          sessionId: this.httpSessionId(peer),
+        };
+        this.workers.set(id, entry);
+        const state = this.peerState.get(peer);
         if (state) {
           state.registered = true;
           state.entryId = id;
         }
-        socket.write(encodeMessage({ type: MSG.WELCOME, leaderId: this.opts.workspaceId }));
+        peer.send({ type: MSG.WELCOME, leaderId: this.opts.workspaceId });
         this.log(
           `[leader] worker registered: ${displayName} (${paths.join(", ") || "no workspace"})`,
         );
         break;
       }
       case MSG.PING: {
-        try {
-          socket.write(encodeMessage({ type: MSG.PONG }));
-        } catch {
-          /* peer gone */
-        }
+        peer.send({ type: MSG.PONG });
         break;
       }
       case MSG.UPDATE: {
         // Worker publishes window state (active file / open editors).
-        const peer = this.ipcPeer.get(socket);
-        if (peer?.entryId) {
-          const entry = this.workers.get(peer.entryId);
+        const peerState = this.peerState.get(peer);
+        if (peerState?.entryId) {
+          const entry = this.workers.get(peerState.entryId);
           if (entry) {
             entry.state = this.normalizeWindowState(msg.state);
           }
@@ -439,11 +514,20 @@ export class LeaderCoordinator implements McpRouter {
     }
   }
 
+  /** Find the session id routing to a member peer (for REGISTER bookkeeping). */
+  private httpSessionId(peer: MemberPeer): string | undefined {
+    for (const [sessionId, p] of this.httpPeers) {
+      if (p === peer) return sessionId;
+    }
+    return undefined;
+  }
+
   private dropWorker(workerId: string): void {
     const entry = this.workers.get(workerId);
     if (entry) {
       this.workers.delete(workerId);
-      if (!entry.socket.destroyed) entry.socket.destroy();
+      if (entry.sessionId) this.httpPeers.delete(entry.sessionId);
+      if (!entry.peer.destroyed) entry.peer.close();
     }
     for (const [callId, p] of this.pending) {
       if (p.workerId === workerId) {
@@ -460,8 +544,9 @@ export class LeaderCoordinator implements McpRouter {
 
   /**
    * Publish the leader window's own state (active file / open editors).
-   * The leader row in list_workspaces reflects the latest value. No IPC
-   * message is needed — the leader already owns its row locally.
+   * The leader row in list_workspaces reflects the latest value. No
+   * member-channel message is needed — the leader already owns its row
+   * locally.
    */
   updateState(state: WindowState): void {
     this.localState = state;
@@ -525,6 +610,23 @@ function stripWorkspaceArg(
 
 const PATH_KEY_RE = /(path|uri|file|folder|dir|cwd|root)/i;
 const ABS_RE = /^(\/|[a-zA-Z]:[\\/])/;
+
+/**
+ * Routing refs may arrive as tool arguments — the only channel standard MCP
+ * clients have. Prefers an explicit `workspace` argument over `workspaceFolder`
+ * so the routing contract works from either the top-level param or the args.
+ */
+function extractArgWorkspaceRef(params: Record<string, unknown> | undefined): string | undefined {
+  if (!params || typeof params.arguments !== "object" || params.arguments === null) {
+    return undefined;
+  }
+  const args = params.arguments as Record<string, unknown>;
+  for (const key of ["workspace", "workspaceFolder"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
 
 function collectPathCandidates(args: Record<string, unknown>): string[] {
   const out: string[] = [];

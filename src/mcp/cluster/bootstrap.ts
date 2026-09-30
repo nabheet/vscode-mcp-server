@@ -3,14 +3,29 @@
  * activation (and re-runs after losing its Leader).
  *
  * Algorithm (bounded retry loop over base..base+MAX_PORT_SCAN-1):
- *  - probe /health on the port
- *    • valid   → join as Worker. If the join handshake fails, retry the SAME
- *                port (never increment — that fragments the cluster).
- *    • free    → promote to Leader (bind IPC pipe + HTTP)
+ *  - probe /health on 127.0.0.1:port (this namespace)
+ *    • valid   → join as Worker over the HTTP member channel on the same
+ *                host:port. Join failure → retry the SAME port (never
+ *                increment — that fragments the cluster).
+ *    • free    → if crossBoundaryHosts is configured, probe each candidate
+ *                host (e.g. host.docker.internal) before promoting:
+ *                - valid   → join over HTTP. Join failure → retry same port.
+ *                - timeout → possible frozen Leader in the other namespace,
+ *                            but only for CROSS_BOUNDARY_TIMEOUT_LIMIT
+ *                            consecutive attempts. A host that never answers
+ *                            (e.g. Docker Desktop's VM gateway silently
+ *                            dropping SYNs to unforwarded ports) is treated as
+ *                            absent after that, and we promote locally — a
+ *                            container with no host Leader must be able to
+ *                            elect itself.
+ *                - free/foreign → try the next candidate host.
+ *                Only when every candidate is free/foreign (or the timeout
+ *                patience window has been exhausted) do we promote.
  *    • foreign → unrelated app squatting the port → try next port
- *    • zombie  → occupied, no HTTP signature, but IPC pipe alive: a frozen
- *                or still-starting Leader. Retry registration on the SAME
- *                port (never increment — that fragments the cluster).
+ *    • timeout → occupied, no HTTP signature: a frozen/starting Leader or a
+ *                non-HTTP app. Retry the SAME port (never increment — that
+ *                fragments the cluster); it may unfreeze, or die and free
+ *                the port for promotion.
  *  - registration/promotion races (leader died mid-handshake, two windows
  *    promoted simultaneously) fall out of the loop naturally: re-probe and
  *    retry with exponential backoff + jitter.
@@ -19,9 +34,15 @@
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { ToolExecutor } from "../executor";
-import { getIpcPath, MAX_ELECTION_ATTEMPTS, MAX_PORT_SCAN, REELECT_JITTER_MS } from "./constants";
-import { jitter, probePort, sleep } from "./election";
+import {
+  CROSS_BOUNDARY_TIMEOUT_LIMIT,
+  MAX_ELECTION_ATTEMPTS,
+  MAX_PORT_SCAN,
+  REELECT_JITTER_MS,
+} from "./constants";
+import { jitter, probeHost, probePort, sleep } from "./election";
 import { LeaderCoordinator } from "./leader";
+import { HttpMemberTransport, memberBaseUrl } from "./memberTransport";
 import type { WindowState } from "./protocol";
 import { WorkerCoordinator } from "./worker";
 
@@ -30,10 +51,18 @@ export type ClusterMember = LeaderCoordinator | WorkerCoordinator;
 export interface BootstrapOptions {
   basePort: number;
   host: string;
-  ipcPath?: string;
+  /** Secondary bind addresses for the leader's HTTP server (Linux hosts). */
+  hosts?: string[];
   authToken?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
+  /**
+   * Hosts to probe (in order) when the local port is free, before promoting.
+   * Container windows pass [host.docker.internal] to reach a Leader running
+   * on the host; host windows pass nothing (they reach a container Leader
+   * via the loopback valid-probe + HTTP join path).
+   */
+  crossBoundaryHosts?: string[];
   executor: ToolExecutor;
   metrics?: Metrics;
   logger?: ServerLog;
@@ -52,16 +81,20 @@ export interface BootstrapOptions {
 export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterMember> {
   const base = opts.basePort;
   const maxPorts = Math.max(1, MAX_PORT_SCAN);
-  const ipcPath = opts.ipcPath ?? getIpcPath();
+  const crossHosts = opts.crossBoundaryHosts ?? [];
   let delay = 250;
+  let crossBoundaryTimeoutStreak = 0;
 
   for (let attempt = 0; attempt < MAX_ELECTION_ATTEMPTS; attempt++) {
     for (let offset = 0; offset < maxPorts; offset++) {
       const port = base + offset;
-      const probe = await probePort(port, ipcPath);
+      const probe = await probePort(port);
 
       if (probe.status === "valid") {
-        const worker = await tryJoin(port, opts, ipcPath);
+        // Join over the HTTP member channel on the same host:port (works
+        // for same-namespace windows AND a container leader reachable
+        // through a forwarded port).
+        const worker = await tryJoinHttp(port, "127.0.0.1", opts);
         if (worker) {
           opts.log?.(`[mcp] Joined leader on port ${port} as worker`);
           return worker;
@@ -71,21 +104,63 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         break;
       }
 
-      if (probe.status === "zombie") {
-        // Frozen leader: do NOT skip the port. Try to rejoin; if that fails,
-        // back off and retry this port on the next attempt (it may unfreeze,
-        // or die and free the port for promotion).
-        const worker = await tryJoin(port, opts, ipcPath);
-        if (worker) {
-          opts.log?.(`[mcp] Rejoined leader on port ${port} after freeze`);
-          return worker;
-        }
+      if (probe.status === "timeout") {
+        // Occupied but silent: a frozen/starting Leader (or a non-HTTP app
+        // squatting the port). Do NOT skip or promote — retry the SAME port
+        // on the next attempt (it may unfreeze, or die and free the port).
         break;
       }
 
       if (probe.status === "free") {
-        const leader = await tryPromote(port, opts, ipcPath);
+        // Cross-boundary discovery: a Leader may live in another namespace
+        // (container ↔ host). Probe candidates before promoting.
+        if (crossHosts.length > 0) {
+          let joinedOrRetry = false;
+          for (const host of crossHosts) {
+            const hp = await probeHost(port, host);
+            if (hp.status === "valid") {
+              const worker = await tryJoinHttp(port, host, opts);
+              if (worker) {
+                opts.log?.(`[mcp] Joined leader on ${host}:${port} over HTTP member channel`);
+                return worker;
+              }
+              // Leader vanished mid-handshake: retry the SAME port later.
+              joinedOrRetry = true;
+              break;
+            }
+            if (hp.status === "timeout") {
+              // Occupied but silent. Locally this means a frozen Leader and we
+              // must keep retrying the same port. Cross-boundary, a host that
+              // silently drops SYNs (Docker Desktop's VM gateway) also looks
+              // like this — but there may be no Leader at all. Give a real
+              // (frozen or starting) host Leader a bounded window, then treat
+              // the host as absent and promote locally.
+              crossBoundaryTimeoutStreak += 1;
+              if (crossBoundaryTimeoutStreak < CROSS_BOUNDARY_TIMEOUT_LIMIT) {
+                opts.log?.(
+                  `[mcp] Cross-boundary probe ${host}:${port} timed out ` +
+                    `(${crossBoundaryTimeoutStreak}/${CROSS_BOUNDARY_TIMEOUT_LIMIT}) — ` +
+                    `retrying same port`,
+                );
+                joinedOrRetry = true;
+                break;
+              }
+              opts.log?.(
+                `[mcp] Cross-boundary probe ${host}:${port} timed out ` +
+                  `${CROSS_BOUNDARY_TIMEOUT_LIMIT} consecutive attempts — ` +
+                  `no host leader reachable, promoting locally`,
+              );
+              crossBoundaryTimeoutStreak = 0;
+              break;
+            }
+            // free / foreign → try the next candidate host
+          }
+          if (joinedOrRetry) break;
+        }
+
+        const leader = await tryPromote(port, opts);
         if (leader) {
+          crossBoundaryTimeoutStreak = 0;
           opts.log?.(`[mcp] Promoted to leader on port ${port}`);
           return leader;
         }
@@ -104,13 +179,20 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
   );
 }
 
-async function tryJoin(
+/** Join a Leader over the HTTP member channel on the given host:port. */
+async function tryJoinHttp(
   port: number,
+  host: string,
   opts: BootstrapOptions,
-  ipcPath: string,
 ): Promise<WorkerCoordinator | null> {
+  const scheme = opts.tlsCertPath && opts.tlsKeyPath ? "https" : "http";
+  const transport = new HttpMemberTransport({
+    baseUrl: memberBaseUrl(scheme, host, port),
+    authToken: opts.authToken,
+    log: opts.log,
+  });
   const worker = new WorkerCoordinator({
-    ipcPath,
+    transport,
     executor: opts.executor,
     workspaceId: opts.workspaceId,
     workspacePaths: opts.workspacePaths,
@@ -119,31 +201,26 @@ async function tryJoin(
     instanceName: opts.instanceName ?? opts.displayName,
     state: opts.state,
     log: opts.log,
-    // Re-election is wired by the owner (extension.ts) after the member is
-    // returned: it must stop this worker, re-run bootstrapCluster, and swap
-    // the member + update the UI.
   });
   try {
     await worker.start();
     return worker;
   } catch (err) {
     opts.log?.(
-      `[mcp] Join on port ${port} failed: ${err instanceof Error ? err.message : String(err)}`,
+      `[mcp] HTTP join on ${host}:${port} failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
     );
     await worker.stop(100);
     return null;
   }
 }
 
-async function tryPromote(
-  port: number,
-  opts: BootstrapOptions,
-  ipcPath: string,
-): Promise<LeaderCoordinator | null> {
+async function tryPromote(port: number, opts: BootstrapOptions): Promise<LeaderCoordinator | null> {
   const leader = new LeaderCoordinator({
     port,
     host: opts.host,
-    ipcPath,
+    ...(opts.hosts && opts.hosts.length > 0 ? { hosts: opts.hosts } : {}),
     ...(opts.authToken ? { authToken: opts.authToken } : {}),
     ...(opts.tlsCertPath && opts.tlsKeyPath
       ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath }
