@@ -172,6 +172,16 @@ async function resolveCodeCli(): Promise<{
     if (fs.existsSync(binary)) return { cmd: binary, args: [] };
     throw new Error(`VS Code binary not found under ${appRoot}`);
   }
+  if (process.platform === "linux") {
+    // downloadAndUnzipVSCode returns the root Electron binary itself
+    // (<dir>/code). Spawn it directly — NOT the `bin/code` Node CLI wrapper
+    // that resolveCliPathFromVSCodeExecutablePath returns: that wrapper
+    // spawns the real binary and exits, so the PID we hold would be a dead
+    // script whose process group vanishes and whose child (the real app)
+    // gets reparented away from it, breaking the self-heal test's group
+    // freeze. The binary stays attached as our child.
+    return wrapForDisplay(vscodePath, []);
+  }
   const { resolveCliPathFromVSCodeExecutablePath } = await import("@vscode/test-electron");
   const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
 
