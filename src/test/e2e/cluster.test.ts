@@ -23,6 +23,47 @@ function findFreePort(): Promise<number> {
 }
 
 /**
+ * PIDs listening on `port`. macOS ships lsof; Linux runners ship iproute2's
+ * `ss` (lsof is not guaranteed there). Exactly one process binds the cluster
+ * port — the current leader's extension host — but `ss`/`lsof` may also
+ * report a stray, so the caller filters by the leader window's process tree.
+ */
+function listenerPids(port: number): number[] {
+  const pids: number[] = [];
+  const fromLsof = (): void => {
+    try {
+      const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, {
+        encoding: "utf8",
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      for (const line of out.split("\n")) {
+        const pid = Number(line.trim());
+        if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+      }
+    } catch {
+      // No listener (or lsof unavailable); caller decides.
+    }
+  };
+  if (process.platform === "darwin") {
+    fromLsof();
+  } else {
+    try {
+      const out = execSync(`ss -ltnp 'sport = :${port}'`, {
+        encoding: "utf8",
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      for (const m of out.matchAll(/pid=(\d+)/g)) {
+        const pid = Number(m[1]);
+        if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+      }
+    } catch {
+      fromLsof();
+    }
+  }
+  return pids;
+}
+
+/**
  * Resolve the extension-host process that owns the MCP HTTP server for the
  * leader window. On VS Code 1.139 the extension host is an Electron
  * "NodeService" utility process (no `--type=extensionHost` flag, no
@@ -56,18 +97,8 @@ function findLeaderExtensionHostPid(rootPid: number, port: number): number | nul
       queue.push(pid);
     }
   }
-  let lsof = "";
-  try {
-    lsof = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, {
-      encoding: "utf8",
-      maxBuffer: 8 * 1024 * 1024,
-    });
-  } catch {
-    return null;
-  }
-  for (const line of lsof.split("\n")) {
-    const pid = Number(line.trim());
-    if (Number.isInteger(pid) && pid > 0 && descendants.has(pid)) return pid;
+  for (const pid of listenerPids(port)) {
+    if (descendants.has(pid)) return pid;
   }
   return null;
 }
