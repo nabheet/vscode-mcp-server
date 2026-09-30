@@ -23,37 +23,51 @@ function findFreePort(): Promise<number> {
 }
 
 /**
- * Resolve the extension-host process under `rootPid` (BFS over the process
- * tree). The extension host owns the MCP HTTP server, so freezing it with
- * SIGSTOP pauses the server while keeping the port bound — unlike a kill,
- * which frees the port for the survivor to promote and lets VS Code
- * auto-restart the killed extension host, racing the re-election.
+ * Resolve the extension-host process that owns the MCP HTTP server for the
+ * leader window. On VS Code 1.139 the extension host is an Electron
+ * "NodeService" utility process (no `--type=extensionHost` flag, no
+ * "Extension Host" name anymore), so it is identified by the port it binds:
+ * exactly one process listens on the cluster port, and it is a descendant of
+ * the leader window's main process. Freezing it with SIGSTOP pauses the
+ * server while keeping the port bound — unlike a kill, which frees the port
+ * for the survivor to promote and lets VS Code auto-restart the killed
+ * extension host, racing the re-election.
  */
-function findExtensionHostPid(rootPid: number): number | null {
+function findLeaderExtensionHostPid(rootPid: number, port: number): number | null {
   const ps = execSync("ps -axo pid=,ppid=,command=", {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
   });
   const children = new Map<number, number[]>();
-  const commands = new Map<number, string>();
   for (const line of ps.split("\n")) {
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
     if (!m) continue;
     const pid = Number(m[1]);
     const ppid = Number(m[2]);
-    commands.set(pid, m[3]);
     const list = children.get(ppid);
     if (list) list.push(pid);
     else children.set(ppid, [pid]);
   }
+  const descendants = new Set<number>();
   const queue: number[] = [rootPid];
   for (let i = 0; i < queue.length; i++) {
-    const pid = queue[i];
-    const cmd = commands.get(pid) ?? "";
-    if (/--type=extensionHost/i.test(cmd) || /Code Helper \(Extension Host\)/i.test(cmd)) {
-      return pid;
+    for (const pid of children.get(queue[i]) ?? []) {
+      descendants.add(pid);
+      queue.push(pid);
     }
-    queue.push(...(children.get(pid) ?? []));
+  }
+  let lsof = "";
+  try {
+    lsof = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, {
+      encoding: "utf8",
+      maxBuffer: 8 * 1024 * 1024,
+    });
+  } catch {
+    return null;
+  }
+  for (const line of lsof.split("\n")) {
+    const pid = Number(line.trim());
+    if (Number.isInteger(pid) && pid > 0 && descendants.has(pid)) return pid;
   }
   return null;
 }
@@ -598,7 +612,7 @@ describe("cluster leader-worker (E2E)", () => {
     // stayed dead until a manual reload. A kill would be useless here: the
     // port would free up and the survivor would simply promote — and VS
     // Code would auto-restart the killed extension host, racing it.
-    const extHostPid = findExtensionHostPid(leaderProc.pid);
+    const extHostPid = findLeaderExtensionHostPid(leaderProc.pid, port);
     if (extHostPid === null) {
       throw new Error("Should locate the leader's extension host process");
     }
@@ -614,10 +628,29 @@ describe("cluster leader-worker (E2E)", () => {
       // 5.5s backoff, so 8 attempts ≈ 41s and FATAL#1 lands around 55-60s.
       // Un-freezing at 70s guarantees at least one FATAL and an
       // already-scheduled retry — that FATAL is the regression signal.
-      await new Promise((r) => setTimeout(r, 70000));
+      //
+      // The freeze must hold for the whole window: if VS Code ever
+      // auto-restarts the frozen extension host, the port comes back and
+      // the cluster heals by promotion instead of by the FATAL retry we are
+      // testing — fail loudly rather than silently pass on the wrong path.
+      const holdUntil = Date.now() + 70000;
+      while (Date.now() < holdUntil) {
+        await new Promise((r) => setTimeout(r, 5000));
+        if (!(await probePortDown(port))) {
+          throw new Error(
+            "leader's extension host was auto-restarted during the freeze; SIGSTOP did not isolate the MCP server",
+          );
+        }
+      }
     } finally {
       // Thaw the leader so its port (and cluster membership) come back.
-      process.kill(extHostPid, "SIGCONT");
+      // The process may already be gone if VS Code restarted it — that is
+      // caught by the hold assertion above, not silently ignored here.
+      try {
+        process.kill(extHostPid, "SIGCONT");
+      } catch {
+        // Already exited; nothing to resume.
+      }
     }
 
     // Self-heal must happen WITHOUT any reload: the retry re-runs
