@@ -23,87 +23,6 @@ function findFreePort(): Promise<number> {
 }
 
 /**
- * PIDs listening on `port`. macOS ships lsof; Linux runners ship iproute2's
- * `ss` (lsof is not guaranteed there). Exactly one process binds the cluster
- * port — the current leader's extension host — but `ss`/`lsof` may also
- * report a stray, so the caller filters by the leader window's process tree.
- */
-function listenerPids(port: number): number[] {
-  const pids: number[] = [];
-  const fromLsof = (): void => {
-    try {
-      const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, {
-        encoding: "utf8",
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      for (const line of out.split("\n")) {
-        const pid = Number(line.trim());
-        if (Number.isInteger(pid) && pid > 0) pids.push(pid);
-      }
-    } catch {
-      // No listener (or lsof unavailable); caller decides.
-    }
-  };
-  if (process.platform === "darwin") {
-    fromLsof();
-  } else {
-    try {
-      const out = execSync(`ss -ltnp 'sport = :${port}'`, {
-        encoding: "utf8",
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      for (const m of out.matchAll(/pid=(\d+)/g)) {
-        const pid = Number(m[1]);
-        if (Number.isInteger(pid) && pid > 0) pids.push(pid);
-      }
-    } catch {
-      fromLsof();
-    }
-  }
-  return pids;
-}
-
-/**
- * Resolve the extension-host process that owns the MCP HTTP server for the
- * leader window. On VS Code 1.139 the extension host is an Electron
- * "NodeService" utility process (no `--type=extensionHost` flag, no
- * "Extension Host" name anymore), so it is identified by the port it binds:
- * exactly one process listens on the cluster port, and it is a descendant of
- * the leader window's main process. Freezing it with SIGSTOP pauses the
- * server while keeping the port bound — unlike a kill, which frees the port
- * for the survivor to promote and lets VS Code auto-restart the killed
- * extension host, racing the re-election.
- */
-function findLeaderExtensionHostPid(rootPid: number, port: number): number | null {
-  const ps = execSync("ps -axo pid=,ppid=,command=", {
-    encoding: "utf8",
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  const children = new Map<number, number[]>();
-  for (const line of ps.split("\n")) {
-    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (!m) continue;
-    const pid = Number(m[1]);
-    const ppid = Number(m[2]);
-    const list = children.get(ppid);
-    if (list) list.push(pid);
-    else children.set(ppid, [pid]);
-  }
-  const descendants = new Set<number>();
-  const queue: number[] = [rootPid];
-  for (let i = 0; i < queue.length; i++) {
-    for (const pid of children.get(queue[i]) ?? []) {
-      descendants.add(pid);
-      queue.push(pid);
-    }
-  }
-  for (const pid of listenerPids(port)) {
-    if (descendants.has(pid)) return pid;
-  }
-  return null;
-}
-
-/**
  * True when the MCP endpoint is unreachable OR accepts connections but
  * never answers (a SIGSTOPped leader). A plain mcpRequest would hang
  * forever on the frozen server, so this probe enforces its own socket
@@ -381,6 +300,12 @@ describe("cluster leader-worker (E2E)", () => {
           MCP_SERVER_MAX_RETRIES: "1",
         },
         stdio: ["ignore", "pipe", "pipe"],
+        // Each window becomes a process-group leader (its PID is its PGID)
+        // so the self-heal test can SIGSTOP/SIGCONT the entire window —
+        // main, renderer, and extension host — via kill(-pid). Without
+        // this, the children share vitest's process group and a group-wide
+        // stop would freeze the test runner itself.
+        detached: true,
       };
 
       const proc = spawn(cliCmd, launchArgs, spawnOpts);
@@ -634,20 +559,25 @@ describe("cluster leader-worker (E2E)", () => {
     const leaderProc = procs[leaderFolder?.endsWith("alpha") ? 0 : 1];
     expect(leaderProc.pid, "leader process should be trackable").toBeTruthy();
 
-    // Freeze (SIGSTOP — NOT kill) the leader's extension host. The frozen
-    // process keeps the TCP port bound but never answers, so the survivor's
-    // /health probe times out: "occupied but silent" → it must NOT promote
-    // and must NOT advance to a higher port — it retries the SAME port and
-    // FATALs ("Could not elect or join a leader after N attempts") before
-    // extension.ts's retry loop re-runs startCluster. Pre-fix, the window
-    // stayed dead until a manual reload. A kill would be useless here: the
-    // port would free up and the survivor would simply promote — and VS
-    // Code would auto-restart the killed extension host, racing it.
-    const extHostPid = findLeaderExtensionHostPid(leaderProc.pid, port);
-    if (extHostPid === null) {
-      throw new Error("Should locate the leader's extension host process");
-    }
-    process.kill(extHostPid, "SIGSTOP");
+    // Freeze (SIGSTOP — NOT kill) the leader window's ENTIRE process group
+    // (main + renderer + extension host). The frozen processes keep the TCP
+    // port bound but never answer, so the survivor's /health probe times
+    // out: "occupied but silent" → it must NOT promote and must NOT advance
+    // to a higher port — it retries the SAME port and FATALs ("Could not
+    // elect or join a leader after N attempts") before extension.ts's retry
+    // loop re-runs startCluster. Pre-fix, the window stayed dead until a
+    // manual reload. A kill would be useless here: the port would free up
+    // and the survivor would simply promote — and VS Code would
+    // auto-restart the killed extension host, racing it.
+    //
+    // The whole group is frozen (not just the extension host) because the
+    // extension host is an Electron "NodeService" utility process whose PID
+    // is not reliably discoverable on every platform (lsof is not guaranteed
+    // on Linux runners). Freezing the group also keeps VS Code's main
+    // process watchdog from restarting the frozen extension host. Each
+    // window is spawned with `detached: true`, so kill(-pid) targets the
+    // whole group.
+    process.kill(-leaderProc.pid, "SIGSTOP");
 
     try {
       // Frozen leader accepts TCP but never answers: MCP must be down.
@@ -669,16 +599,16 @@ describe("cluster leader-worker (E2E)", () => {
         await new Promise((r) => setTimeout(r, 5000));
         if (!(await probePortDown(port))) {
           throw new Error(
-            "leader's extension host was auto-restarted during the freeze; SIGSTOP did not isolate the MCP server",
+            "MCP server became reachable during the freeze; SIGSTOP did not isolate the leader window",
           );
         }
       }
     } finally {
       // Thaw the leader so its port (and cluster membership) come back.
-      // The process may already be gone if VS Code restarted it — that is
-      // caught by the hold assertion above, not silently ignored here.
+      // The group may already be gone if VS Code exited — that is caught
+      // by the hold assertion above, not silently ignored here.
       try {
-        process.kill(extHostPid, "SIGCONT");
+        process.kill(-leaderProc.pid, "SIGCONT");
       } catch {
         // Already exited; nothing to resume.
       }
