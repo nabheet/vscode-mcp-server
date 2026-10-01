@@ -53,12 +53,16 @@ import { WorkerCoordinator } from "./worker";
 export type ClusterMember = LeaderCoordinator | WorkerCoordinator;
 
 /**
- * First-seen time of a silently-occupied local port, per port (M1). A port
- * that stays silent for SILENT_PORT_WINDOW_MS is treated as foreign.
- * Module-level so patience survives across bootstrapCluster invocations
- * (FATAL → retry): a squatter is not re-probed from scratch every round.
+ * First-seen time of a silently-occupied local port, keyed by `${base}:${port}`
+ * (M1). A port that stays silent for SILENT_PORT_WINDOW_MS is treated as
+ * foreign. Module-level so patience survives across bootstrapCluster
+ * invocations (FATAL → retry): a squatter is not re-probed from scratch every
+ * round. Entries are KEPT after expiry — a later pass re-probing the same
+ * port (the offset loop restarts at 0) sees the expired timestamp and
+ * advances immediately instead of opening a fresh window. Cleared on any
+ * successful election.
  */
-const silentPortFirstSeen = new Map<number, number>();
+const silentPortFirstSeen = new Map<string, number>();
 
 /**
  * Consecutive silent cross-boundary probe timeouts, per host (M2). A host
@@ -132,13 +136,20 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         // may thaw, but a permanent squatter must not wedge startup forever,
         // so after SILENT_PORT_WINDOW_MS of continuous silence the port is
         // treated as foreign and we advance to the next port.
-        const firstSeen = silentPortFirstSeen.get(port) ?? Date.now();
-        silentPortFirstSeen.set(port, firstSeen);
+        // Keyed by base+port so a changed basePort config never inherits a
+        // stale first-seen. The entry is KEPT after expiry: the offset loop
+        // restarts at 0 each attempt, and a fresh first-seen would grant a
+        // brand-new window on the next pass — compounding a multi-squatter
+        // into ~MAX_PORT_SCAN windows per round instead of one each.
+        const firstSeenKey = `${base}:${port}`;
+        const firstSeen = silentPortFirstSeen.get(firstSeenKey) ?? Date.now();
+        silentPortFirstSeen.set(firstSeenKey, firstSeen);
         if (Date.now() - firstSeen < SILENT_PORT_WINDOW_MS) {
           opts.log?.(`[mcp] Port ${port} occupied but silent — retrying same port`);
           break;
         }
-        silentPortFirstSeen.delete(port);
+        // Keep the expired entry: the next pass re-probing this port sees the
+        // old timestamp and advances immediately (no fresh window).
         opts.log?.(
           `[mcp] Port ${port} occupied but silent for ${SILENT_PORT_WINDOW_MS}ms — treating as foreign, trying the next port`,
         );

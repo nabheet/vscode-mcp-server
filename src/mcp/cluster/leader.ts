@@ -23,10 +23,10 @@ import { type McpRouter, type McpRouterResult, McpServer, type MemberChannel } f
 import { defineTool } from "../tools/index";
 import {
   HEARTBEAT_INTERVAL_MS,
+  LEADER_REGISTER_TIMEOUT_MS,
   MAX_MEMBER_PEERS,
   MSG,
   PROXY_TIMEOUT_MS,
-  REGISTER_TIMEOUT_MS,
 } from "./constants";
 import type { IpcMessage, WindowState } from "./protocol";
 
@@ -41,7 +41,9 @@ export class ClusterAuthError extends Error {
   constructor(readonly binds: string[]) {
     super(
       `Refusing to start: non-loopback bind (${binds.join(", ")}) without an authToken. ` +
-        "Set a shared authToken on every cluster window (all windows must use the same one).",
+        "Set the vscode-mcp-server.authToken setting (or the MCP_AUTH_TOKEN " +
+        "environment variable) to a shared token on every cluster window — " +
+        "all windows must use the same one.",
     );
     this.name = "ClusterAuthError";
   }
@@ -49,7 +51,17 @@ export class ClusterAuthError extends Error {
 
 /** Loopback bind addresses that need no bearer token (C1). */
 export function isLoopbackHost(host: string): boolean {
-  return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  if (host === "127.0.0.1" || host === "localhost") return true;
+  // 127/8 loopback (any 127.x.y.z), used by some proxies/tunnels.
+  if (host.startsWith("127.")) return true;
+  // IPv6 loopback, with or without brackets, plus IPv4-mapped forms.
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return (
+    bare === "::1" ||
+    bare === "0:0:0:0:0:0:0:1" ||
+    bare === "::ffff:127.0.0.1" ||
+    bare.startsWith("::ffff:127.")
+  );
 }
 
 /**
@@ -137,7 +149,10 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
   private server: McpServer;
   private localState: WindowState = { openEditors: [] };
   /** Per-peer connection state: registration status + worker id (REGISTER). */
-  private peerState = new Map<MemberPeer, { registered: boolean; entryId: string | null }>();
+  private peerState = new Map<
+    MemberPeer,
+    { registered: boolean; entryId: string | null; regTimer: NodeJS.Timeout | null }
+  >();
   /** HTTP member-channel peers, keyed by worker-chosen session id. */
   private httpPeers = new Map<string, HttpPeer>();
   private workers = new Map<string, WorkerEntry>();
@@ -413,7 +428,11 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     res.write(": connected\n\n");
 
     const peer = new HttpPeer(res);
-    const state = { registered: false, entryId: null as string | null };
+    const state = {
+      registered: false,
+      entryId: null as string | null,
+      regTimer: null as NodeJS.Timeout | null,
+    };
     this.httpPeers.set(sessionId, peer);
     this.peerState.set(peer, state);
 
@@ -432,7 +451,8 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
         this.log(`[leader] member ${sessionId} did not REGISTER in time — closing`);
         this.dropHttpPeer(sessionId, peer);
       }
-    }, REGISTER_TIMEOUT_MS);
+    }, LEADER_REGISTER_TIMEOUT_MS);
+    state.regTimer = regTimer;
 
     const cleanup = () => {
       clearTimeout(regTimer);
@@ -494,6 +514,15 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
   }
 
   private onPeerMessage(peer: MemberPeer, msg: IpcMessage): void {
+    // A first POST proves the worker is alive and actively registering; the
+    // registration deadline only guards a peer that opened a stream and then
+    // went silent. Clear the timer so a slow-but-live REGISTER (e.g. busy
+    // leader during an election) is never cut off mid-flight (F4).
+    const peerState = this.peerState.get(peer);
+    if (peerState?.regTimer) {
+      clearTimeout(peerState.regTimer);
+      peerState.regTimer = null;
+    }
     switch (msg.type) {
       case MSG.REGISTER: {
         const id = typeof msg.id === "string" ? msg.id : undefined;

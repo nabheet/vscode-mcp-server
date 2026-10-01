@@ -39,6 +39,15 @@ export const CROSS_BOUNDARY_TIMEOUT_LIMIT = 3;
 /** How long a Worker waits for the Leader's WELCOME after registering. */
 export const REGISTER_TIMEOUT_MS = 5000;
 
+/**
+ * How long the Leader waits for a Worker's first POST after it opens the
+ * SSE stream before dropping it as never-registered. Longer than the
+ * worker-side channel timeouts (MEMBER_HTTP_TIMEOUT_MS + retries) so a slow
+ * or busy Worker is not cut off mid-registration: the Leader must outlast
+ * the Worker's worst-case REGISTER attempt, not race it.
+ */
+export const LEADER_REGISTER_TIMEOUT_MS = 15_000;
+
 /** Worker → Leader heartbeat cadence. */
 export const HEARTBEAT_INTERVAL_MS = 5000;
 
@@ -107,7 +116,11 @@ export const MEMBER_POST_RETRY_DELAY_MS = 250;
  * as foreign. A frozen/starting Leader answers nothing but may thaw; a
  * non-HTTP squatter never will. The window (2 min) is longer than the e2e
  * cluster-freeze test (~70s), so a frozen Leader is always re-joined, while
- * a permanent squatter only delays startup by the window.
+ * a permanent squatter only delays startup by the window — per port. With
+ * several squatted ports, each pays its window once (first-seen entries are
+ * kept after expiry so later passes advance immediately instead of starting
+ * a fresh window), so the worst case is MAX_PORT_SCAN × this window, not
+ * MAX_PORT_SCAN × this window × attempts.
  */
 export const SILENT_PORT_WINDOW_MS = 120_000;
 

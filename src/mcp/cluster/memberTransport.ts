@@ -139,8 +139,14 @@ export class HttpMemberTransport implements MemberTransport {
   }
 
   /** POST one message, retrying transient failures (N1). Resolves once the
-   * leader acked (HTTP 2xx); logs and gives up after MEMBER_POST_RETRIES. */
+   * leader acked (HTTP 2xx); logs and gives up after MEMBER_POST_RETRIES.
+   * Only transient failures are retried: network errors, timeouts, and 5xx.
+   * A 4xx response is terminal (the leader got the request and rejected it —
+   * retrying cannot change that) so it is logged and not retried. Also bails
+   * once the transport is destroyed, so a close() is not followed by up to
+   * MEMBER_POST_RETRIES further attempts (~30s of stray POSTs). */
   private async postWithRetry(msg: IpcMessage, attempt: number): Promise<void> {
+    if (this.destroyed) return;
     const url = `${this.baseUrl}${CLUSTER_MESSAGE_PATH}?id=${encodeURIComponent(this.sessionId)}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), MEMBER_HTTP_TIMEOUT_MS);
@@ -153,9 +159,14 @@ export class HttpMemberTransport implements MemberTransport {
         signal: controller.signal,
       });
       if (!res.ok) {
+        if (res.status >= 400 && res.status < 500) {
+          this.log?.(`[worker] member POST (${msg.type}) rejected: HTTP ${res.status}`);
+          return;
+        }
         throw new Error(`member POST (${msg.type}) failed: HTTP ${res.status}`);
       }
     } catch (err) {
+      if (this.destroyed) return;
       if (attempt < MEMBER_POST_RETRIES) {
         await sleep(MEMBER_POST_RETRY_DELAY_MS);
         return this.postWithRetry(msg, attempt + 1);

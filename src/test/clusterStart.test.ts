@@ -335,20 +335,20 @@ describe("startCluster FATAL retry", () => {
     // Non-loopback binds need a token under C1, so this test sets one.
     const p = startCluster(
       makeOpts(log, {
-        detectBridges: () => ["127.0.0.2"],
+        detectBridges: () => ["172.18.0.1"],
         authToken: "t",
       }),
     );
     await settle();
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
-      expect.objectContaining({ hosts: ["127.0.0.1", "127.0.0.2"] }),
+      expect.objectContaining({ hosts: ["127.0.0.1", "172.18.0.1"] }),
     );
     await p;
   });
 
   it("refuses to start a non-loopback bind without an authToken and never retries (C1)", async () => {
     const log = vi.fn();
-    const p = startCluster(makeOpts(log, { detectBridges: () => ["127.0.0.2"] }));
+    const p = startCluster(makeOpts(log, { detectBridges: () => ["172.18.0.1"] }));
     await settle();
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Refusing to start cluster:"));
     expect(vi.mocked(bootstrapCluster)).not.toHaveBeenCalled();
@@ -364,7 +364,7 @@ describe("startCluster FATAL retry", () => {
     vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
     const p = startCluster(
       makeOpts(log, {
-        detectBridges: () => ["127.0.0.2"],
+        detectBridges: () => ["172.18.0.1"],
         authToken: "shared-token",
       }),
     );
@@ -389,7 +389,7 @@ describe("startCluster FATAL retry", () => {
     const p = startCluster(
       makeOpts(log, {
         isRemoteContainer: true,
-        detectBridges: () => ["127.0.0.2"],
+        detectBridges: () => ["172.18.0.1"],
       }),
     );
     await settle();
