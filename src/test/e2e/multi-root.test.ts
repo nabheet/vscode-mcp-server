@@ -11,6 +11,10 @@ const PROJECT_ROOT = process.cwd();
 
 let ENABLED = true;
 
+// C1 requires a token for non-loopback binds (auto-detected Docker bridges
+// on Linux CI runners); every MCP call carries the shared token.
+const E2E_AUTH_TOKEN = "t";
+
 function findFreePort(): Promise<number> {
   return new Promise((resolve) => {
     const srv = http.createServer();
@@ -59,6 +63,7 @@ function mcpRequest(
         headers: {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(body),
+          Authorization: `Bearer ${E2E_AUTH_TOKEN}`,
         },
       },
       (res) => {
@@ -316,7 +321,7 @@ describe("multi-root workspace (E2E)", () => {
       path.join(userSettingsDir, "settings.json"),
       JSON.stringify({
         "vscode-mcp-server.port": port,
-        "vscode-mcp-server.authToken": "",
+        "vscode-mcp-server.authToken": E2E_AUTH_TOKEN,
       }),
     );
 

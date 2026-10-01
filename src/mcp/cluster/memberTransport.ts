@@ -15,12 +15,21 @@
  *   Leader → Worker:  GET  /cluster/stream?id=<sessionId>  (SSE receive leg)
  *
  * The channel carries the exact same IpcMessage JSON; only the direction of
- * the two legs differs. v1 has no cluster-specific auth: the channel relies
- * on the same origin/CORS guards as the rest of the server, plus the shared
- * `authToken` when the server is configured with one.
+ * the two legs differs. The shared `authToken` is REQUIRED whenever any bind
+ * is non-loopback (C1): the channel proxies tools/call — including shell
+ * commands — to every connected worker, so an unauthenticated non-loopback
+ * bind would expose remote code execution. Loopback-only binds (the
+ * macOS/Windows default) need no token; CORS/origin checks still stop a
+ * malicious webpage from driving the channel via DNS rebinding.
  */
 import { randomUUID } from "node:crypto";
-import { CLUSTER_MESSAGE_PATH, CLUSTER_STREAM_PATH, MEMBER_HTTP_TIMEOUT_MS } from "./constants";
+import {
+  CLUSTER_MESSAGE_PATH,
+  CLUSTER_STREAM_PATH,
+  MEMBER_HTTP_TIMEOUT_MS,
+  MEMBER_POST_RETRIES,
+  MEMBER_POST_RETRY_DELAY_MS,
+} from "./constants";
 import type { IpcMessage } from "./protocol";
 
 export interface MemberTransport {
@@ -33,8 +42,11 @@ export interface MemberTransport {
   connect(): Promise<void>;
   /** Send one protocol message. Best-effort: no-ops after close. */
   send(msg: IpcMessage): void;
-  /** Tear the channel down (idempotent). */
-  close(): void;
+  /**
+   * Tear the channel down (idempotent). May return a promise that settles
+   * once in-flight POSTs have finished, so callers can wait for the flush.
+   */
+  close(): void | Promise<void>;
   readonly destroyed: boolean;
 }
 
@@ -72,6 +84,8 @@ export class HttpMemberTransport implements MemberTransport {
   private controller: AbortController | null = null;
   private closedByUs = false;
   private ended = false;
+  /** In-flight POST promises, awaited by close() so callers can flush. */
+  private inflight = new Set<Promise<void>>();
 
   constructor(opts: HttpMemberTransportOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -117,33 +131,57 @@ export class HttpMemberTransport implements MemberTransport {
 
   send(msg: IpcMessage): void {
     if (this.destroyed) return;
+    let p: Promise<void>;
+    p = this.postWithRetry(msg, 0).finally(() => {
+      this.inflight.delete(p);
+    });
+    this.inflight.add(p);
+  }
+
+  /** POST one message, retrying transient failures (N1). Resolves once the
+   * leader acked (HTTP 2xx); logs and gives up after MEMBER_POST_RETRIES. */
+  private async postWithRetry(msg: IpcMessage, attempt: number): Promise<void> {
     const url = `${this.baseUrl}${CLUSTER_MESSAGE_PATH}?id=${encodeURIComponent(this.sessionId)}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), MEMBER_HTTP_TIMEOUT_MS);
     timer.unref?.();
-    void fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.headers() },
-      body: JSON.stringify(msg),
-      signal: controller.signal,
-    })
-      .catch((err) => {
-        this.log?.(
-          `[worker] member POST (${msg.type}) failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        // A failed POST is non-fatal — the SSE stream is the liveness
-        // source. If the leader is truly gone the stream closes and
-        // triggers failOver via onClose.
-      })
-      .finally(() => clearTimeout(timer));
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...this.headers() },
+        body: JSON.stringify(msg),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`member POST (${msg.type}) failed: HTTP ${res.status}`);
+      }
+    } catch (err) {
+      if (attempt < MEMBER_POST_RETRIES) {
+        await sleep(MEMBER_POST_RETRY_DELAY_MS);
+        return this.postWithRetry(msg, attempt + 1);
+      }
+      this.log?.(
+        `[worker] member POST (${msg.type}) failed after ${attempt + 1} attempts: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      // A failed POST is non-fatal — the SSE stream is the liveness source.
+      // If the leader is truly gone the stream closes and triggers failOver
+      // via onClose.
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
-  close(): void {
+  close(): Promise<void> {
     this.closedByUs = true;
     this.controller?.abort();
     this.controller = null;
+    const inflight = Array.from(this.inflight);
+    this.inflight.clear();
+    // Resolve once in-flight POSTs settled, so a caller can flush before
+    // treating the transport as fully closed (M4).
+    return Promise.allSettled(inflight).then(() => undefined);
   }
 
   private headers(): Record<string, string> {
@@ -199,4 +237,12 @@ export class HttpMemberTransport implements MemberTransport {
     }
     return buffer;
   }
+}
+
+/** Minimal delay helper for retry backoff. */
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
 }

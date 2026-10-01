@@ -111,7 +111,7 @@ async function tailLogFile(filePath: string, maxLines: number, grep?: string): P
     } catch {
       /* invalid regex — no filter */
     }
-    if (re) filtered = lines.filter((l) => re!.test(l));
+    if (re) filtered = lines.filter((l) => re?.test(l));
   }
   return filtered.slice(-maxLines).join("\n");
 }

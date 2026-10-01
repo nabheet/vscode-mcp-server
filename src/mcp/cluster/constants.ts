@@ -78,11 +78,14 @@ export const MSG = {
 // sessionId is a worker-generated UUID; both legs of the channel carry it
 // so the Leader can associate the SSE stream with the POSTs that target it.
 //
-// v1 ships WITHOUT cluster-specific auth (issue #94 scope decision). Two
-// cheap guards apply: CORS/origin checks (a malicious webpage cannot drive
-// the channel via DNS rebinding) and the existing bearer-token check when
-// the server is configured with authToken (all cluster windows must share
-// that token). Mutual-auth + TLS is planned as an opt-in v2.
+// The bearer token is REQUIRED whenever any bind is non-loopback (C1): the
+// member channel proxies tools/call to every connected worker — including
+// shell commands — so an unauthenticated non-loopback bind would expose
+// remote code execution to anything that can reach those addresses. All
+// cluster windows must share the same token. Loopback-only binds (the
+// macOS/Windows default) need no token. CORS/origin checks still stop a
+// malicious webpage from driving the channel via DNS rebinding. Mutual-auth
+// + TLS is planned as an opt-in v2.
 
 /** SSE receive leg of the member channel. */
 export const CLUSTER_STREAM_PATH = "/cluster/stream";
@@ -92,6 +95,24 @@ export const CLUSTER_MESSAGE_PATH = "/cluster/message";
 
 /** Timeout for member-channel HTTP POSTs (REGISTER / CALL / PING / UPDATE). */
 export const MEMBER_HTTP_TIMEOUT_MS = 10_000;
+
+/** Extra attempts for member-channel POSTs before the sender gives up. */
+export const MEMBER_POST_RETRIES = 2;
+
+/** Delay between member-channel POST retries. */
+export const MEMBER_POST_RETRY_DELAY_MS = 250;
+
+/**
+ * How long a silently-occupied local port is retried before it is treated
+ * as foreign. A frozen/starting Leader answers nothing but may thaw; a
+ * non-HTTP squatter never will. The window (2 min) is longer than the e2e
+ * cluster-freeze test (~70s), so a frozen Leader is always re-joined, while
+ * a permanent squatter only delays startup by the window.
+ */
+export const SILENT_PORT_WINDOW_MS = 120_000;
+
+/** Cap on concurrent member-channel connections the Leader will hold. */
+export const MAX_MEMBER_PEERS = 64;
 
 /**
  * Default cross-boundary host a container window probes to reach the host
