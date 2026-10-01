@@ -83,8 +83,23 @@ export class ToolExecutor {
     this.tools.set(def.name, def);
   }
 
+  /**
+   * Remove a tool. Cluster-internal: only the coordinators use this, to drop
+   * a role-specific tool when the window's role ends (e.g. the leader-only
+   * discovery tool when a window stops serving as leader). The executor is
+   * shared across roles, so a tool left behind after a role ends leaks into
+   * the next role's tools/list. Do not remove tools a live role advertises.
+   */
+  unregisterTool(name: string): void {
+    this.tools.delete(name);
+  }
+
   hasTool(name: string): boolean {
     return this.tools.has(name);
+  }
+
+  getTool(name: string): ToolDefinition | undefined {
+    return this.tools.get(name);
   }
 
   listTools(): ToolListItem[] {
