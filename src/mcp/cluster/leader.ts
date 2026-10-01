@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import type * as http from "node:http";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
-import type { JsonRpcResponse } from "../../utils/types";
+import type { JsonRpcResponse, ToolDefinition } from "../../utils/types";
 import type { ToolExecutor } from "../executor";
 import { type McpRouter, type McpRouterResult, McpServer, type MemberChannel } from "../server";
 import { defineTool } from "../tools/index";
@@ -115,6 +115,9 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
   private workers = new Map<string, WorkerEntry>();
   private pending = new Map<string, PendingCall>();
 
+  /** The discovery-tool definition this instance registered, for ownership checks. */
+  private discoveryTool: ToolDefinition | null = null;
+
   constructor(opts: LeaderOptions) {
     this.opts = opts;
     if (opts.state) this.localState = opts.state;
@@ -168,44 +171,57 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
    * window that loses the promotion race never advertises it.
    */
   private registerDiscoveryTool(): void {
-    this.opts.executor.registerTool(
-      defineTool(
-        "list_workspaces",
-        "List all VS Code windows/workspaces served by this MCP endpoint. Each entry has an id, display name, and workspace folders. Pass the id or a folder path as the `workspace` argument to tools/call or tools/list to target that window.",
-        { type: "object", properties: {} },
-        async () => {
-          const rows = [
-            {
-              id: this.opts.workspaceId,
-              instanceId: this.opts.instanceId,
-              instanceName: this.opts.instanceName,
-              displayName: this.opts.displayName,
-              folders: this.opts.workspacePaths,
-              role: "leader",
-              state: this.localState,
-            },
-            ...Array.from(this.workers.values()).map((w) => ({
-              id: w.id,
-              instanceId: w.instanceId,
-              instanceName: w.instanceName,
-              displayName: w.displayName,
-              folders: w.workspacePaths,
-              role: "worker",
-              state: w.state ?? { openEditors: [] },
-            })),
-          ];
-          return {
-            content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
-            isError: false,
-          };
-        },
-      ),
+    const def = defineTool(
+      "list_workspaces",
+      "List all VS Code windows/workspaces served by this MCP endpoint. Each entry has an id, display name, and workspace folders. Pass the id or a folder path as the `workspace` argument to tools/call or tools/list to target that window.",
+      { type: "object", properties: {} },
+      async () => {
+        const rows = [
+          {
+            id: this.opts.workspaceId,
+            instanceId: this.opts.instanceId,
+            instanceName: this.opts.instanceName,
+            displayName: this.opts.displayName,
+            folders: this.opts.workspacePaths,
+            role: "leader",
+            state: this.localState,
+          },
+          ...Array.from(this.workers.values()).map((w) => ({
+            id: w.id,
+            instanceId: w.instanceId,
+            instanceName: w.instanceName,
+            displayName: w.displayName,
+            folders: w.workspacePaths,
+            role: "worker",
+            state: w.state ?? { openEditors: [] },
+          })),
+        ];
+        return {
+          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
+          isError: false,
+        };
+      },
     );
+    this.opts.executor.registerTool(def);
+    this.discoveryTool = def;
   }
 
-  /** Drop the discovery tool when this window stops serving as leader. */
+  /**
+   * Drop the discovery tool when this window stops serving as leader. Only
+   * removes it if this instance's own registration is still the live one: the
+   * executor is shared across roles, and a successor leader may have
+   * re-registered the same tool after this instance stopped serving (e.g.
+   * re-election in the same window), so an unconditional delete would clobber
+   * the successor's tool.
+   */
   private unregisterDiscoveryTool(): void {
-    this.opts.executor.unregisterTool("list_workspaces");
+    if (
+      this.discoveryTool &&
+      this.opts.executor.getTool("list_workspaces") === this.discoveryTool
+    ) {
+      this.opts.executor.unregisterTool("list_workspaces");
+    }
+    this.discoveryTool = null;
   }
 
   async stop(timeoutMs = 5000): Promise<void> {
