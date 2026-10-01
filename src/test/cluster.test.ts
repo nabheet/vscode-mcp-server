@@ -1230,4 +1230,46 @@ describe("promotion failure cleanup", () => {
       await leader1.stop(500).catch(() => {});
     }
   });
+
+  it("a stopped leader does not unregister a successor's discovery tool on the shared executor", async () => {
+    const portA = await findFreePort();
+    const portB = await findFreePort();
+    const exec = new ToolExecutor();
+
+    const leaderA = new LeaderCoordinator({
+      port: portA,
+      host: "127.0.0.1",
+      executor: exec,
+      workspaceId: "a",
+      workspacePaths: ["/mnt/a"],
+      displayName: "A",
+    });
+    await leaderA.start();
+
+    const leaderB = new LeaderCoordinator({
+      port: portB,
+      host: "127.0.0.1",
+      executor: exec,
+      workspaceId: "b",
+      workspacePaths: ["/mnt/b"],
+      displayName: "B",
+    });
+    await leaderB.start();
+
+    try {
+      // Both serve on the same shared executor; B's registration replaced A's.
+      expect(exec.hasTool("list_workspaces")).toBe(true);
+
+      // A stops first (e.g. demotion); its cleanup must not remove B's tool.
+      await leaderA.stop(300);
+      expect(exec.hasTool("list_workspaces")).toBe(true);
+
+      // B's own stop removes it.
+      await leaderB.stop(300);
+      expect(exec.hasTool("list_workspaces")).toBe(false);
+    } finally {
+      await leaderA.stop(300).catch(() => {});
+      await leaderB.stop(300).catch(() => {});
+    }
+  });
 });

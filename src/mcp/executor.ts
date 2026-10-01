@@ -98,6 +98,10 @@ export class ToolExecutor {
     return this.tools.has(name);
   }
 
+  getTool(name: string): ToolDefinition | undefined {
+    return this.tools.get(name);
+  }
+
   listTools(): ToolListItem[] {
     const items: ToolListItem[] = [];
     for (const [, def] of this.tools) {
