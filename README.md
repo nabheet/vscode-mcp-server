@@ -8,6 +8,25 @@ human developer. This [MCP (Model Context Protocol)](https://modelcontextprotoco
 server exposes 40+ VS Code tools (debugger, terminal, LSP, file ops, commands)
 over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
+```bash
+code --install-extension nabheet.vscode-ide-mcp
+```
+
+## Debugger MCP
+
+Drive the VS Code debugger from your AI agent: start and stop sessions, set
+and remove breakpoints, step through code, inspect stack frames and local
+variables, and evaluate expressions in the paused frame —
+`start_debugging`, `step_over`, `add_breakpoint`, `get_stack_trace`,
+`evaluate_in_debug_console`, and more.
+
+## VS Code terminal and LSP tools
+
+Run commands in the integrated terminal (`execute_in_terminal`,
+`get_terminal_output`) and query language servers — definitions, references,
+hover, rename, diagnostics, completions, symbols, and code actions
+(`go_to_definition`, `find_references`, `get_diagnostics`, `rename_symbol`).
+
 ## Quick Start
 
 1. **Install the extension** from the
