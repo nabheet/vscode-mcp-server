@@ -34,6 +34,7 @@
  *    retry with exponential backoff + jitter.
  */
 
+import * as net from "node:net";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { ToolExecutor } from "../executor";
@@ -71,6 +72,16 @@ const silentPortFirstSeen = new Map<string, number>();
  * burning probes forever. Cleared on any successful election.
  */
 const crossBoundaryStreaks = new Map<string, number>();
+
+/**
+ * Clear the election patience state (M1/M2). Called on every successful
+ * election; also exposed for tests that need a deterministic starting point
+ * without depending on a prior promotion having happened.
+ */
+export function resetElectionPatience(): void {
+  silentPortFirstSeen.clear();
+  crossBoundaryStreaks.clear();
+}
 
 export interface BootstrapOptions {
   basePort: number;
@@ -119,8 +130,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         // through a forwarded port).
         const worker = await tryJoinHttp(port, "127.0.0.1", opts);
         if (worker) {
-          silentPortFirstSeen.clear();
-          crossBoundaryStreaks.clear();
+          resetElectionPatience();
           opts.log?.(`[mcp] Joined leader on port ${port} as worker`);
           return worker;
         }
@@ -148,10 +158,25 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
           opts.log?.(`[mcp] Port ${port} occupied but silent — retrying same port`);
           break;
         }
-        // Keep the expired entry: the next pass re-probing this port sees the
-        // old timestamp and advances immediately (no fresh window).
+        // Window expired. Before advancing we must rule out a LIVE frozen
+        // leader: advancing past a still-bound port to a higher one creates a
+        // second leader (split-brain) as soon as the frozen one thaws. Binding
+        // the port is the authoritative test — if the bind succeeds nobody
+        // holds it (a dead squatter, or a leader that already exited), so
+        // advancing is safe; if it fails someone still owns the port, so keep
+        // retrying it (never advance past a live holder). Delete the stale
+        // first-seen so a freed port gets a fresh window after it is reclaimed.
+        if (!(await canBind(port))) {
+          opts.log?.(
+            `[mcp] Port ${port} silent past ${SILENT_PORT_WINDOW_MS}ms but still bound — ` +
+              `likely a live frozen leader, retrying same port`,
+          );
+          break;
+        }
+        silentPortFirstSeen.delete(firstSeenKey);
         opts.log?.(
-          `[mcp] Port ${port} occupied but silent for ${SILENT_PORT_WINDOW_MS}ms — treating as foreign, trying the next port`,
+          `[mcp] Port ${port} silent for ${SILENT_PORT_WINDOW_MS}ms and no longer bound — ` +
+            `treating as foreign, trying the next port`,
         );
         // fall through: treat as foreign and advance to the next port
       }
@@ -171,8 +196,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
             if (hp.status === "valid") {
               const worker = await tryJoinHttp(port, host, opts);
               if (worker) {
-                silentPortFirstSeen.clear();
-                crossBoundaryStreaks.clear();
+                resetElectionPatience();
                 opts.log?.(`[mcp] Joined leader on ${host}:${port} over HTTP member channel`);
                 return worker;
               }
@@ -213,8 +237,7 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
 
         const leader = await tryPromote(port, opts);
         if (leader) {
-          silentPortFirstSeen.clear();
-          crossBoundaryStreaks.clear();
+          resetElectionPatience();
           opts.log?.(`[mcp] Promoted to leader on port ${port}`);
           return leader;
         }
@@ -231,6 +254,21 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
     `Could not elect or join a leader after ${MAX_ELECTION_ATTEMPTS} attempts ` +
       `(ports ${base}..${base + maxPorts - 1})`,
   );
+}
+
+/**
+ * Authoritative "is this port free?" test via bind. Unlike probePort, a bind
+ * distinguishes "nobody holds the port" from "a live (possibly frozen) process
+ * holds it but doesn't answer HTTP" — the exact ambiguity that lets a window
+ * advance past a frozen leader and split the cluster. Binds on 127.0.0.1 and
+ * immediately releases.
+ */
+function canBind(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once("error", () => resolve(false));
+    srv.listen(port, "127.0.0.1", () => srv.close(() => resolve(true)));
+  });
 }
 
 /** Join a Leader over the HTTP member channel on the given host:port. */

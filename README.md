@@ -646,6 +646,11 @@ VS Code settings take priority over env vars.
 - TLS supported but not required (loopback-only by default)
 - Non-loopback binds (e.g. Linux Docker bridge addresses) refuse to start
   without an auth token
+- When `authToken` is set, `/metrics` and `/diagnostics` also require the
+  bearer token (they expose process internals once the bind is reachable
+  beyond loopback). `/health` stays unauthenticated so cluster probes work.
+  A metrics scraper pointing at a token-protected server must be configured
+  with `authorization`/`bearer_token`.
 - **Cluster member channel (cross-host):** when `authToken` is set, member
   channel requests carry the same `Authorization: Bearer <token>` and are
   rejected otherwise. The cluster refuses to start when any bind address is

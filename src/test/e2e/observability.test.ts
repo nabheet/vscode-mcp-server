@@ -25,15 +25,23 @@ function findFreePort(): Promise<number> {
   });
 }
 
-function rawGet(port: number, pathname: string): Promise<{ status: number; body: string }> {
+function rawGet(
+  port: number,
+  pathname: string,
+  token?: string,
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = http.get(`http://127.0.0.1:${port}${pathname}`, (res) => {
-      const chunks: Buffer[] = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () =>
-        resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf-8") }),
-      );
-    });
+    const req = http.get(
+      `http://127.0.0.1:${port}${pathname}`,
+      token ? { headers: { Authorization: `Bearer ${token}` } } : {},
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf-8") }),
+        );
+      },
+    );
     req.on("error", reject);
   });
 }
@@ -369,7 +377,7 @@ describe("observability endpoints + log tools (E2E)", () => {
       return;
     }
     // tools/list already ran (waitForServer) — histogram should be non-empty.
-    const { status, body } = await rawGet(port, "/metrics");
+    const { status, body } = await rawGet(port, "/metrics", E2E_AUTH_TOKEN);
     expect(status).toBe(200);
     expect(body).toContain("vscode_mcp_uptime_seconds");
     expect(body).toContain("vscode_mcp_memory_rss_bytes");
@@ -385,7 +393,7 @@ describe("observability endpoints + log tools (E2E)", () => {
       console.warn("skipped");
       return;
     }
-    const { status, body } = await rawGet(port, "/diagnostics");
+    const { status, body } = await rawGet(port, "/diagnostics", E2E_AUTH_TOKEN);
     expect(status).toBe(200);
     const parsed = JSON.parse(body);
     expect(parsed.uptimeSeconds).toBeGreaterThanOrEqual(0);
