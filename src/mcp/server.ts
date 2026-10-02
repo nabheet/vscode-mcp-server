@@ -409,16 +409,21 @@ export class McpServer {
       return;
     }
 
-    // Metrics — Prometheus text format
+    // Metrics — Prometheus text format. Gated behind the bearer token when
+    // one is configured (I1): with a non-loopback bind, process metrics and
+    // the diagnostics snapshot (recent errors, tool names) are internal
+    // detail, not public. /health stays open — cluster probes need it.
     if (req.method === "GET" && pathname === "/metrics") {
+      if (this.authFailed(req, res)) return;
       this.updateGauges();
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(this.metrics.text());
       return;
     }
 
-    // Diagnostics — human-readable JSON snapshot
+    // Diagnostics — human-readable JSON snapshot (same auth gate as /metrics).
     if (req.method === "GET" && pathname === "/diagnostics") {
+      if (this.authFailed(req, res)) return;
       this.updateGauges();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(this.metrics.diagnostics(), null, 2));
