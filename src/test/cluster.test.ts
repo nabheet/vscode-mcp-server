@@ -287,6 +287,38 @@ describe("cluster port probing", () => {
 
 // ── Leader + Worker integration ──────────────────────────────────────
 
+describe("leader constructor auth (C1)", () => {
+  const base = () => ({
+    port: 0,
+    executor: new ToolExecutor(),
+    workspaceId: "w",
+    workspacePaths: ["/tmp"],
+    displayName: "W",
+  });
+
+  it("throws when the bind host is non-loopback and no authToken is set", () => {
+    expect(() => new LeaderCoordinator({ ...base(), host: "0.0.0.0" })).toThrow(
+      /non-loopback bind/,
+    );
+  });
+
+  it("throws when hosts contain a non-loopback address and no authToken is set", () => {
+    expect(
+      () => new LeaderCoordinator({ ...base(), host: "127.0.0.1", hosts: ["192.168.1.10"] }),
+    ).toThrow(/non-loopback bind/);
+  });
+
+  it("allows a non-loopback bind when an authToken is set", () => {
+    const leader = new LeaderCoordinator({ ...base(), host: "0.0.0.0", authToken: "t" });
+    expect(leader).toBeInstanceOf(LeaderCoordinator);
+  });
+
+  it("allows loopback-only binds without an authToken", () => {
+    const leader = new LeaderCoordinator({ ...base(), host: "127.0.0.1" });
+    expect(leader).toBeInstanceOf(LeaderCoordinator);
+  });
+});
+
 describe("leader-worker cluster", () => {
   let port: number;
   let leader: LeaderCoordinator;

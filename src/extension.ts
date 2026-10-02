@@ -7,6 +7,7 @@ import {
   detectBridgeAddresses,
   detectDefaultGateway,
 } from "./mcp/cluster/gateway";
+import { ClusterAuthError, isLoopbackHost } from "./mcp/cluster/leader";
 import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
@@ -269,6 +270,14 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     const bindHosts = opts.isRemoteContainer
       ? [opts.host]
       : buildBindHosts(opts.host, (opts.detectBridges ?? detectBridgeAddresses)());
+    // C1: the member channel proxies tools/call (including shell commands)
+    // to every connected worker. Exposing it beyond loopback without a
+    // bearer token is remote code execution for anything that can reach
+    // those addresses, so refuse to start (no retry). bindHosts always
+    // includes opts.host, so an explicitly non-loopback host is covered too.
+    if (bindHosts.some((h) => !isLoopbackHost(h)) && !opts.authToken) {
+      throw new ClusterAuthError(bindHosts);
+    }
     const newMember = await bootstrapCluster({
       basePort: opts.basePort,
       host: opts.host,
@@ -326,6 +335,12 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     }
     updateStatusBar(newMember);
   } catch (err) {
+    // C1 is a permanent configuration error: a token will not appear on its
+    // own, so never retry it. Surface it once and stay out of the cluster.
+    if (err instanceof ClusterAuthError) {
+      opts.log(`Refusing to start cluster: ${err.message}`);
+      return;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     // Transient FATALs (e.g. the leader dying mid-handshake) self-heal:
     // retry with exponential backoff so the window still gets a cluster

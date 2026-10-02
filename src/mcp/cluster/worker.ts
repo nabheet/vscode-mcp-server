@@ -45,7 +45,7 @@ export class WorkerCoordinator {
   private registered = false;
   private state: WindowState = { openEditors: [] };
   private heartbeatTimer: NodeJS.Timeout | null = null;
-  private lastPongAt = 0;
+  private pingOutstanding = false;
   private missedPongs = 0;
   private welcomeResolve: (() => void) | null = null;
   private welcomeReject: ((err: Error) => void) | null = null;
@@ -59,6 +59,7 @@ export class WorkerCoordinator {
     this.stopped = false;
     this.registered = false;
     this.missedPongs = 0;
+    this.pingOutstanding = false;
 
     const transport = this.opts.transport;
     transport.onMessage = (msg) => this.onMessage(msg);
@@ -69,7 +70,6 @@ export class WorkerCoordinator {
       throw new Error("Worker stopped while connecting");
     }
     this.transport = transport;
-    this.lastPongAt = Date.now();
 
     // Register with the Leader and wait for WELCOME.
     const welcome = new Promise<void>((resolve, reject) => {
@@ -124,7 +124,7 @@ export class WorkerCoordinator {
     this.transport.send({ type: MSG.UPDATE, state });
   }
 
-  async stop(_timeoutMs = 3000): Promise<void> {
+  async stop(timeoutMs = 3000): Promise<void> {
     this.stopped = true;
     this.rejectWelcome(new Error("Worker stopped"));
     if (this.heartbeatTimer) {
@@ -134,24 +134,37 @@ export class WorkerCoordinator {
     const transport = this.transport;
     this.transport = null;
     if (transport) {
-      transport.close();
-      await new Promise<void>((resolve) => setTimeout(resolve, 0).unref?.());
+      // Give in-flight member-channel POSTs a bounded chance to settle
+      // before the stop completes — a stop right after a send must not race
+      // the send's completion — but never wait longer than timeoutMs (M4).
+      await Promise.race([
+        transport.close(),
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, Math.max(0, timeoutMs));
+          t.unref?.();
+        }),
+      ]);
     }
   }
 
   private heartbeatTick(): void {
     if (this.stopped || !this.transport || this.transport.destroyed) return;
-    this.transport.send({ type: MSG.PING });
-    if (Date.now() - this.lastPongAt > HEARTBEAT_INTERVAL_MS) {
+    // At most one PING in flight: if the previous PING was not answered by
+    // now, that is one missed heartbeat. Sending a second PING while the
+    // first is unanswered would count a single slow PONG (event-loop
+    // throttling, GC pause, busy leader) as multiple misses and could fail
+    // over a healthy leader (N2).
+    if (this.pingOutstanding) {
       this.missedPongs++;
       if (this.missedPongs >= HEARTBEAT_MISS_LIMIT) {
         this.failOver(
           `no PONG for ${this.missedPongs} heartbeat intervals — leader event loop assumed frozen`,
         );
       }
-    } else {
-      this.missedPongs = 0;
+      return;
     }
+    this.pingOutstanding = true;
+    this.transport.send({ type: MSG.PING });
   }
 
   private onMessage(msg: IpcMessage): void {
@@ -161,7 +174,7 @@ export class WorkerCoordinator {
         this.resolveWelcome();
         break;
       case MSG.PONG:
-        this.lastPongAt = Date.now();
+        this.pingOutstanding = false;
         this.missedPongs = 0;
         break;
       case MSG.CALL: {

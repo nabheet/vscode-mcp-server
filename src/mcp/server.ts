@@ -257,6 +257,18 @@ export class McpServer {
     this.servers = [];
     if (servers.length === 0) return;
 
+    // Force-close open MCP SSE sessions so server.close() below doesn't hang
+    // on them: each open SSE response keeps a connection alive until the
+    // timeout fallback, which can stall shutdown by up to timeoutMs (N4).
+    for (const session of this.sessions.values()) {
+      try {
+        session.res.destroy();
+      } catch {
+        /* already closed */
+      }
+    }
+    this.sessions.clear();
+
     // server.close() stops accepting new connections and waits for existing
     // ones to finish naturally. We add a timeout fallback to force-close.
     return new Promise((resolve) => {
@@ -516,6 +528,9 @@ export class McpServer {
     res: http.ServerResponse,
     sessionId: string,
   ): void {
+    // Same auth gate as the other POST handlers (N3): an unauthenticated
+    // message must be rejected before touching the session.
+    if (this.authFailed(req, res)) return;
     const session = this.sessions.get(sessionId);
     if (!session) {
       res.writeHead(404, { "Content-Type": "application/json" });

@@ -10,6 +10,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const PROJECT_ROOT = process.cwd();
 let ENABLED = true;
 
+// C1 requires a token for non-loopback binds (auto-detected Docker bridges
+// on Linux CI runners); every MCP call carries the shared token.
+const E2E_AUTH_TOKEN = "t";
+
 function findFreePort(): Promise<number> {
   return new Promise((resolve) => {
     const srv = http.createServer();
@@ -63,7 +67,11 @@ function mcpRequest(
       `http://127.0.0.1:${port}/mcp`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          Authorization: `Bearer ${E2E_AUTH_TOKEN}`,
+        },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -179,7 +187,10 @@ describe("observability endpoints + log tools (E2E)", () => {
     fs.mkdirSync(userSettingsDir, { recursive: true });
     fs.writeFileSync(
       path.join(userSettingsDir, "settings.json"),
-      JSON.stringify({ "vscode-mcp-server.port": port, "vscode-mcp-server.authToken": "" }),
+      JSON.stringify({
+        "vscode-mcp-server.port": port,
+        "vscode-mcp-server.authToken": E2E_AUTH_TOKEN,
+      }),
     );
 
     let cliCmd: string;

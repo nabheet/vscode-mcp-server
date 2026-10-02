@@ -24,8 +24,11 @@
  *    • foreign → unrelated app squatting the port → try next port
  *    • timeout → occupied, no HTTP signature: a frozen/starting Leader or a
  *                non-HTTP app. Retry the SAME port (never increment — that
- *                fragments the cluster); it may unfreeze, or die and free
- *                the port for promotion.
+ *                fragments the cluster) while it may still thaw, but only
+ *                within SILENT_PORT_WINDOW_MS of continuous silence; after
+ *                that the port is treated as foreign and we advance. A
+ *                frozen Leader that dies meanwhile frees the port for
+ *                promotion on the next pass.
  *  - registration/promotion races (leader died mid-handshake, two windows
  *    promoted simultaneously) fall out of the loop naturally: re-probe and
  *    retry with exponential backoff + jitter.
@@ -39,6 +42,7 @@ import {
   MAX_ELECTION_ATTEMPTS,
   MAX_PORT_SCAN,
   REELECT_JITTER_MS,
+  SILENT_PORT_WINDOW_MS,
 } from "./constants";
 import { jitter, probeHost, probePort, sleep } from "./election";
 import { LeaderCoordinator } from "./leader";
@@ -47,6 +51,26 @@ import type { WindowState } from "./protocol";
 import { WorkerCoordinator } from "./worker";
 
 export type ClusterMember = LeaderCoordinator | WorkerCoordinator;
+
+/**
+ * First-seen time of a silently-occupied local port, keyed by `${base}:${port}`
+ * (M1). A port that stays silent for SILENT_PORT_WINDOW_MS is treated as
+ * foreign. Module-level so patience survives across bootstrapCluster
+ * invocations (FATAL → retry): a squatter is not re-probed from scratch every
+ * round. Entries are KEPT after expiry — a later pass re-probing the same
+ * port (the offset loop restarts at 0) sees the expired timestamp and
+ * advances immediately instead of opening a fresh window. Cleared on any
+ * successful election.
+ */
+const silentPortFirstSeen = new Map<string, number>();
+
+/**
+ * Consecutive silent cross-boundary probe timeouts, per host (M2). A host
+ * proven absent this election (CROSS_BOUNDARY_TIMEOUT_LIMIT silent probes)
+ * is skipped on later probes so a container promotes locally instead of
+ * burning probes forever. Cleared on any successful election.
+ */
+const crossBoundaryStreaks = new Map<string, number>();
 
 export interface BootstrapOptions {
   basePort: number;
@@ -83,7 +107,6 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
   const maxPorts = Math.max(1, MAX_PORT_SCAN);
   const crossHosts = opts.crossBoundaryHosts ?? [];
   let delay = 250;
-  let crossBoundaryTimeoutStreak = 0;
 
   for (let attempt = 0; attempt < MAX_ELECTION_ATTEMPTS; attempt++) {
     for (let offset = 0; offset < maxPorts; offset++) {
@@ -96,6 +119,8 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         // through a forwarded port).
         const worker = await tryJoinHttp(port, "127.0.0.1", opts);
         if (worker) {
+          silentPortFirstSeen.clear();
+          crossBoundaryStreaks.clear();
           opts.log?.(`[mcp] Joined leader on port ${port} as worker`);
           return worker;
         }
@@ -106,9 +131,29 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
 
       if (probe.status === "timeout") {
         // Occupied but silent: a frozen/starting Leader (or a non-HTTP app
-        // squatting the port). Do NOT skip or promote — retry the SAME port
-        // on the next attempt (it may unfreeze, or die and free the port).
-        break;
+        // squatting the port). Retry the SAME port (never increment — that
+        // fragments the cluster) within a bounded window: a frozen Leader
+        // may thaw, but a permanent squatter must not wedge startup forever,
+        // so after SILENT_PORT_WINDOW_MS of continuous silence the port is
+        // treated as foreign and we advance to the next port.
+        // Keyed by base+port so a changed basePort config never inherits a
+        // stale first-seen. The entry is KEPT after expiry: the offset loop
+        // restarts at 0 each attempt, and a fresh first-seen would grant a
+        // brand-new window on the next pass — compounding a multi-squatter
+        // into ~MAX_PORT_SCAN windows per round instead of one each.
+        const firstSeenKey = `${base}:${port}`;
+        const firstSeen = silentPortFirstSeen.get(firstSeenKey) ?? Date.now();
+        silentPortFirstSeen.set(firstSeenKey, firstSeen);
+        if (Date.now() - firstSeen < SILENT_PORT_WINDOW_MS) {
+          opts.log?.(`[mcp] Port ${port} occupied but silent — retrying same port`);
+          break;
+        }
+        // Keep the expired entry: the next pass re-probing this port sees the
+        // old timestamp and advances immediately (no fresh window).
+        opts.log?.(
+          `[mcp] Port ${port} occupied but silent for ${SILENT_PORT_WINDOW_MS}ms — treating as foreign, trying the next port`,
+        );
+        // fall through: treat as foreign and advance to the next port
       }
 
       if (probe.status === "free") {
@@ -117,10 +162,17 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
         if (crossHosts.length > 0) {
           let joinedOrRetry = false;
           for (const host of crossHosts) {
+            // A host already proven absent this election (LIMIT silent
+            // probes) is skipped — don't burn more probes on it.
+            if ((crossBoundaryStreaks.get(host) ?? 0) >= CROSS_BOUNDARY_TIMEOUT_LIMIT) {
+              continue;
+            }
             const hp = await probeHost(port, host);
             if (hp.status === "valid") {
               const worker = await tryJoinHttp(port, host, opts);
               if (worker) {
+                silentPortFirstSeen.clear();
+                crossBoundaryStreaks.clear();
                 opts.log?.(`[mcp] Joined leader on ${host}:${port} over HTTP member channel`);
                 return worker;
               }
@@ -132,14 +184,17 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
               // Occupied but silent. Locally this means a frozen Leader and we
               // must keep retrying the same port. Cross-boundary, a host that
               // silently drops SYNs (Docker Desktop's VM gateway) also looks
-              // like this — but there may be no Leader at all. Give a real
-              // (frozen or starting) host Leader a bounded window, then treat
-              // the host as absent and promote locally.
-              crossBoundaryTimeoutStreak += 1;
-              if (crossBoundaryTimeoutStreak < CROSS_BOUNDARY_TIMEOUT_LIMIT) {
+              // like this — but there may be no Leader at all. Track patience
+              // PER HOST: host A timing out must not reset (or break away
+              // from) host B's patience, and once a host is proven absent it
+              // is skipped on later probes so the container still elects
+              // itself and promotes locally.
+              const streak = (crossBoundaryStreaks.get(host) ?? 0) + 1;
+              crossBoundaryStreaks.set(host, streak);
+              if (streak < CROSS_BOUNDARY_TIMEOUT_LIMIT) {
                 opts.log?.(
                   `[mcp] Cross-boundary probe ${host}:${port} timed out ` +
-                    `(${crossBoundaryTimeoutStreak}/${CROSS_BOUNDARY_TIMEOUT_LIMIT}) — ` +
+                    `(${streak}/${CROSS_BOUNDARY_TIMEOUT_LIMIT}) — ` +
                     `retrying same port`,
                 );
                 joinedOrRetry = true;
@@ -150,8 +205,6 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
                   `${CROSS_BOUNDARY_TIMEOUT_LIMIT} consecutive attempts — ` +
                   `no host leader reachable, promoting locally`,
               );
-              crossBoundaryTimeoutStreak = 0;
-              break;
             }
             // free / foreign → try the next candidate host
           }
@@ -160,7 +213,8 @@ export async function bootstrapCluster(opts: BootstrapOptions): Promise<ClusterM
 
         const leader = await tryPromote(port, opts);
         if (leader) {
-          crossBoundaryTimeoutStreak = 0;
+          silentPortFirstSeen.clear();
+          crossBoundaryStreaks.clear();
           opts.log?.(`[mcp] Promoted to leader on port ${port}`);
           return leader;
         }

@@ -5,7 +5,7 @@
 
 Let AI agents read, write, debug, and execute commands in VS Code — just like a
 human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
-server exposes 40+ VS Code tools (debugger, terminal, LSP, file ops, commands)
+server exposes 50 VS Code tools (debugger, terminal, LSP, file ops, commands)
 over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ## Quick Start
@@ -174,7 +174,9 @@ free, in which case the container window promotes and the host window later
   host→container tunnel automatically.
 - On **Linux** hosts, a host leader binds `127.0.0.1` **plus** its detected
   Docker bridge address(es) (`docker0`, `br-*`, `cni-podman0`, …), so
-  containers reach it at `<bridge-ip>:<port>` with zero configuration.
+  containers reach it at `<bridge-ip>:<port>`. Because those bridge addresses
+  are non-loopback, the leader refuses to start unless an auth token is set
+  (`vscode-mcp-server.authToken` or `MCP_AUTH_TOKEN`) — see Security.
 - `host.docker.internal` is only a valid default inside a Docker dev
   container. Other remote environments (attached container, SSH, WSL, …) do
   **not** probe for a host leader unless you set
@@ -483,9 +485,9 @@ curl -sk -X POST https://127.0.0.1:9876/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-> ⚠️ **Security note**: When auth token is set without TLS, the server logs a
-> warning. Bearer tokens over plain HTTP can be intercepted on the local
-> network. Use TLS for any non-loopback access.
+> ⚠️ **Security note**: Bearer tokens over plain HTTP can be intercepted on the
+> local network. Use TLS for any non-loopback access. A non-loopback bind
+> refuses to start without an auth token (see Security).
 
 ## Troubleshooting
 
@@ -599,7 +601,7 @@ All settings under `vscode-mcp-server.*`:
 | Setting | Default | Description |
 | --------- | --------- | ------------- |
 | `port` | `9876` | HTTP server port (auto-retries if busy) |
-| `authToken` | `""` | Bearer token (empty = no auth). Warns if set without TLS |
+| `authToken` | `""` | Bearer token (empty = no auth). Required for non-loopback binds |
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
 | `leaderHost` | `""` | Container→host probe override; default `host.docker.internal` + gateway |
@@ -623,15 +625,19 @@ VS Code settings take priority over env vars.
 - Bearer token auth uses timing-safe comparison
 - Payload limit: 1 MB
 - TLS supported but not required (loopback-only by default)
-- Warning logged when auth token is set without TLS
+- Non-loopback binds (e.g. Linux Docker bridge addresses) refuse to start
+  without an auth token
 - **Cluster member channel (cross-host):** when `authToken` is set, member
   channel requests carry the same `Authorization: Bearer <token>` and are
-  rejected otherwise. There is **no separate cluster handshake** in v1 —
-  anyone who can reach the leader's HTTP port can register as a member if no
-  auth token is configured. Only enable cross-host clusters on a trusted
-  network (a fake leader could drive a real worker, and a spoofed worker
-  could observe leader messages). A per-cluster shared secret + HMAC nonce
-  handshake is planned for a later version.
+  rejected otherwise. The cluster refuses to start when any bind address is
+  non-loopback and no `authToken` is configured (`vscode-mcp-server.authToken`
+  or `MCP_AUTH_TOKEN`), because the member channel proxies tool calls to every
+  worker. There is **no separate cluster handshake** in v1 — a loopback-only
+  bind without a token lets anyone on the host register as a member. Only
+  enable cross-host clusters on a trusted network (a fake leader could drive a
+  real worker, and a spoofed worker could observe leader messages). A
+  per-cluster shared secret + HMAC nonce handshake is planned for a later
+  version.
 
 ## Debug Tips
 
