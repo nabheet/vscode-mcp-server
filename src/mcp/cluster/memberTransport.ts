@@ -105,6 +105,7 @@ export class HttpMemberTransport implements MemberTransport {
    * handler ran. Only then is it safe to POST REGISTER.
    */
   async connect(): Promise<void> {
+    if (this.destroyed) throw new Error("transport destroyed");
     const url = `${this.baseUrl}${CLUSTER_STREAM_PATH}?id=${encodeURIComponent(this.sessionId)}`;
     const controller = new AbortController();
     this.controller = controller;
@@ -130,7 +131,7 @@ export class HttpMemberTransport implements MemberTransport {
   }
 
   send(msg: IpcMessage): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.closedByUs) return;
     let p: Promise<void>;
     p = this.postWithRetry(msg, 0).finally(() => {
       this.inflight.delete(p);
@@ -159,12 +160,18 @@ export class HttpMemberTransport implements MemberTransport {
         signal: controller.signal,
       });
       if (!res.ok) {
+        try {
+          await res.body?.cancel?.();
+        } catch {}
         if (res.status >= 400 && res.status < 500) {
           this.log?.(`[worker] member POST (${msg.type}) rejected: HTTP ${res.status}`);
           return;
         }
         throw new Error(`member POST (${msg.type}) failed: HTTP ${res.status}`);
       }
+      try {
+        await res.body?.cancel?.();
+      } catch {}
     } catch (err) {
       if (this.destroyed) return;
       if (attempt < MEMBER_POST_RETRIES) {

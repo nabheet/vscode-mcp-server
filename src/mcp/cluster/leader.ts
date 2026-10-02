@@ -580,6 +580,15 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
         // re-sent from the SAME peer (POST retry, N1) must NOT drop the
         // worker: dropWorker() closes entry.peer, which would kill the
         // worker's own SSE stream and race it out of the cluster.
+        // Reject self-registration: if the connecting worker claims the same
+        // id as this leader, it's a thawed leader trying to join itself (M1
+        // silent-port window case after freeze) — refuse to create a
+        // self-worker loop.
+        if (id === this.opts.workspaceId) {
+          this.log("[leader] refusing self-registration (worker id matches leader) — closing peer");
+          peer.close();
+          return;
+        }
         const existing = this.workers.get(id);
         if (existing && existing.peer !== peer) {
           existing.peer.close();
