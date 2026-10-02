@@ -332,11 +332,44 @@ describe("startCluster FATAL retry", () => {
   it("binds detected Docker bridge addresses on a Linux-style host window", async () => {
     const log = vi.fn();
     vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
-    const p = startCluster(makeOpts(log, { detectBridges: () => ["127.0.0.2"] }));
+    // Non-loopback binds need a token under C1, so this test sets one.
+    const p = startCluster(
+      makeOpts(log, {
+        detectBridges: () => ["172.18.0.1"],
+        authToken: "t",
+      }),
+    );
     await settle();
     expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledWith(
-      expect.objectContaining({ hosts: ["127.0.0.1", "127.0.0.2"] }),
+      expect.objectContaining({ hosts: ["127.0.0.1", "172.18.0.1"] }),
     );
+    await p;
+  });
+
+  it("refuses to start a non-loopback bind without an authToken and never retries (C1)", async () => {
+    const log = vi.fn();
+    const p = startCluster(makeOpts(log, { detectBridges: () => ["172.18.0.1"] }));
+    await settle();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Refusing to start cluster:"));
+    expect(vi.mocked(bootstrapCluster)).not.toHaveBeenCalled();
+    // Permanent config error: no retry timer may be scheduled.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).not.toHaveBeenCalled();
+    await p;
+  });
+
+  it("allows a non-loopback bind when an authToken is set (C1)", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    const p = startCluster(
+      makeOpts(log, {
+        detectBridges: () => ["172.18.0.1"],
+        authToken: "shared-token",
+      }),
+    );
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).toHaveBeenCalledTimes(1);
     await p;
   });
 
@@ -356,7 +389,7 @@ describe("startCluster FATAL retry", () => {
     const p = startCluster(
       makeOpts(log, {
         isRemoteContainer: true,
-        detectBridges: () => ["127.0.0.2"],
+        detectBridges: () => ["172.18.0.1"],
       }),
     );
     await settle();

@@ -21,8 +21,48 @@ import type { JsonRpcResponse, ToolDefinition } from "../../utils/types";
 import type { ToolExecutor } from "../executor";
 import { type McpRouter, type McpRouterResult, McpServer, type MemberChannel } from "../server";
 import { defineTool } from "../tools/index";
-import { HEARTBEAT_INTERVAL_MS, MSG, PROXY_TIMEOUT_MS, REGISTER_TIMEOUT_MS } from "./constants";
+import {
+  HEARTBEAT_INTERVAL_MS,
+  LEADER_REGISTER_TIMEOUT_MS,
+  MAX_MEMBER_PEERS,
+  MSG,
+  PROXY_TIMEOUT_MS,
+} from "./constants";
 import type { IpcMessage, WindowState } from "./protocol";
+
+/**
+ * Thrown when a cluster member would expose the member channel beyond
+ * loopback without a bearer token (C1). The member channel proxies
+ * tools/call — including shell commands — to every connected worker, so an
+ * unauthenticated non-loopback bind is remote code execution for anything
+ * that can reach those addresses.
+ */
+export class ClusterAuthError extends Error {
+  constructor(readonly binds: string[]) {
+    super(
+      `Refusing to start: non-loopback bind (${binds.join(", ")}) without an authToken. ` +
+        "Set the vscode-mcp-server.authToken setting (or the MCP_AUTH_TOKEN " +
+        "environment variable) to a shared token on every cluster window — " +
+        "all windows must use the same one.",
+    );
+    this.name = "ClusterAuthError";
+  }
+}
+
+/** Loopback bind addresses that need no bearer token (C1). */
+export function isLoopbackHost(host: string): boolean {
+  if (host === "127.0.0.1" || host === "localhost") return true;
+  // 127/8 loopback (any 127.x.y.z), used by some proxies/tunnels.
+  if (host.startsWith("127.")) return true;
+  // IPv6 loopback, with or without brackets, plus IPv4-mapped forms.
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return (
+    bare === "::1" ||
+    bare === "0:0:0:0:0:0:0:1" ||
+    bare === "::ffff:127.0.0.1" ||
+    bare.startsWith("::ffff:127.")
+  );
+}
 
 /**
  * A connected member (Worker) from the Leader's point of view. Every member
@@ -109,7 +149,10 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
   private server: McpServer;
   private localState: WindowState = { openEditors: [] };
   /** Per-peer connection state: registration status + worker id (REGISTER). */
-  private peerState = new Map<MemberPeer, { registered: boolean; entryId: string | null }>();
+  private peerState = new Map<
+    MemberPeer,
+    { registered: boolean; entryId: string | null; regTimer: NodeJS.Timeout | null }
+  >();
   /** HTTP member-channel peers, keyed by worker-chosen session id. */
   private httpPeers = new Map<string, HttpPeer>();
   private workers = new Map<string, WorkerEntry>();
@@ -121,6 +164,15 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
   constructor(opts: LeaderOptions) {
     this.opts = opts;
     if (opts.state) this.localState = opts.state;
+
+    // C1 (defense in depth): extension.ts refuses this configuration before
+    // bootstrap, but every construction path — tests, embedders, future
+    // callers — must be guarded too. The constructor throw propagates
+    // through bootstrap's tryPromote (which does not catch it).
+    const binds = [opts.host, ...(opts.hosts ?? [])];
+    if (binds.some((h) => !isLoopbackHost(h)) && !opts.authToken) {
+      throw new ClusterAuthError(binds);
+    }
 
     this.server = new McpServer({
       port: opts.port,
@@ -392,6 +444,14 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
 
   /** Member channel SSE leg: registers a new HTTP peer for a session. */
   handleStream(req: http.IncomingMessage, res: http.ServerResponse, sessionId: string): void {
+    // Cap concurrent member connections: each holds an open SSE socket plus
+    // a worker entry, and a runaway process must not exhaust the leader's
+    // file descriptors (N5).
+    if (this.httpPeers.size >= MAX_MEMBER_PEERS) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Too many member connections" }));
+      return;
+    }
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -407,7 +467,11 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     res.write(": connected\n\n");
 
     const peer = new HttpPeer(res);
-    const state = { registered: false, entryId: null as string | null };
+    const state = {
+      registered: false,
+      entryId: null as string | null,
+      regTimer: null as NodeJS.Timeout | null,
+    };
     this.httpPeers.set(sessionId, peer);
     this.peerState.set(peer, state);
 
@@ -426,14 +490,20 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
         this.log(`[leader] member ${sessionId} did not REGISTER in time — closing`);
         this.dropHttpPeer(sessionId, peer);
       }
-    }, REGISTER_TIMEOUT_MS);
+    }, LEADER_REGISTER_TIMEOUT_MS);
+    state.regTimer = regTimer;
 
     const cleanup = () => {
       clearTimeout(regTimer);
       clearInterval(keepAlive);
       this.httpPeers.delete(sessionId);
       this.peerState.delete(peer);
-      if (state.entryId) this.dropWorker(state.entryId);
+      // Only drop the worker if this peer is still the one attached to it:
+      // a stream close must not evict a worker that already re-registered
+      // through a different peer (M3).
+      if (state.entryId && this.workers.get(state.entryId)?.peer === peer) {
+        this.dropWorker(state.entryId);
+      }
     };
     req.on("close", cleanup);
     res.on("close", cleanup);
@@ -475,10 +545,23 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     this.httpPeers.delete(sessionId);
     const state = this.peerState.get(peer);
     this.peerState.delete(peer);
-    if (state?.entryId) this.dropWorker(state.entryId);
+    // Only drop the worker if this peer is still the one attached to it
+    // (M3): a re-registered worker must survive its old peer's teardown.
+    if (state?.entryId && this.workers.get(state.entryId)?.peer === peer) {
+      this.dropWorker(state.entryId);
+    }
   }
 
   private onPeerMessage(peer: MemberPeer, msg: IpcMessage): void {
+    // A first POST proves the worker is alive and actively registering; the
+    // registration deadline only guards a peer that opened a stream and then
+    // went silent. Clear the timer so a slow-but-live REGISTER (e.g. busy
+    // leader during an election) is never cut off mid-flight (F4).
+    const peerState = this.peerState.get(peer);
+    if (peerState?.regTimer) {
+      clearTimeout(peerState.regTimer);
+      peerState.regTimer = null;
+    }
     switch (msg.type) {
       case MSG.REGISTER: {
         const id = typeof msg.id === "string" ? msg.id : undefined;
@@ -493,12 +576,15 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
           return;
         }
         // Replace a stale entry for the same window (reconnect after leader
-        // restart) and fail any calls that were in flight to it.
+        // restart) and fail any calls that were in flight to it. A REGISTER
+        // re-sent from the SAME peer (POST retry, N1) must NOT drop the
+        // worker: dropWorker() closes entry.peer, which would kill the
+        // worker's own SSE stream and race it out of the cluster.
         const existing = this.workers.get(id);
         if (existing && existing.peer !== peer) {
           existing.peer.close();
+          this.dropWorker(id);
         }
-        this.dropWorker(id);
         const entry: WorkerEntry = {
           id,
           workspacePaths: paths,
