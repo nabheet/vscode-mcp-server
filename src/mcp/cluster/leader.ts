@@ -552,6 +552,22 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     }
   }
 
+  /**
+   * Remove a peer's bookkeeping synchronously and close it. Unlike
+   * dropHttpPeer it does not require the concrete HttpPeer type (it works for
+   * any MemberPeer) and does not touch workers — used to reject a peer that
+   * never became a legitimate member (e.g. self-registration), where the
+   * stream's async 'close' cleanup has not run yet.
+   */
+  private evictPeer(peer: MemberPeer): void {
+    const sessionId = this.httpSessionId(peer);
+    if (sessionId !== undefined) this.httpPeers.delete(sessionId);
+    const state = this.peerState.get(peer);
+    if (state?.regTimer) clearTimeout(state.regTimer);
+    this.peerState.delete(peer);
+    peer.close();
+  }
+
   private onPeerMessage(peer: MemberPeer, msg: IpcMessage): void {
     // A first POST proves the worker is alive and actively registering; the
     // registration deadline only guards a peer that opened a stream and then
@@ -575,20 +591,33 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
           peer.close();
           return;
         }
+        // Defense in depth: reject a REGISTER that claims THIS window's own
+        // identity. A window that lost its leader role must not re-register as
+        // a worker of its own (now orphaned) server. Key on the stable
+        // per-window `instanceId` (a UUID), not `id`/workspaceId — the latter
+        // is only unique by convention (extension.ts appends the pid), so
+        // keying on it would wrongly refuse a legitimate member that shares a
+        // workspace folder (multi-root / duplicated window). Fall back to the
+        // workspaceId only when either side lacks an instanceId.
+        const instanceId = typeof msg.instanceId === "string" ? msg.instanceId : undefined;
+        const selfByIdentity =
+          this.opts.instanceId !== undefined && instanceId !== undefined
+            ? instanceId === this.opts.instanceId
+            : id === this.opts.workspaceId;
+        if (selfByIdentity) {
+          this.log(
+            "[leader] refusing self-registration (worker identity matches this leader) — closing peer",
+          );
+          // Evict the session immediately (not just on the async 'close'
+          // event) so a follow-up POST on this session id 404s.
+          this.evictPeer(peer);
+          return;
+        }
         // Replace a stale entry for the same window (reconnect after leader
         // restart) and fail any calls that were in flight to it. A REGISTER
         // re-sent from the SAME peer (POST retry, N1) must NOT drop the
         // worker: dropWorker() closes entry.peer, which would kill the
         // worker's own SSE stream and race it out of the cluster.
-        // Reject self-registration: if the connecting worker claims the same
-        // id as this leader, it's a thawed leader trying to join itself (M1
-        // silent-port window case after freeze) — refuse to create a
-        // self-worker loop.
-        if (id === this.opts.workspaceId) {
-          this.log("[leader] refusing self-registration (worker id matches leader) — closing peer");
-          peer.close();
-          return;
-        }
         const existing = this.workers.get(id);
         if (existing && existing.peer !== peer) {
           existing.peer.close();

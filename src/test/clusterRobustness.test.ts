@@ -14,7 +14,7 @@
 import * as http from "node:http";
 import * as net from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bootstrapCluster } from "../mcp/cluster/bootstrap";
+import { bootstrapCluster, resetElectionPatience } from "../mcp/cluster/bootstrap";
 import { CLUSTER_MESSAGE_PATH, CLUSTER_STREAM_PATH, MSG } from "../mcp/cluster/constants";
 import { LeaderCoordinator } from "../mcp/cluster/leader";
 import { HttpMemberTransport, type MemberTransport } from "../mcp/cluster/memberTransport";
@@ -202,13 +202,14 @@ describe("self-registration guard (W1)", () => {
     leaders.length = 0;
   });
 
-  async function startLeader(workspaceId: string): Promise<number> {
+  async function startLeader(workspaceId: string, instanceId?: string): Promise<number> {
     const port = await findFreePort();
     const leader = new LeaderCoordinator({
       port,
       host: "127.0.0.1",
       executor: new ToolExecutor(),
       workspaceId,
+      instanceId,
       workspacePaths: ["/mnt/leader"],
       displayName: "Leader",
     });
@@ -217,8 +218,8 @@ describe("self-registration guard (W1)", () => {
     return port;
   }
 
-  it("refuses a REGISTER whose id matches the leader's own workspace", async () => {
-    const port = await startLeader("leader-ws");
+  it("refuses a REGISTER whose instanceId matches the leader (self-registration)", async () => {
+    const port = await startLeader("leader-ws", "leader-inst");
     const { status, res } = await openMemberStream(port, "s-self");
     streams.push(res);
     expect(status).toBe(200);
@@ -226,6 +227,7 @@ describe("self-registration guard (W1)", () => {
     await memberPost(port, "s-self", {
       type: MSG.REGISTER,
       id: "leader-ws",
+      instanceId: "leader-inst",
       workspacePaths: ["/mnt/leader"],
       displayName: "Thawed Leader",
     });
@@ -235,16 +237,57 @@ describe("self-registration guard (W1)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.role).toBe("leader");
     expect(rows.filter((r) => r.role === "worker")).toHaveLength(0);
+
+    // W1-C: the rejected session must be evicted, not left dangling — a
+    // follow-up POST on the same session id now sees an unknown session.
+    const after = await memberPost(port, "s-self", { type: MSG.PING });
+    expect(after.status).toBe(404);
+  });
+
+  it("refuses a REGISTER matching the leader's workspace id when no instanceId is set", async () => {
+    const port = await startLeader("leader-ws");
+    const { res } = await openMemberStream(port, "s-self2");
+    streams.push(res);
+
+    await memberPost(port, "s-self2", {
+      type: MSG.REGISTER,
+      id: "leader-ws",
+      workspacePaths: ["/mnt/leader"],
+      displayName: "Thawed Leader",
+    });
+
+    const rows = await listWorkspaceRows(port);
+    expect(rows.filter((r) => r.role === "worker")).toHaveLength(0);
+  });
+
+  it("accepts a legitimate worker that shares the leader's workspaceId (distinct instanceId)", async () => {
+    // Multi-root / duplicated-window shape: same folder (workspaceId) but a
+    // different window instance. The guard must key on instanceId, not id.
+    const port = await startLeader("shared-ws", "leader-inst");
+    const { res } = await openMemberStream(port, "s-multi");
+    streams.push(res);
+
+    await memberPost(port, "s-multi", {
+      type: MSG.REGISTER,
+      id: "shared-ws",
+      instanceId: "other-inst",
+      workspacePaths: ["/mnt/leader"],
+      displayName: "Second Window",
+    });
+
+    const rows = await listWorkspaceRows(port);
+    expect(rows.some((r) => r.id === "shared-ws" && r.role === "worker")).toBe(true);
   });
 
   it("still registers a genuine worker with a different id (control)", async () => {
-    const port = await startLeader("leader-ws");
+    const port = await startLeader("leader-ws", "leader-inst");
     const { res } = await openMemberStream(port, "s-worker");
     streams.push(res);
 
     await memberPost(port, "s-worker", {
       type: MSG.REGISTER,
       id: "worker-ws",
+      instanceId: "worker-inst",
       workspacePaths: ["/mnt/worker"],
       displayName: "Worker",
     });
@@ -375,15 +418,23 @@ class FakeTransport implements MemberTransport {
   destroyed = false;
   /** Answer each PING with a PONG after `pongDelayMs` (0 = never). */
   pongDelayMs = 0;
+  /** PINGs sent while the previous PING was still unanswered — must stay 0. */
+  doubleSends = 0;
+  private pingOutstanding = false;
 
   async connect(): Promise<void> {}
 
   send(msg: IpcMessage): void {
     this.sent.push(msg);
-    if (msg.type === MSG.PING && this.pongDelayMs > 0) {
-      const delay = this.pongDelayMs;
-      setTimeout(() => this.onMessage?.({ type: MSG.PONG }), delay);
-    }
+    if (msg.type !== MSG.PING) return;
+    if (this.pingOutstanding) this.doubleSends++;
+    if (this.pongDelayMs <= 0) return;
+    this.pingOutstanding = true;
+    const delay = this.pongDelayMs;
+    setTimeout(() => {
+      this.pingOutstanding = false;
+      this.onMessage?.({ type: MSG.PONG });
+    }, delay);
   }
 
   close(): void {
@@ -434,8 +485,20 @@ describe("worker heartbeat failover (N2)", () => {
 
     await sleep(300); // ~15 heartbeat intervals
     expect(lost).toEqual([]);
-    // Several PINGs must have been sent and none left outstanding.
+    // Several PINGs must have been sent...
     expect(tp.sent.filter((m) => m.type === MSG.PING).length).toBeGreaterThan(2);
+    // ...and never two while one was still unanswered (the N2 invariant).
+    expect(tp.doubleSends).toBe(0);
+  });
+
+  it("never sends a second PING while the first is unanswered (N2 invariant)", async () => {
+    const tp = new FakeTransport();
+    tp.pongDelayMs = 35; // ~1.75× the interval: PINGs overlap if unguarded
+    const worker = await startWorker(tp);
+    await sleep(300);
+    // The invariant must hold regardless of whether a failover fired.
+    expect(tp.doubleSends).toBe(0);
+    void worker;
   });
 
   it("a late PONG resets the miss counter before it reaches the limit", async () => {
@@ -532,14 +595,53 @@ describe("silent-port window (M1)", () => {
     silentServers.length = 0;
     for (const s of httpServers) s.close();
     httpServers.length = 0;
+    // The patience maps are module state; a test that fails before promotion
+    // would otherwise leave a stale first-seen entry for a later test.
+    resetElectionPatience();
   });
 
-  it("retries a silent port within the window, then advances and promotes", async () => {
+  it("refuses to advance past a still-bound silent port (frozen-leader split-brain guard)", async () => {
     const base = await findConsecutiveFreePorts();
-    // Silent squatter: accepts TCP but never answers /health.
+    // A live-but-silent holder: accepts TCP, never answers /health, and keeps
+    // the port BOUND. This models a frozen leader. The window may expire, but
+    // bootstrap must NOT advance to base+1 — doing so is the split-brain.
     const silent = net.createServer(() => {});
     await new Promise<void>((resolve) => silent.listen(base, "127.0.0.1", resolve));
     silentServers.push(silent);
+
+    const logs: string[] = [];
+    // Keep the loop bounded: with the guard, every attempt retries the same
+    // port and bootstrap eventually FATALs rather than promoting on base+1.
+    await expect(
+      bootstrapCluster({
+        basePort: base,
+        host: "127.0.0.1",
+        executor: new ToolExecutor(),
+        workspaceId: "w1",
+        workspacePaths: ["/w"],
+        displayName: "W1",
+        log: (m) => logs.push(m),
+      }),
+    ).rejects.toThrow(/Could not elect or join/);
+
+    expect(logs.some((l) => l.includes("retrying same port"))).toBe(true);
+    expect(logs.some((l) => l.includes("likely a live frozen leader"))).toBe(true);
+    // Never treated as foreign while the holder is still bound.
+    expect(logs.some((l) => l.includes("no longer bound"))).toBe(false);
+  }, 20000);
+
+  it("advances past a silent port once the holder is gone (no split-brain false-positive)", async () => {
+    const base = await findConsecutiveFreePorts();
+    // A silent squatter that RELEASES the port after the window. Bind is then
+    // free, so advancing is safe and the window promotes on base+1.
+    let silent: net.Server | null = new net.Server(() => {});
+    await new Promise<void>((resolve) => (silent as net.Server).listen(base, "127.0.0.1", resolve));
+    // Release base as soon as the first-seen window has been recorded: the
+    // guard's bind test then succeeds and the loop advances.
+    setTimeout(() => {
+      silent?.close();
+      silent = null;
+    }, 60);
 
     const logs: string[] = [];
     const member = await bootstrapCluster({
@@ -554,10 +656,12 @@ describe("silent-port window (M1)", () => {
     members.push(member);
 
     expect(member.role).toBe("leader");
-    expect(member.port).toBe(base + 1);
-    expect(logs.some((l) => l.includes("retrying same port"))).toBe(true);
-    expect(logs.some((l) => l.includes("treating as foreign"))).toBe(true);
-  }, 15000);
+    // Either path is correct and safe: base freed before it was classified
+    // silent (promote on base), or it was silent then released (advance to
+    // base+1). The forbidden outcome — advancing while it is still bound — is
+    // covered by the previous test.
+    expect([base, base + 1]).toContain(member.port);
+  }, 20000);
 
   it("skips a foreign HTTP squatter and promotes on the next port", async () => {
     const base = await findConsecutiveFreePorts();

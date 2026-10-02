@@ -131,7 +131,7 @@ export class HttpMemberTransport implements MemberTransport {
   }
 
   send(msg: IpcMessage): void {
-    if (this.destroyed || this.closedByUs) return;
+    if (this.destroyed) return;
     let p: Promise<void>;
     p = this.postWithRetry(msg, 0).finally(() => {
       this.inflight.delete(p);

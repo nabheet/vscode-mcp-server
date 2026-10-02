@@ -317,11 +317,10 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     newMember.updateState(currentWindowState());
 
     if (newMember.role === "worker") {
-      const lostHandler = (reason: string) => {
+      newMember.setOnLostLeader((reason: string) => {
         opts.log(`Lost leader (${reason}) — re-electing...`);
         void startCluster(opts);
-      };
-      newMember.setOnLostLeader(lostHandler);
+      });
     } else {
       newMember.setOnListen((url: string) => {
         let msg = `MCP server listening on ${url}`;
