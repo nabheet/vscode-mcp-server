@@ -154,6 +154,13 @@ function openMemberStream(port: number, sessionId: string): Promise<http.Incomin
 function readSseEvent(res: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let buffer = "";
+    const onError = (err: Error) => reject(err);
+    const onEnd = () => reject(new Error("stream ended before an event"));
+    const cleanup = () => {
+      res.off("data", onData);
+      res.off("error", onError);
+      res.off("end", onEnd);
+    };
     const onData = (c: Buffer) => {
       buffer += c.toString("utf-8");
       let idx = buffer.indexOf("\n\n");
@@ -164,7 +171,7 @@ function readSseEvent(res: http.IncomingMessage): Promise<string> {
         if (dataLine) {
           // Stop reading, but leave the stream open for the caller to close
           // after it has finished asserting against cluster state.
-          res.off("data", onData);
+          cleanup();
           resolve(dataLine.slice(5).trim());
           return;
         }
@@ -173,8 +180,8 @@ function readSseEvent(res: http.IncomingMessage): Promise<string> {
       }
     };
     res.on("data", onData);
-    res.on("error", reject);
-    res.on("end", () => reject(new Error("stream ended before an event")));
+    res.on("error", onError);
+    res.on("end", onEnd);
   });
 }
 
