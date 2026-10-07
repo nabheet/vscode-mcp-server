@@ -187,10 +187,17 @@ free, in which case the container window promotes and the host window later
      container's default traffic to the host's bridge interface, so no
      `extra_hosts` or `devcontainer.json` networking config is needed.
 - The reverse direction (host window joining a container leader) works out of
-  the box: a container leader binds `0.0.0.0` inside the container, VS Code's
-  `forwardPorts` maps it back to `127.0.0.1`, and a container leader
-  additionally calls `vscode.env.asExternalUri` to make VS Code establish the
-  host→container tunnel automatically.
+  the box: a container leader binds `127.0.0.1` inside the container, and VS
+  Code's port forwarding reaches it. `forwardPorts` tunnels to `localhost`
+  inside the container, and the leader additionally calls
+  `vscode.env.asExternalUri` so VS Code establishes the host→container tunnel
+  automatically. The host side of that tunnel binds `127.0.0.1` unless you set
+  `remote.localPortHost` to `allInterfaces`.
+- Port forwarding is the supported path. If you bypass it (devcontainer
+  `appPort` / compose `ports:`), Docker publishes the port on `0.0.0.0` and a
+  loopback bind inside the container is unreachable — set
+  `vscode-mcp-server.bindHost` to `0.0.0.0` **and** an `authToken` (C1 requires
+  the token for any non-loopback bind).
 - On **Linux** hosts, a host leader binds `127.0.0.1` **plus** its detected
   Docker bridge address(es) (`docker0`, `br-*`, `cni-podman0`, …), so
   containers reach it at `<bridge-ip>:<port>`. Because those bridge addresses
@@ -624,6 +631,7 @@ All settings under `vscode-mcp-server.*`:
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
 | `leaderHost` | `""` | Container→host probe override; default `host.docker.internal` + gateway |
+| `bindHost` | `""` (loopback) | Bind address override. Non-loopback requires `authToken` (C1) |
 
 Settings fall back to environment variables:
 
@@ -634,6 +642,7 @@ Settings fall back to environment variables:
 | `MCP_TLS_CERT_PATH` | `tlsCertPath` | (none) |
 | `MCP_TLS_KEY_PATH` | `tlsKeyPath` | (none) |
 | `MCP_LEADER_HOST` | `leaderHost` | (none — `host.docker.internal`, then gateway) |
+| `MCP_BIND_HOST` | `bindHost` | (none — `127.0.0.1`) |
 | `MCP_SERVER_MAX_RETRIES` | ports scanned per election (default 5, 9876–9880) | `5` |
 
 VS Code settings take priority over env vars.
@@ -644,6 +653,8 @@ VS Code settings take priority over env vars.
 - Bearer token auth uses timing-safe comparison
 - Payload limit: 1 MB
 - TLS supported but not required (loopback-only by default)
+- Dev-container windows bind loopback too (`127.0.0.1`); VS Code's port
+  forwarding tunnels the host to it, so no token is needed in a container
 - Non-loopback binds (e.g. Linux Docker bridge addresses) refuse to start
   without an auth token
 - When `authToken` is set, `/metrics` and `/diagnostics` also require the

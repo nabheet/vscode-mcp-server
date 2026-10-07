@@ -52,7 +52,7 @@ vi.mock("../mcp/tools/index", () => ({
   registerAllTools: vi.fn(),
 }));
 
-import { deactivate, startCluster } from "../extension";
+import { deactivate, resolveBindHost, startCluster } from "../extension";
 import { bootstrapCluster, type ClusterMember } from "../mcp/cluster/bootstrap";
 
 function makeOpts(
@@ -97,6 +97,18 @@ function fakeMember(role: "leader" | "worker" = "leader"): ClusterMember {
 async function settle(): Promise<void> {
   await vi.advanceTimersByTimeAsync(0);
 }
+
+describe("resolveBindHost", () => {
+  it("binds loopback when there is no override", () => {
+    expect(resolveBindHost("")).toBe("127.0.0.1");
+    expect(resolveBindHost(undefined)).toBe("127.0.0.1");
+  });
+
+  it("honours an explicit override (C1 then requires a token for non-loopback)", () => {
+    expect(resolveBindHost("0.0.0.0")).toBe("0.0.0.0");
+    expect(resolveBindHost("192.168.1.10")).toBe("192.168.1.10");
+  });
+});
 
 describe("startCluster FATAL retry", () => {
   beforeEach(() => {
