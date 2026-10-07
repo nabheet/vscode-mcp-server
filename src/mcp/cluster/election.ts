@@ -12,7 +12,7 @@
  *               port and do NOT promote — that would fragment the cluster;
  *               retry the same port on the next attempt.
  */
-import * as http from "http";
+import * as http from "node:http";
 import { HEALTH_SERVICE, PROBE_TIMEOUT_MS } from "./constants";
 
 export type PortProbe =

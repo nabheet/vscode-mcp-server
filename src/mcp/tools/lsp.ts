@@ -16,18 +16,14 @@ function lspCommand<T>(command: string, ...args: unknown[]): Promise<T> {
   );
 }
 
-/** Get active text editor or return a CallToolResult error */
-function requireEditor():
-  | { editor: vscode.TextEditor; err: null }
-  | { editor: null; err: { content: { type: "text"; text: string }[]; isError: true } } {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    return {
-      editor: null,
-      err: { content: [{ type: "text", text: "No active text editor" }], isError: true },
-    };
-  }
-  return { editor, err: null };
+/** Active text editor, or undefined when none is focused. */
+function activeEditor(): vscode.TextEditor | undefined {
+  return vscode.window.activeTextEditor;
+}
+
+/** Tool result for "no active text editor". */
+function noEditorError(): { content: { type: "text"; text: string }[]; isError: true } {
+  return { content: [{ type: "text", text: "No active text editor" }], isError: true };
 }
 
 /** Get cursor position from active editor */
@@ -40,12 +36,32 @@ interface NormalisedLocation {
   uri: vscode.Uri;
   range: vscode.Range;
 }
-function normaliseLocation(loc: any): NormalisedLocation {
-  if (loc.uri && loc.range && loc.range.start) return loc; // vscode.Location
-  if (loc.targetUri && loc.targetRange) return { uri: loc.targetUri, range: loc.targetRange }; // LocationLink
+function normaliseLocation(loc: unknown): NormalisedLocation {
+  const candidate = loc as {
+    uri?: vscode.Uri;
+    range?: vscode.Range;
+    targetUri?: vscode.Uri;
+    targetRange?: vscode.Range;
+  };
+  if (candidate.uri && candidate.range?.start) {
+    return { uri: candidate.uri, range: candidate.range }; // vscode.Location
+  }
+  if (candidate.targetUri && candidate.targetRange) {
+    return { uri: candidate.targetUri, range: candidate.targetRange }; // LocationLink
+  }
   throw new Error(
-    "Unexpected location format from language server: " + JSON.stringify(loc).slice(0, 200),
+    `Unexpected location format from language server: ${JSON.stringify(loc).slice(0, 200)}`,
   );
+}
+
+/** Diagnostics grouped by document, as returned by the diagnostics provider. */
+interface DocumentDiagnostics {
+  uri: vscode.Uri;
+  diagnostics: vscode.Diagnostic[];
+}
+
+function isDocumentDiagnostics(value: unknown): value is DocumentDiagnostics {
+  return typeof value === "object" && value !== null && "uri" in value && "diagnostics" in value;
 }
 
 export function registerLspTools(server: ToolRegistrar): void {
@@ -58,13 +74,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const refs = await lspCommand<vscode.Location[]>(
             "vscode.executeReferenceProvider",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
           );
           if (!refs || refs.length === 0)
             return { content: [{ type: "text", text: "No references found" }], isError: false };
@@ -93,13 +109,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const defs = await lspCommand(
             "vscode.executeDefinitionProvider",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
           );
           if (!defs || !Array.isArray(defs) || defs.length === 0)
             return { content: [{ type: "text", text: "No definition found" }], isError: false };
@@ -134,13 +150,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const defs = await lspCommand(
             "vscode.executeTypeDefinitionProvider",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
           );
           if (!defs || !Array.isArray(defs) || defs.length === 0)
             return {
@@ -178,13 +194,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const impls = await lspCommand(
             "vscode.executeImplementationProvider",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
           );
           if (!impls || !Array.isArray(impls) || impls.length === 0)
             return { content: [{ type: "text", text: "No implementation found" }], isError: false };
@@ -219,13 +235,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const hovers = await lspCommand<vscode.Hover[]>(
             "vscode.executeHoverProvider",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
           );
           if (!hovers || hovers.length === 0)
             return { content: [{ type: "text", text: "No hover info" }], isError: false };
@@ -275,9 +291,9 @@ export function registerLspTools(server: ToolRegistrar): void {
         const MAX_DIAG_LINES = 200;
         const entries = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
         for (const diag of entries) {
-          if ("uri" in diag && "diagnostics" in diag) {
-            for (const d of (diag as any).diagnostics) {
-              const line = `${(diag as any).uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
+          if (isDocumentDiagnostics(diag)) {
+            for (const d of diag.diagnostics) {
+              const line = `${diag.uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
               if (lines.length < MAX_DIAG_LINES) {
                 lines.push(line);
               }
@@ -290,12 +306,9 @@ export function registerLspTools(server: ToolRegistrar): void {
             }
           }
         }
-        const rawDiag: any[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
-        const total = rawDiag.reduce((sum: number, entry: any) => {
-          if (entry && typeof entry === "object" && "diagnostics" in entry) {
-            const arr = entry.diagnostics as any[] | undefined;
-            return sum + (Array.isArray(arr) ? arr.length : 1);
-          }
+        const rawDiag: unknown[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
+        const total = rawDiag.reduce((sum: number, entry: unknown) => {
+          if (isDocumentDiagnostics(entry)) return sum + entry.diagnostics.length;
           return sum + 1;
         }, 0);
         const tail = total > MAX_DIAG_LINES ? `\n... and ${total - MAX_DIAG_LINES} more` : "";
@@ -313,30 +326,24 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
-          const symbols = await lspCommand(
+          const symbols = await lspCommand<vscode.DocumentSymbol[] | vscode.SymbolInformation[]>(
             "vscode.executeDocumentSymbolProvider",
-            editor!.document.uri,
+            editor.document.uri,
           );
-          if (!symbols || (Array.isArray(symbols) && symbols.length === 0))
+          if (!symbols || symbols.length === 0)
             return { content: [{ type: "text", text: "No symbols found" }], isError: false };
           const lines: string[] = [];
-          function flattenSymbol(s: any): void {
-            if (s.location) {
-              lines.push(
-                `${s.name} (${vscode.SymbolKind[s.kind]}) at ${s.location.range.start.line + 1}`,
-              );
-            } else if (s.range) {
-              // DocumentSymbol uses .range instead of .location
-              lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${s.range.start.line + 1}`);
-            }
-            if (s.children) {
+          function flattenSymbol(s: vscode.DocumentSymbol | vscode.SymbolInformation): void {
+            const range = "location" in s ? s.location.range : s.range;
+            lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${range.start.line + 1}`);
+            if ("children" in s) {
               for (const child of s.children) flattenSymbol(child);
             }
           }
-          for (const s of symbols as any[]) flattenSymbol(s);
+          for (const s of symbols) flattenSymbol(s);
           return {
             content: [{ type: "text", text: lines.join("\n") || "No symbols found" }],
             isError: false,
@@ -401,14 +408,14 @@ export function registerLspTools(server: ToolRegistrar): void {
         required: ["line"],
       },
       async (args) => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         const line = Math.max(0, Number(args.line) - 1);
-        const lineRange = editor!.document.lineAt(line).range;
+        const lineRange = editor.document.lineAt(line).range;
         try {
           const actions = await lspCommand<vscode.CodeAction[]>(
             "vscode.executeCodeActionProvider",
-            editor!.document.uri,
+            editor.document.uri,
             lineRange,
           );
           if (!actions || actions.length === 0)
@@ -439,13 +446,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         properties: {},
       },
       async () => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const items = await lspCommand<vscode.CallHierarchyItem[]>(
             "vscode.executePrepareCallHierarchy",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
           );
           if (!items || items.length === 0)
             return {
@@ -503,13 +510,13 @@ export function registerLspTools(server: ToolRegistrar): void {
         required: ["newName"],
       },
       async (args) => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         try {
           const edit = await lspCommand<vscode.WorkspaceEdit>(
             "vscode.executeDocumentRenameProvider",
-            editor!.document.uri,
-            getCursor(editor!),
+            editor.document.uri,
+            getCursor(editor),
             String(args.newName),
           );
           if (!edit)
@@ -561,23 +568,23 @@ export function registerLspTools(server: ToolRegistrar): void {
         },
       },
       async (args) => {
-        const { editor, err } = requireEditor();
-        if (err) return err;
+        const editor = activeEditor();
+        if (!editor) return noEditorError();
         const line =
-          args.line !== undefined ? Math.max(0, Number(args.line) - 1) : getCursor(editor!).line;
+          args.line !== undefined ? Math.max(0, Number(args.line) - 1) : getCursor(editor).line;
         const col =
           args.column !== undefined
             ? Math.max(0, Number(args.column) - 1)
-            : getCursor(editor!).character;
+            : getCursor(editor).character;
         const maxResults = Number(args.maxResults) || 50;
         const pos = new vscode.Position(line, col);
         try {
           const list = await lspCommand<vscode.CompletionList>(
             "vscode.executeCompletionItemProvider",
-            editor!.document.uri,
+            editor.document.uri,
             pos,
           );
-          if (!list || !list.items || list.items.length === 0)
+          if (!list?.items || list.items.length === 0)
             return {
               content: [{ type: "text", text: "No completions available" }],
               isError: false,

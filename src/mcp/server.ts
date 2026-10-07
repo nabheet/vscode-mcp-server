@@ -105,7 +105,6 @@ const LAG_INTERVAL_MS = 1_000;
 
 export class McpServer {
   private servers: Array<http.Server | https.Server> = [];
-  private activeRequests = 0;
   private shuttingDown = false;
   private options: McpServerOptions;
   private bindHosts: string[];
@@ -113,7 +112,6 @@ export class McpServer {
   private useTls: boolean;
   private sessions = new Map<string, SseSession>();
   private metrics: Metrics;
-  private readonly fileLog?: ServerLog;
   private lagMs = 0;
   private lastLagSample = Date.now();
   private lagTimer: NodeJS.Timeout | null = null;
@@ -123,7 +121,6 @@ export class McpServer {
     this.options = options;
     this.useTls = !!(options.tlsCertPath && options.tlsKeyPath);
     this.metrics = options.metrics ?? new Metrics();
-    this.fileLog = options.logger;
     this.executor =
       options.executor ??
       new ToolExecutor({
@@ -168,10 +165,11 @@ export class McpServer {
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
       const createServer = (): http.Server | https.Server => {
-        if (this.useTls) {
+        const { tlsCertPath, tlsKeyPath } = this.options;
+        if (tlsCertPath && tlsKeyPath) {
           const tlsOpts: https.ServerOptions = {
-            cert: fs.readFileSync(this.options.tlsCertPath!, "utf-8"),
-            key: fs.readFileSync(this.options.tlsKeyPath!, "utf-8"),
+            cert: fs.readFileSync(tlsCertPath, "utf-8"),
+            key: fs.readFileSync(tlsKeyPath, "utf-8"),
             minVersion: "TLSv1.2",
           };
           return https.createServer(tlsOpts, (req, res) => this.onRequest(req, res));
@@ -717,14 +715,6 @@ export class McpServer {
       return;
     }
 
-    this.activeRequests++;
-    let requestHandled = false;
-    const activeRequestDone = () => {
-      if (requestHandled) return;
-      requestHandled = true;
-      this.activeRequests--;
-    };
-
     const chunks: Buffer[] = [];
     let bodySize = 0;
     const MAX_BODY = 10 * 1024 * 1024;
@@ -740,7 +730,6 @@ export class McpServer {
         this.writeCorsHeaders(res, origin);
         res.writeHead(413, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Payload Too Large: max 10 MB" }));
-        activeRequestDone();
         return;
       }
 
@@ -792,13 +781,7 @@ export class McpServer {
             error: { code: -32603, message: `Internal error: ${msg}` },
           }),
         );
-      } finally {
-        activeRequestDone();
       }
-    });
-
-    req.on("error", () => {
-      activeRequestDone();
     });
   }
 }
