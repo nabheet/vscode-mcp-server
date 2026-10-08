@@ -308,7 +308,9 @@ export function registerLspTools(server: ToolRegistrar): void {
         }
         const rawDiag: unknown[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
         const total = rawDiag.reduce((sum: number, entry: unknown) => {
-          if (isDocumentDiagnostics(entry)) return sum + entry.diagnostics.length;
+          if (isDocumentDiagnostics(entry)) {
+            return sum + (Array.isArray(entry.diagnostics) ? entry.diagnostics.length : 1);
+          }
           return sum + 1;
         }, 0);
         const tail = total > MAX_DIAG_LINES ? `\n... and ${total - MAX_DIAG_LINES} more` : "";
