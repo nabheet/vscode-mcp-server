@@ -339,6 +339,9 @@ export function registerLspTools(server: ToolRegistrar): void {
             return { content: [{ type: "text", text: "No symbols found" }], isError: false };
           const lines: string[] = [];
           function flattenSymbol(s: vscode.DocumentSymbol | vscode.SymbolInformation): void {
+            // A provider can return a primitive where a symbol is expected;
+            // main's truthiness chain skipped those, and `in` would throw.
+            if (typeof s !== "object" || s === null) return;
             const located = "location" in s ? s.location : undefined;
             const own = "range" in s ? s.range : undefined;
             const range = located?.range ?? own;
