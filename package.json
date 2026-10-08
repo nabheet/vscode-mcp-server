@@ -81,7 +81,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Bind address. Empty = 127.0.0.1 (loopback only, the default — a dev container needs no more, VS Code's port forwarding reaches it). Set 0.0.0.0 only when bypassing port forwarding (appPort / compose ports:); a non-loopback bind then requires vscode-mcp-server.authToken."
+          "description": "Bind address. Empty = 127.0.0.1 (loopback only, the default — a dev container needs no more, VS Code's port forwarding reaches it). Set 0.0.0.0 only when bypassing port forwarding (appPort / compose ports:); a non-loopback bind then requires vscode-mcp-server.authToken. A specific address is bound alongside 127.0.0.1 so sibling windows can still find the leader. A value that is neither an IP address nor a hostname is refused at startup."
         }
       }
     }

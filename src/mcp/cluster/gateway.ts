@@ -135,10 +135,15 @@ export function detectBridgeAddresses(
  * The addresses a leader should bind, in order (primary first — the primary
  * is what gets logged and used for origin checks):
  *
- *  - remote container: everything (the container must accept both forwarded
- *    tunnel traffic and container-internal traffic);
- *  - local window: loopback, plus any Docker bridge addresses on Linux so
- *    containers can reach this leader without config.
+ *  - the configured host — loopback by default; a container leader binds
+ *    loopback too, because VS Code's port forwarding reaches it there;
+ *  - plus any Docker bridge addresses on Linux, so containers can reach a
+ *    host leader without config.
+ *
+ * Callers add a loopback bind when the configured host is a specific address
+ * that does not already cover loopback (see extension.ts): sibling windows
+ * probe loopback, so a leader bound only to one address would be invisible to
+ * them and they would promote a second leader.
  */
 export function buildBindHosts(host: string, bridges: string[]): string[] {
   const out: string[] = [];
@@ -146,4 +151,14 @@ export function buildBindHosts(host: string, bridges: string[]): string[] {
     if (candidate && !out.includes(candidate)) out.push(candidate);
   }
   return out;
+}
+
+/**
+ * True for a wildcard bind (`0.0.0.0`, `::`), which already accepts traffic on
+ * every local address — loopback included — so no separate loopback bind is
+ * needed (and adding one would collide with the wildcard bind).
+ */
+export function isWildcardHost(host: string): boolean {
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return bare === "0.0.0.0" || bare === "::";
 }

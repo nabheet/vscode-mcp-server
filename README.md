@@ -190,14 +190,21 @@ free, in which case the container window promotes and the host window later
   the box: a container leader binds `127.0.0.1` inside the container, and VS
   Code's port forwarding reaches it. `forwardPorts` tunnels to `localhost`
   inside the container, and the leader additionally calls
-  `vscode.env.asExternalUri` so VS Code establishes the host→container tunnel
-  automatically. The host side of that tunnel binds `127.0.0.1` unless you set
-  `remote.localPortHost` to `allInterfaces`.
+  `vscode.env.asExternalUri` for the port it actually bound — election may
+  advance past `port` when the base port is taken, and the tunnel follows it —
+  so VS Code establishes the host→container tunnel automatically. The host side
+  of that tunnel binds `127.0.0.1` unless you set `remote.localPortHost` to
+  `allInterfaces`.
 - Port forwarding is the supported path. If you bypass it (devcontainer
   `appPort` / compose `ports:`), Docker publishes the port on `0.0.0.0` and a
   loopback bind inside the container is unreachable — set
   `vscode-mcp-server.bindHost` to `0.0.0.0` **and** an `authToken` (C1 requires
   the token for any non-loopback bind).
+- `bindHost` takes an IP address or a hostname. A **specific** address (rather
+  than `0.0.0.0`) is bound *alongside* `127.0.0.1`, so windows in the same
+  namespace still find the leader by probing loopback instead of promoting a
+  second one. A value that is neither an IP address nor a hostname is refused
+  at startup — a permanent configuration error, never retried.
 - On **Linux** hosts, a host leader binds `127.0.0.1` **plus** its detected
   Docker bridge address(es) (`docker0`, `br-*`, `cni-podman0`, …), so
   containers reach it at `<bridge-ip>:<port>`. Because those bridge addresses
@@ -631,7 +638,7 @@ All settings under `vscode-mcp-server.*`:
 | `tlsCertPath` | `""` | TLS cert PEM path (enables HTTPS) |
 | `tlsKeyPath` | `""` | TLS key PEM path (enables HTTPS) |
 | `leaderHost` | `""` | Container→host probe override; default `host.docker.internal` + gateway |
-| `bindHost` | `""` (loopback) | Bind address override. Non-loopback requires `authToken` (C1) |
+| `bindHost` | `""` (loopback) | Bind address (IP/hostname). Non-loopback needs `authToken` (C1) |
 
 Settings fall back to environment variables:
 

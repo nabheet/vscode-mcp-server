@@ -15,6 +15,7 @@
 
 import { randomUUID } from "node:crypto";
 import type * as http from "node:http";
+import { isIP } from "node:net";
 import type { Metrics } from "../../utils/metrics";
 import type { ServerLog } from "../../utils/serverLog";
 import type { JsonRpcResponse, ToolDefinition } from "../../utils/types";
@@ -62,6 +63,31 @@ export function isLoopbackHost(host: string): boolean {
     bare === "::ffff:127.0.0.1" ||
     bare.startsWith("::ffff:127.")
   );
+}
+
+/**
+ * True when `host` can be handed to `server.listen`: an IPv4/IPv6 literal
+ * (brackets allowed) or a hostname. A typo — most often stray whitespace or a
+ * stray character — would otherwise fail at bind time and be retried forever
+ * as if it were a transient failure.
+ */
+export function isUsableBindHost(host: string): boolean {
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (bare.length === 0) return false;
+  if (isIP(bare) !== 0) return true;
+  return /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(bare);
+}
+
+/**
+ * Thrown for a permanent cluster configuration error — an unusable bind
+ * address, say. Like C1 it cannot fix itself, so startup refuses once instead
+ * of retrying forever with exponential backoff.
+ */
+export class ClusterConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ClusterConfigError";
+  }
 }
 
 /**
