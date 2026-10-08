@@ -6,8 +6,14 @@ import {
   buildCrossBoundaryHosts,
   detectBridgeAddresses,
   detectDefaultGateway,
+  isWildcardHost,
 } from "./mcp/cluster/gateway";
-import { ClusterAuthError, isLoopbackHost } from "./mcp/cluster/leader";
+import {
+  ClusterAuthError,
+  ClusterConfigError,
+  isLoopbackHost,
+  isUsableBindHost,
+} from "./mcp/cluster/leader";
 import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
@@ -72,6 +78,27 @@ function scheduleStatePush(): void {
   }, 300);
 }
 
+/**
+ * Loopback unless overridden. A container window binds loopback too — VS
+ * Code's port forwarding reaches it there, so a container needs no wider bind
+ * (and therefore no token). A blank or whitespace-only override counts as
+ * unset.
+ */
+export function resolveBindHost(override: string | undefined): string {
+  return override?.trim() || "127.0.0.1";
+}
+
+/**
+ * The `bindHost` setting wins over `MCP_BIND_HOST`; both unset → "" (loopback
+ * via resolveBindHost).
+ */
+export function resolveBindHostSetting(
+  setting: string | undefined,
+  env: string | undefined,
+): string {
+  return setting || env || "";
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
   outputChannel.appendLine("[mcp] Activating vscode-mcp-server (cluster mode)...");
@@ -100,6 +127,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // host.docker.internal to the host loopback). Setting/env only needed when
   // the default is wrong for the user's container networking.
   const leaderHost = config.get<string>("leaderHost") || process.env.MCP_LEADER_HOST || "";
+  const bindHost = resolveBindHostSetting(
+    config.get<string>("bindHost"),
+    process.env.MCP_BIND_HOST,
+  );
 
   // Detect remote container
   const remoteName = vscode.env.remoteName;
@@ -107,7 +138,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // sensible default for reaching the host leader.
   const isDevContainer = remoteName === "dev-container";
   const isRemoteContainer = isDevContainer || remoteName === "attached-container";
-  const host = isRemoteContainer ? "0.0.0.0" : "127.0.0.1";
+  const host = resolveBindHost(bindHost);
 
   // Validate TLS config
   const useTls = !!(tlsCertPath && tlsKeyPath);
@@ -118,7 +149,11 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   if (isRemoteContainer) {
-    outputChannel.appendLine("[mcp] Remote container detected — binding to 0.0.0.0");
+    outputChannel.appendLine(
+      isLoopbackHost(host)
+        ? `[mcp] Remote container detected — binding ${host}; VS Code's port forwarding reaches it from the host`
+        : `[mcp] Remote container detected — binding ${host} (non-loopback override)`,
+    );
     outputChannel.appendLine(`[mcp] Ensure devcontainer.json includes: "forwardPorts": [${port}]`);
     if (isDevContainer) {
       const chain = buildCrossBoundaryHosts(leaderHost || undefined, detectDefaultGateway());
@@ -266,10 +301,28 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     const gateway = opts.isDevContainer ? (opts.detectGateway ?? detectDefaultGateway)() : null;
     // Host leaders additionally bind detected Docker bridge addresses so
     // containers can reach them at <gateway>:port (Linux native Docker has
-    // no host.docker.internal magic). Container leaders keep binding 0.0.0.0.
+    // no host.docker.internal magic). Container leaders bind loopback only.
     const bindHosts = opts.isRemoteContainer
       ? [opts.host]
       : buildBindHosts(opts.host, (opts.detectBridges ?? detectBridgeAddresses)());
+    // Sibling windows find the leader by probing loopback, so a leader bound
+    // only to a specific address would be invisible to them and they would
+    // promote a second leader (silent split-brain). Bind loopback alongside
+    // unless the configured host already covers it — loopback itself, or a
+    // wildcard that accepts every local address.
+    if (!bindHosts.some(isLoopbackHost) && !bindHosts.some(isWildcardHost)) {
+      bindHosts.push("127.0.0.1");
+    }
+    // A bind address that is neither an IP literal nor a hostname can never
+    // work, so refuse it once rather than retrying it as if it were transient.
+    // Checked before C1 so a typo is not misreported as an auth failure.
+    if (bindHosts.some((h) => !isUsableBindHost(h))) {
+      throw new ClusterConfigError(
+        `Refusing to start: "${opts.host}" is not a usable bind address ` +
+          "(expected an IP address or hostname). Check the " +
+          "vscode-mcp-server.bindHost setting or the MCP_BIND_HOST environment variable.",
+      );
+    }
     // C1: the member channel proxies tools/call (including shell commands)
     // to every connected worker. Exposing it beyond loopback without a
     // bearer token is remote code execution for anything that can reach
@@ -328,7 +381,7 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
         let msg = `MCP server listening on ${url}`;
         if (opts.isRemoteContainer) {
           msg += " (remote container — use forwarded port)";
-          void ensureContainerForward(opts.basePort, opts.log);
+          void ensureContainerForward(newMember.port, opts.log);
         }
         if (opts.authToken) msg += " [auth enabled]";
         opts.log(msg);
@@ -337,9 +390,10 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
     }
     updateStatusBar(newMember);
   } catch (err) {
-    // C1 is a permanent configuration error: a token will not appear on its
-    // own, so never retry it. Surface it once and stay out of the cluster.
-    if (err instanceof ClusterAuthError) {
+    // Permanent configuration errors (C1, an unusable bind address) never fix
+    // themselves, so do not retry them. Surface once and stay out of the
+    // cluster.
+    if (err instanceof ClusterAuthError || err instanceof ClusterConfigError) {
       opts.log(`Refusing to start cluster: ${err.message}`);
       return;
     }

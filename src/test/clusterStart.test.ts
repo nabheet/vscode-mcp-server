@@ -52,7 +52,7 @@ vi.mock("../mcp/tools/index", () => ({
   registerAllTools: vi.fn(),
 }));
 
-import { deactivate, startCluster } from "../extension";
+import { deactivate, resolveBindHost, resolveBindHostSetting, startCluster } from "../extension";
 import { bootstrapCluster, type ClusterMember } from "../mcp/cluster/bootstrap";
 
 function makeOpts(
@@ -97,6 +97,104 @@ function fakeMember(role: "leader" | "worker" = "leader"): ClusterMember {
 async function settle(): Promise<void> {
   await vi.advanceTimersByTimeAsync(0);
 }
+
+describe("resolveBindHost", () => {
+  it("binds loopback when there is no override", () => {
+    expect(resolveBindHost("")).toBe("127.0.0.1");
+    expect(resolveBindHost(undefined)).toBe("127.0.0.1");
+  });
+
+  it("treats a whitespace-only override as unset", () => {
+    expect(resolveBindHost("   ")).toBe("127.0.0.1");
+    expect(resolveBindHost("\t")).toBe("127.0.0.1");
+  });
+
+  it("honours an explicit override, trimmed (C1 then requires a token for non-loopback)", () => {
+    expect(resolveBindHost("0.0.0.0")).toBe("0.0.0.0");
+    expect(resolveBindHost("  192.168.1.10  ")).toBe("192.168.1.10");
+  });
+});
+
+describe("resolveBindHostSetting", () => {
+  it("prefers the setting over the environment variable", () => {
+    expect(resolveBindHostSetting("0.0.0.0", "10.0.0.1")).toBe("0.0.0.0");
+    expect(resolveBindHostSetting("", "10.0.0.1")).toBe("10.0.0.1");
+    expect(resolveBindHostSetting(undefined, "10.0.0.1")).toBe("10.0.0.1");
+    expect(resolveBindHostSetting(undefined, undefined)).toBe("");
+  });
+});
+
+describe("startCluster bind hosts", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(bootstrapCluster).mockReset();
+  });
+
+  afterEach(() => {
+    deactivate();
+    vi.useRealTimers();
+  });
+
+  it("refuses a container 0.0.0.0 bind without a token (C1)", async () => {
+    const log = vi.fn();
+    await startCluster(
+      makeOpts(log, { isRemoteContainer: true, isDevContainer: true, host: "0.0.0.0" }),
+    );
+    expect(vi.mocked(bootstrapCluster)).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Refusing to start"));
+  });
+
+  it("starts a container 0.0.0.0 bind when a token is set", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    await startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        isDevContainer: true,
+        host: "0.0.0.0",
+        authToken: "t",
+      }),
+    );
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs.host).toBe("0.0.0.0");
+    // A wildcard already accepts loopback traffic; no secondary bind is added.
+    expect(callArgs).not.toHaveProperty("hosts");
+  });
+
+  it("binds loopback alongside a specific non-loopback host", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    await startCluster(
+      makeOpts(log, {
+        isRemoteContainer: true,
+        isDevContainer: true,
+        host: "172.17.0.5",
+        authToken: "t",
+      }),
+    );
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs.hosts).toContain("127.0.0.1");
+  });
+
+  it("adds no secondary loopback bind for the default loopback host", async () => {
+    const log = vi.fn();
+    vi.mocked(bootstrapCluster).mockResolvedValue(fakeMember());
+    await startCluster(makeOpts(log));
+    const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("hosts");
+  });
+
+  it("refuses an unusable bind address once, without retrying", async () => {
+    const log = vi.fn();
+    await startCluster(makeOpts(log, { host: "not a host" }));
+    expect(vi.mocked(bootstrapCluster)).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("not a usable bind address"));
+    // A configuration error is permanent: no FATAL retry may be scheduled.
+    await vi.advanceTimersByTimeAsync(60000);
+    await settle();
+    expect(vi.mocked(bootstrapCluster)).not.toHaveBeenCalled();
+  });
+});
 
 describe("startCluster FATAL retry", () => {
   beforeEach(() => {
