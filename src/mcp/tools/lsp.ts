@@ -337,10 +337,13 @@ export function registerLspTools(server: ToolRegistrar): void {
             return { content: [{ type: "text", text: "No symbols found" }], isError: false };
           const lines: string[] = [];
           function flattenSymbol(s: vscode.DocumentSymbol | vscode.SymbolInformation): void {
-            const range = "location" in s ? s.location.range : s.range;
-            lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${range.start.line + 1}`);
-            if ("children" in s) {
-              for (const child of s.children) flattenSymbol(child);
+            const range = "location" in s ? s.location?.range : s.range;
+            if (range) {
+              lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${range.start.line + 1}`);
+            }
+            const children = "children" in s ? s.children : undefined;
+            if (Array.isArray(children)) {
+              for (const child of children) flattenSymbol(child);
             }
           }
           for (const s of symbols) flattenSymbol(s);
