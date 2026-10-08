@@ -82,6 +82,16 @@ const mockCommands = {
   getCommands: vi.fn().mockResolvedValue(["cmd1", "cmd2"]),
 };
 
+/** Minimal reverse mapping for `vscode.SymbolKind[kind]` lookups in lsp.ts. */
+const mockSymbolKind: Record<number, string> = {
+  0: "File",
+  1: "Module",
+  2: "Namespace",
+  3: "Package",
+  4: "Class",
+  5: "Method",
+};
+
 // Build the mock vscode module
 const mockVscode = {
   Uri: mockUri,
@@ -96,6 +106,7 @@ const mockVscode = {
   env: mockEnv,
   commands: mockCommands,
   debug: mockDebug,
+  SymbolKind: mockSymbolKind,
   // For ExtensionContext type used in path.ts indirectly
   ExtensionContext: class {
     subscriptions: { dispose: () => void }[] = [];

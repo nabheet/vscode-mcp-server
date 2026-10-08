@@ -64,6 +64,15 @@ function isDocumentDiagnostics(value: unknown): value is DocumentDiagnostics {
   return typeof value === "object" && value !== null && "uri" in value && "diagnostics" in value;
 }
 
+/** Arrays and other iterables — main iterated any truthy `children` value. */
+function isIterable(value: unknown): value is Iterable<unknown> {
+  return (
+    value !== null &&
+    value !== undefined &&
+    typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === "function"
+  );
+}
+
 export function registerLspTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
@@ -348,9 +357,11 @@ export function registerLspTools(server: ToolRegistrar): void {
             if (range) {
               lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${range.start.line + 1}`);
             }
-            const children = "children" in s ? s.children : undefined;
-            if (Array.isArray(children)) {
-              for (const child of children) flattenSymbol(child);
+            const children: unknown = "children" in s ? s.children : undefined;
+            if (isIterable(children)) {
+              for (const child of children) {
+                flattenSymbol(child as vscode.DocumentSymbol | vscode.SymbolInformation);
+              }
             }
           }
           for (const s of symbols) flattenSymbol(s);
