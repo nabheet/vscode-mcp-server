@@ -121,7 +121,7 @@ export function registerTerminalTools(
       },
       async (args) => {
         const cmd = String(args.command);
-        const termName = String(args.name || "mcp-" + Date.now());
+        const termName = String(args.name || `mcp-${Date.now()}`);
         const term = getOrCreateTerminal(termName);
 
         term.show();
@@ -134,7 +134,7 @@ export function registerTerminalTools(
         }
 
         return {
-          content: [{ type: "text", text: 'Executed command in terminal "' + termName + '"' }],
+          content: [{ type: "text", text: `Executed command in terminal "${termName}"` }],
           isError: false,
         };
       },
@@ -189,7 +189,7 @@ export function registerTerminalTools(
         }
 
         const text =
-          buffer.length > maxChars ? "...(truncated)\n" + buffer.slice(-maxChars) : buffer;
+          buffer.length > maxChars ? `...(truncated)\n${buffer.slice(-maxChars)}` : buffer;
         return { content: [{ type: "text", text }], isError: false };
       },
     ),

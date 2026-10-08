@@ -38,7 +38,7 @@ function truncateVariables(rows: unknown[]): { text: string; note: string } {
   }
   if (Buffer.byteLength(text, "utf8") > MAX_VARS_BYTES) {
     notes.push("output truncated at 200 KB");
-    return { text: text.slice(0, MAX_VARS_BYTES) + "\n…", note: notes.join("; ") };
+    return { text: `${text.slice(0, MAX_VARS_BYTES)}\n…`, note: notes.join("; ") };
   }
   return { text, note: notes.join("; ") };
 }
@@ -54,6 +54,43 @@ async function dapRequest<T>(
     DAP_TIMEOUT_MS,
     `Debugger request '${command}' timed out after ${DAP_TIMEOUT_MS / 1000}s (adapter unresponsive — is it paused on a slow operation?)`,
   );
+}
+
+/** Minimal DAP response shapes for the requests these tools issue. */
+interface DapThread {
+  id: number;
+  name: string;
+}
+interface DapStackFrame {
+  id: number;
+  name: string;
+  line: number;
+  source?: { path?: string };
+}
+interface DapScope {
+  name: string;
+  variablesReference: number;
+}
+interface DapVariable {
+  name: string;
+  value: string;
+  type?: string;
+  variablesReference: number;
+}
+interface DapThreadsResponse {
+  threads?: DapThread[];
+}
+interface DapStackTraceResponse {
+  stackFrames?: DapStackFrame[];
+}
+interface DapScopesResponse {
+  scopes?: DapScope[];
+}
+interface DapVariablesResponse {
+  variables?: DapVariable[];
+}
+interface DapEvaluateResponse {
+  result?: string;
 }
 
 /**
@@ -90,7 +127,7 @@ async function readWorkspaceFileLaunchSection(): Promise<WorkspaceLaunchSection 
     | undefined;
   const uri: vscode.Uri | undefined =
     wsFile && "uri" in wsFile ? wsFile.uri : (wsFile as vscode.Uri | undefined);
-  if (!uri || uri.scheme !== "file") return undefined;
+  if (uri?.scheme !== "file") return undefined;
   try {
     const buf = await vscode.workspace.fs.readFile(uri);
     const json = parseJsonc<{ launch?: WorkspaceLaunchSection }>(Buffer.from(buf).toString("utf8"));
@@ -360,7 +397,7 @@ export function registerDebugTools(server: ToolRegistrar): void {
             if (!timedOut) {
               throw err;
             }
-            detail = detail ? detail + " (launch timed out)" : " (launch timed out)";
+            detail = detail ? `${detail} (launch timed out)` : " (launch timed out)";
           }
 
           if (!success) {
@@ -631,10 +668,10 @@ export function registerDebugTools(server: ToolRegistrar): void {
           return { content: [{ type: "text", text: "No active debug session" }], isError: true };
         try {
           // Get stack frames first, then variables from top frame
-          const threads = await dapRequest<any>(session, "threads");
+          const threads = await dapRequest<DapThreadsResponse>(session, "threads");
           if (!threads?.threads?.length)
             return { content: [{ type: "text", text: "No threads available" }], isError: true };
-          const stack = await dapRequest<any>(session, "stackTrace", {
+          const stack = await dapRequest<DapStackTraceResponse>(session, "stackTrace", {
             threadId: threads.threads[0].id,
           });
           if (!stack?.stackFrames?.length)
@@ -642,16 +679,18 @@ export function registerDebugTools(server: ToolRegistrar): void {
               content: [{ type: "text", text: "No stack frames (is debugger paused?)" }],
               isError: true,
             };
-          const scopes = await dapRequest<any>(session, "scopes", {
+          const scopes = await dapRequest<DapScopesResponse>(session, "scopes", {
             frameId: stack.stackFrames[0].id,
           });
           const varsRef = scopes?.scopes?.[0]?.variablesReference;
           if (!varsRef)
             return { content: [{ type: "text", text: "No variables in scope" }], isError: true };
-          const vars = await dapRequest<any>(session, "variables", { variablesReference: varsRef });
+          const vars = await dapRequest<DapVariablesResponse>(session, "variables", {
+            variablesReference: varsRef,
+          });
           const { text, note } = truncateVariables(vars?.variables || []);
           return {
-            content: [{ type: "text", text: note ? text + "\n" + note : text }],
+            content: [{ type: "text", text: note ? `${text}\n${note}` : text }],
             isError: false,
           };
         } catch (err) {
@@ -682,16 +721,17 @@ export function registerDebugTools(server: ToolRegistrar): void {
         if (!session)
           return { content: [{ type: "text", text: "No active debug session" }], isError: true };
         try {
-          const threads = await dapRequest<any>(session, "threads");
+          const threads = await dapRequest<DapThreadsResponse>(session, "threads");
           if (!threads?.threads?.length)
             return { content: [{ type: "text", text: "No threads" }], isError: true };
-          const stack = await dapRequest<any>(session, "stackTrace", {
+          const stack = await dapRequest<DapStackTraceResponse>(session, "stackTrace", {
             threadId: threads.threads[0].id,
           });
           if (!stack?.stackFrames?.length)
             return { content: [{ type: "text", text: "No stack frames" }], isError: true };
           const lines = stack.stackFrames.map(
-            (f: any) => `${f.name}${f.source?.path ? ` at ${f.source.path}:${f.line}` : ""}`,
+            (f: DapStackFrame) =>
+              `${f.name}${f.source?.path ? ` at ${f.source.path}:${f.line}` : ""}`,
           );
           return { content: [{ type: "text", text: lines.join("\n") }], isError: false };
         } catch (err) {
@@ -725,9 +765,9 @@ export function registerDebugTools(server: ToolRegistrar): void {
           // Resolve top stack frame for frame-scoped evaluation (locals)
           let frameId: number | undefined;
           try {
-            const threads = await dapRequest<any>(session, "threads");
+            const threads = await dapRequest<DapThreadsResponse>(session, "threads");
             if (threads?.threads?.length) {
-              const stack = await dapRequest<any>(session, "stackTrace", {
+              const stack = await dapRequest<DapStackTraceResponse>(session, "stackTrace", {
                 threadId: threads.threads[0].id,
               });
               frameId = stack?.stackFrames?.[0]?.id;
@@ -735,14 +775,14 @@ export function registerDebugTools(server: ToolRegistrar): void {
           } catch {
             // Not paused — fall through to global-scope eval
           }
-          const result = await dapRequest<any>(session, "evaluate", {
+          const result = await dapRequest<DapEvaluateResponse>(session, "evaluate", {
             expression: String(args.expression),
             context: "repl",
             ...(frameId !== undefined ? { frameId } : {}),
           });
           let out = result?.result || String(result);
           if (out.length > EVAL_RESULT_MAX_CHARS) {
-            out = out.slice(0, EVAL_RESULT_MAX_CHARS) + "\n…result truncated at 100 KB…";
+            out = `${out.slice(0, EVAL_RESULT_MAX_CHARS)}\n…result truncated at 100 KB…`;
           }
           return { content: [{ type: "text", text: out }], isError: false };
         } catch (err) {

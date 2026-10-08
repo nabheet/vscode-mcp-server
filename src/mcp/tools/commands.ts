@@ -25,7 +25,7 @@ export function registerCommandsTools(server: ToolRegistrar): void {
         const command = String(args.command);
         const cmdArgs = Array.isArray(args.args) ? args.args : [];
         console.warn(
-          "[vscode-mcp-server] execute_command: " + command + " args=" + JSON.stringify(cmdArgs),
+          `[vscode-mcp-server] execute_command: ${command} args=${JSON.stringify(cmdArgs)}`,
         );
         try {
           const result = await vscode.commands.executeCommand(command, ...cmdArgs);
@@ -35,7 +35,7 @@ export function registerCommandsTools(server: ToolRegistrar): void {
               ? `Command '${command}' executed successfully (no return value)`
               : `Command '${command}' returned: ${JSON.stringify(result)}`;
           if (text.length > MAX_RESULT_CHARS) {
-            text = text.slice(0, MAX_RESULT_CHARS) + "\n…result truncated at 100 KB…";
+            text = `${text.slice(0, MAX_RESULT_CHARS)}\n…result truncated at 100 KB…`;
           }
           return { content: [{ type: "text", text }], isError: false };
         } catch (err) {

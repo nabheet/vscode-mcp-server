@@ -148,7 +148,7 @@ export class ToolExecutor {
         .observe(durMs / 1000);
       this.metrics.counterInc("vscode_mcp_tool_total", "Total tool calls dispatched");
       if (response.error) {
-        const msg = response.error.message || "code " + response.error.code;
+        const msg = response.error.message || `code ${response.error.code}`;
         this.metrics.recordError(toolName, msg);
         this.metrics.counterInc("vscode_mcp_tool_errors", "Tool calls that returned an error");
         this.fileLog?.log({ type: "tool", tool: toolName, ok: false, durMs, error: msg });

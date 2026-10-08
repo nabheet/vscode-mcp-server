@@ -293,7 +293,9 @@ export async function startCluster(opts: ClusterStartOptions): Promise<void> {
       host: opts.host,
       ...(bindHosts.length > 1 ? { hosts: bindHosts } : {}),
       ...(opts.authToken ? { authToken: opts.authToken } : {}),
-      ...(opts.tlsCertPath ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath! } : {}),
+      ...(opts.tlsCertPath && opts.tlsKeyPath
+        ? { tlsCertPath: opts.tlsCertPath, tlsKeyPath: opts.tlsKeyPath }
+        : {}),
       ...(opts.isDevContainer
         ? { crossBoundaryHosts: buildCrossBoundaryHosts(opts.leaderHost, gateway) }
         : opts.leaderHost

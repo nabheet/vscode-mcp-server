@@ -1,4 +1,4 @@
-import * as path from "path";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { resolvePath } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";

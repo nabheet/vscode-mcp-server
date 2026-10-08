@@ -8,9 +8,9 @@
  * incl. realpath for symlink escape). Read-only tools.
  */
 
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type * as vscode from "vscode";
 import { defineTool, type ToolRegistrar } from "./index";
 
@@ -80,9 +80,9 @@ function newestSession(logsRoot: string): string | undefined {
 }
 
 function formatBytes(n: number): string {
-  if (n < 1024) return n + " B";
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
-  return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /** Safe tail of a file: boundary-checked, big-file aware, optional grep. */
@@ -131,7 +131,7 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
         if (!logsRoot) {
           out.push("VS Code logs root not found");
         } else {
-          out.push("VS Code logs root: " + logsRoot);
+          out.push(`VS Code logs root: ${logsRoot}`);
           const dirs: string[] = [];
           for (const entry of fs.readdirSync(logsRoot, { withFileTypes: true })) {
             if (entry.isDirectory()) dirs.push(entry.name);
