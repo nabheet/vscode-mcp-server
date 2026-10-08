@@ -9,7 +9,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Cancel superseded runs for the SAME PR only. Never cancel a push to main:
+  # cancellation kills the whole run, including its `publish` job, and the
+  # follow-up non-shipping push then skips — losing the release entirely.
+  # github.head_ref is set only on pull_request events, so main pushes and
+  # workflow_dispatch fall back to the unique run id and never cancel each
+  # other. `publish` serialises itself via its own `group: publish`.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -189,12 +195,14 @@ jobs:
   # RELEASE RULE (enforced by the "changes" step below): publish UNLESS every
   # path changed by this push is non-shipping.
   #   * NON-shipping (never cuts a release): package-lock.json, .github/**,
-  #     and package.json when its only diffs are version and/or inert
-  #     devDependencies (@types/*, vitest, biome, markdownlint, test-electron).
+  #     and package.json when its only diffs are version and/or the INERT
+  #     devDependencies (the allowlist in the step below: @types/*, vitest,
+  #     biome, markdownlint, test-electron).
   #   * Everything else ships: src/** (compiled into out/extension.js),
   #     README.md and other VSIX files (README is bundled into the extension),
-  #     and package.json when any shipping field changes — including a
-  #     typescript or @vscode/vsce bump, which change the build/packaging.
+  #     and package.json when any shipping field changes. A devDependency bump
+  #     ships UNLESS the dep is on the inert list — so typescript, @vscode/vsce,
+  #     or any future bundler/compiler plugin still cuts a release.
   # This is what stops a dependabot devDependency merge (which only moves
   # package.json devDependencies + package-lock.json) from cutting a release.
   #
@@ -263,27 +271,29 @@ jobs:
           fi
 
           # Squash merges make before..sha exactly the merged PR's diff.
-          changed_paths="$(git diff --name-only "$BEFORE" "$SHA")"
+          # --no-renames: with rename detection on, `--name-only` reports only
+          # the NEW path of a rename, so a rename INTO a non-shipping path would
+          # hide the shipping source (e.g. `git mv src/a.ts .github/a.ts`).
+          changed_paths="$(git diff --no-renames --name-only "$BEFORE" "$SHA")"
           echo "Paths changed by ${BEFORE}..${SHA}:"
           printf '%s\n' "$changed_paths"
 
-          # package.json ships when any field other than version and inert
-          # devDependencies differs. A typescript (compiler) or @vscode/vsce
-          # (packager) bump is NOT inert — it can change the built extension —
-          # so those two are kept in the comparison. Inert devDeps (@types/*,
-          # vitest, biome, markdownlint, test-electron) are dropped. jq -S
-          # normalises key order; on any error (e.g. file absent) treat it as
-          # shipping.
-          SHIPPING_DEVDEPS='["typescript","@vscode/vsce"]'
+          # package.json ships when any field other than version and an INERT
+          # devDependency differs. INERT is the explicit list below (build/test/
+          # lint only, never in the VSIX); EVERYTHING ELSE defaults to shipping,
+          # so an unknown or future devDep — a bundler, a compiler plugin —
+          # still cuts a release when bumped. jq -S normalises key order; on any
+          # error (e.g. file absent) treat it as shipping.
+          INERT_DEVDEPS='["@types/node","@types/vscode","vitest","@biomejs/biome","markdownlint-cli2","@vscode/test-electron"]'
           pkg_shipping_changed() {
             local before after
             local normalise='del(.version)
               | if has("devDependencies")
-                then .devDependencies |= with_entries(select(.key as $k | $devdeps | index($k)))
+                then .devDependencies |= with_entries(select(.key as $k | ($inert | index($k)) | not))
                 else . end
               | if (.devDependencies // {}) == {} then del(.devDependencies) else . end'
-            before="$(git show "${BEFORE}:package.json" 2>/dev/null | jq -S --argjson devdeps "$SHIPPING_DEVDEPS" "$normalise")" || return 0
-            after="$(git show "${SHA}:package.json" 2>/dev/null | jq -S --argjson devdeps "$SHIPPING_DEVDEPS" "$normalise")" || return 0
+            before="$(git show "${BEFORE}:package.json" 2>/dev/null | jq -S --argjson inert "$INERT_DEVDEPS" "$normalise")" || return 0
+            after="$(git show "${SHA}:package.json" 2>/dev/null | jq -S --argjson inert "$INERT_DEVDEPS" "$normalise")" || return 0
             [ "$before" != "$after" ]
           }
 
