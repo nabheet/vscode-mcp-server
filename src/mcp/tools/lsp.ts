@@ -339,7 +339,9 @@ export function registerLspTools(server: ToolRegistrar): void {
             return { content: [{ type: "text", text: "No symbols found" }], isError: false };
           const lines: string[] = [];
           function flattenSymbol(s: vscode.DocumentSymbol | vscode.SymbolInformation): void {
-            const range = "location" in s ? s.location?.range : s.range;
+            const located = "location" in s ? s.location : undefined;
+            const own = "range" in s ? s.range : undefined;
+            const range = located?.range ?? own;
             if (range) {
               lines.push(`${s.name} (${vscode.SymbolKind[s.kind]}) at ${range.start.line + 1}`);
             }
