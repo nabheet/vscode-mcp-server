@@ -4,7 +4,15 @@ All publishing happens from GitHub Actions — no local login needed.
 
 ## Stable (auto on merge to main)
 
-Squash-merge any PR to `main`. The workflow:
+Squash-merge any PR to `main`. The workflow publishes only when the merge
+changed what actually ships. A merge whose every changed path is non-shipping
+is skipped — `package-lock.json`, `.github/**`, or `package.json` with only
+`version` and/or inert-devDependency changes. So a dependabot devDependency
+bump does not cut a release. A devDependency that can affect the build
+(`typescript`, `@vscode/vsce`, or anything not on the inert list) still
+publishes, and manual `workflow_dispatch` always publishes.
+
+When it does publish, the workflow:
 
 1. Runs `vsce publish patch --no-git-tag-version` — vsce bumps the patch
    version in `package.json` locally and publishes the VSIX to the

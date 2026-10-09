@@ -9,7 +9,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Cancel superseded runs for the SAME PR only. Never cancel a push to main:
+  # cancellation kills the whole run, including its `publish` job, and the
+  # follow-up non-shipping push then skips — losing the release entirely.
+  # github.head_ref is set only on pull_request events, so main pushes and
+  # workflow_dispatch fall back to the unique run id and never cancel each
+  # other. `publish` serialises itself via its own `group: publish`.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -185,9 +191,25 @@ jobs:
 
   # Stable publish to the Marketplace. Runs on push to main (post-merge
   # auto-publish) and manual dispatch. Uses a PAT (VSCE_PAT), not OIDC.
-  # Do not re-publish when the push is the version sync-back squash merge
-  # (its commit message starts with "chore: bump version to v"); workflow_dispatch
-  # always runs (head_commit null).
+  #
+  # RELEASE RULE (enforced by the "changes" step below): publish UNLESS every
+  # path changed by this push is non-shipping.
+  #   * NON-shipping (never cuts a release): package-lock.json, .github/**,
+  #     and package.json when its only diffs are version and/or the INERT
+  #     devDependencies (the allowlist in the step below: @types/*, vitest,
+  #     biome, markdownlint, test-electron).
+  #   * Everything else ships: src/** (compiled into out/extension.js),
+  #     README.md and other VSIX files (README is bundled into the extension),
+  #     and package.json when any shipping field changes. A devDependency bump
+  #     ships UNLESS the dep is on the inert list — so typescript, @vscode/vsce,
+  #     or any future bundler/compiler plugin still cuts a release.
+  # This is what stops a dependabot devDependency merge (which only moves
+  # package.json devDependencies + package-lock.json) from cutting a release.
+  #
+  # The `if:` below is kept as belt-and-braces: it still drops the version
+  # sync-back squash merge (message "chore: bump version to vX.Y.Z (#N)") at the
+  # job level, before a runner starts. workflow_dispatch always runs (head_commit
+  # is null) and has no `before` commit, so the step below short-circuits it.
   publish:
     if: >-
       github.event_name != 'pull_request' &&
@@ -204,26 +226,126 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The "changes" step below diffs github.event.before..github.sha.
+          # actions/checkout is SHALLOW by default and omits the before commit,
+          # so `git diff` would fail (or, worse, the guard would look correct and
+          # never fire). Full history makes the diff always valid.
+          fetch-depth: 0
+
+      # Implements the RELEASE RULE documented on the job above. Lists the paths
+      # this push changed and writes changed=true|false to $GITHUB_OUTPUT; every
+      # later step is gated on that, so a non-shipping push produces no build,
+      # no publish, no tag, no Release, and no version-sync PR.
+      - name: Determine whether the push changed shipping files
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          emit() { # $1 = true|false (written to the step output), $2 = log line
+            echo "changed=$1" >> "$GITHUB_OUTPUT"
+            echo "$2"
+          }
+
+          # Manual runs carry no `before`: a human explicitly asked to release.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            emit true "workflow_dispatch: publishing"
+            exit 0
+          fi
+
+          # Empty or all-zero `before` (new branch): nothing to diff.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            emit true "no usable before commit: publishing"
+            exit 0
+          fi
+
+          # Shallow-checkout trap. If the before commit is not present, fail
+          # loudly instead of skipping (or falsely publishing) a release.
+          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "::error::before commit ${BEFORE} is not in this checkout; actions/checkout needs fetch-depth: 0"
+            exit 1
+          fi
+
+          # Squash merges make before..sha exactly the merged PR's diff.
+          # --no-renames: with rename detection on, `--name-only` reports only
+          # the NEW path of a rename, so a rename INTO a non-shipping path would
+          # hide the shipping source (e.g. `git mv src/a.ts .github/a.ts`).
+          changed_paths="$(git diff --no-renames --name-only "$BEFORE" "$SHA")"
+          echo "Paths changed by ${BEFORE}..${SHA}:"
+          printf '%s\n' "$changed_paths"
+
+          # package.json ships when any field other than version and an INERT
+          # devDependency differs. INERT is the explicit list below (build/test/
+          # lint only, never in the VSIX); EVERYTHING ELSE defaults to shipping,
+          # so an unknown or future devDep — a bundler, a compiler plugin —
+          # still cuts a release when bumped. jq -S normalises key order; on any
+          # error (e.g. file absent) treat it as shipping.
+          INERT_DEVDEPS='["@types/node","@types/vscode","vitest","@biomejs/biome","markdownlint-cli2","@vscode/test-electron"]'
+          pkg_shipping_changed() {
+            local before after
+            local normalise='del(.version)
+              | if has("devDependencies")
+                then .devDependencies |= with_entries(select(.key as $k | ($inert | index($k)) | not))
+                else . end
+              | if (.devDependencies // {}) == {} then del(.devDependencies) else . end'
+            before="$(git show "${BEFORE}:package.json" 2>/dev/null | jq -S --argjson inert "$INERT_DEVDEPS" "$normalise")" || return 0
+            after="$(git show "${SHA}:package.json" 2>/dev/null | jq -S --argjson inert "$INERT_DEVDEPS" "$normalise")" || return 0
+            [ "$before" != "$after" ]
+          }
+
+          publish=false
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              package-lock.json|.github/*)
+                echo "  skip:    $path (non-shipping)"
+                ;;
+              package.json)
+                if pkg_shipping_changed; then
+                  echo "  PUBLISH: $path (a shipping field changed)"
+                  publish=true
+                else
+                  echo "  skip:    $path (only version/inert devDependencies changed)"
+                fi
+                ;;
+              *)
+                echo "  PUBLISH: $path"
+                publish=true
+                ;;
+            esac
+          done <<< "$changed_paths"
+
+          emit "$publish" "RESULT: changed=$publish"
 
       - uses: actions/setup-node@v7
+        if: steps.changes.outputs.changed == 'true'
         with:
           node-version: 24
           cache: npm
 
       - run: npm ci
+        if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 2
 
       - run: npm run compile
+        if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 2
 
       - run: npm test
+        if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 2
 
       - name: Verify PAT
+        if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 1
         run: npx @vscode/vsce verify-pat nabheet
 
       - name: Publish stable (with retry)
+        if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 5
         run: |
           for i in $(seq 1 3); do
@@ -239,14 +361,17 @@ jobs:
 
       - name: Get published version
         id: published
+        if: steps.changes.outputs.changed == 'true'
         run: echo "v=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
 
       - name: Create tag
+        if: steps.changes.outputs.changed == 'true'
         run: |
           git tag v${{ steps.published.outputs.v }}
           git push origin v${{ steps.published.outputs.v }}
 
       - name: Create GitHub Release
+        if: steps.changes.outputs.changed == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.published.outputs.v }}
@@ -271,6 +396,7 @@ jobs:
       # PAT (owner: nabheet) attributes the run to a real user, so CI runs
       # immediately and the auto-merge queue completes on its own.
       - name: Sync version back via auto-PR
+        if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ secrets.GH_SYNC_PAT }}
