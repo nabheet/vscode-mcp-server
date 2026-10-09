@@ -2,7 +2,7 @@
   "name": "vscode-ide-mcp",
   "displayName": "MCP Server for VS Code",
   "description": "VS Code MCP server for AI agents (opencode, Claude, Cursor) — debug, edit, and control VS Code via Model Context Protocol. Debugger, terminal, LSP, file ops (50 tools).",
-  "version": "0.3.55",
+  "version": "0.3.56",
   "publisher": "nabheet",
   "license": "MIT",
   "repository": {
@@ -76,6 +76,12 @@
           "default": "",
           "scope": "machine-overridable",
           "description": "Host a Docker dev-container window probes to find a Leader running on the host (empty string = auto: MCP_LEADER_HOST env var, then host.docker.internal). Only needed when the container cannot reach the host loopback via host.docker.internal (e.g. Linux Docker with a custom extra_hosts entry), or for non-dev-container remotes that want cross-boundary discovery."
+        },
+        "vscode-mcp-server.bindHost": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Bind address. Empty = 127.0.0.1 (loopback only, the default — a dev container needs no more, VS Code's port forwarding reaches it). Set 0.0.0.0 only when bypassing port forwarding (appPort / compose ports:); a non-loopback bind then requires vscode-mcp-server.authToken. A specific address is bound alongside 127.0.0.1 so sibling windows can still find the leader. A value that is neither an IP address nor a hostname is refused at startup."
         }
       }
     }
