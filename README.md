@@ -748,12 +748,16 @@ npx @vscode/vsce package
 
 Publishing is fully automated from GitHub Actions — no local login needed.
 
-**Stable** — every merge to `main` auto-publishes the next patch to the
-[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp):
-`vsce publish patch` bumps `package.json`, publishes, tags `vX.Y.Z`, creates a
-GitHub release (VSIX attached), then syncs the bumped version back to `main`
-via an auto-PR (`chore: bump version to vX.Y.Z`; a job-level guard matching
-the sync-back commit message prevents it from re-triggering publishing).
+**Stable** — merging to `main` auto-publishes the next patch to the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=nabheet.vscode-ide-mcp)
+when the merge changes what ships: `vsce publish patch` bumps `package.json`,
+publishes, tags `vX.Y.Z`, creates a GitHub release (VSIX attached), then syncs
+the bumped version back to `main` via an auto-PR (`chore: bump version to
+vX.Y.Z`; a job-level guard matching the sync-back commit message prevents it
+from re-triggering publishing). A merge that touches only non-shipping paths
+(`package-lock.json`, `.github/**`, or `package.json` with only `version`/inert
+devDependency changes) is skipped, so a dependabot devDependency bump does not
+cut a release. Manual `workflow_dispatch` always publishes.
 
 **Pre-release** — every push to an open PR publishes a unique pre-release
 (`0.9.<workflow-run>`) to the Marketplace pre-release channel. This dedicated
