@@ -5,7 +5,7 @@
 
 Let AI agents read, write, debug, and execute commands in VS Code — just like a
 human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
-server exposes 50 VS Code tools (debugger, terminal, LSP, file ops, commands)
+server exposes 51 VS Code tools (debugger, terminal, LSP, file ops, commands)
 over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ```bash
@@ -110,6 +110,7 @@ VS Code Extension (onStartupFinished)
 | `list_files` | workspace | List files by glob pattern |
 | `read_file` | workspace | Read file content |
 | `read_files` | workspace | Read multiple files in one call (batch, per-file errors inline) |
+| `apply_workspace_edit` | workspace | Apply multi-file edits atomically (ranges, create, delete) |
 | `write_file` | workspace | Write content to a file (creates or overwrites) |
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
@@ -566,7 +567,7 @@ This server supports **both** transports transparently — no configuration
 change needed. Just use `POST /mcp` as the endpoint and the server handles
 everything synchronously.
 
-### Example: tool list (50 tools)
+### Example: tool list (51 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
@@ -574,8 +575,9 @@ When connected, `tools/list` returns schemas for all tools. Key categories:
   `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`,
   `close_all_editors`
 - **Workspace** — `read_file`, `read_files`, `write_file`, `create_file`,
-  `delete_file`, `list_files`, `get_workspace_folders`,
-  `add_workspace_folder`, `update_workspace_folder`, `remove_workspace_folder`
+  `delete_file`, `list_files`, `apply_workspace_edit`,
+  `get_workspace_folders`, `add_workspace_folder`,
+  `update_workspace_folder`, `remove_workspace_folder`
 - **Search** — `search_files`
 - **Debug** — `start_debugging`, `stop_debugging`, `step_over`, `step_into`,
   `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`,
@@ -770,7 +772,8 @@ See `RELEASE.md` for details.
 
 - Workspace file operations target the first workspace root by default. In
   multi-root workspaces, pass `workspaceFolder` to any file tool (`read_file`,
-  `read_files`, `write_file`, `create_file`, `delete_file`, `list_files`,
+  `read_files`, `write_file`, `apply_workspace_edit`, `create_file`,
+  `delete_file`, `list_files`,
   `open_file`, `open_file_at_line`, `open_file_at_position`,
   `reveal_in_explorer`, `add_breakpoint`, `remove_breakpoint`) to operate on a
   specific folder

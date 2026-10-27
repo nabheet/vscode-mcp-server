@@ -541,6 +541,91 @@ describe("multi-root workspace (E2E)", () => {
     expect(text).toContain("src/nope.ts ===\n[error:");
   });
 
+  // ── apply_workspace_edit (atomic batch) ──────────────────────────────
+
+  it("apply_workspace_edit applies text edits, create, and delete in one atomic call", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const target = path.join(tmpDir, "frontend/src/atomic.ts");
+    const created = path.join(tmpDir, "backend/src/created.ts");
+    const doomed = path.join(tmpDir, "backend/src/doomed.ts");
+    fs.writeFileSync(target, "alpha\nbeta\n");
+    fs.writeFileSync(doomed, "delete me\n");
+
+    const res = await mcpRequest(port, "tools/call", {
+      name: "apply_workspace_edit",
+      arguments: {
+        edits: [
+          {
+            path: target,
+            textEdits: [
+              {
+                range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+                newText: "BETA",
+              },
+            ],
+          },
+          { path: created, create: true, content: "// created atomically\n" },
+          { path: doomed, delete: true },
+        ],
+      },
+    });
+
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain("Applied 3 file edit(s) atomically");
+    expect(text).toContain(`${target} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain(`${created} ===\nCreated`);
+    expect(text).toContain(`${doomed} ===\nDeleted`);
+
+    // Disk is the source of truth: poll briefly (the edit lands on disk async).
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const applied = fs.existsSync(target) && fs.readFileSync(target, "utf-8") === "alpha\nBETA\n";
+      if (applied && fs.existsSync(created) && !fs.existsSync(doomed)) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(fs.readFileSync(target, "utf-8")).toBe("alpha\nBETA\n");
+    expect(fs.readFileSync(created, "utf-8")).toBe("// created atomically\n");
+    expect(fs.existsSync(doomed)).toBe(false);
+  });
+
+  it("apply_workspace_edit rejects the whole batch when one entry is invalid", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const untouched = path.join(tmpDir, "frontend/src/untouched.ts");
+    fs.writeFileSync(untouched, "keep me\n");
+
+    const res = await mcpRequest(port, "tools/call", {
+      name: "apply_workspace_edit",
+      arguments: {
+        edits: [
+          {
+            path: untouched,
+            textEdits: [
+              {
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } },
+                newText: "CHANGED",
+              },
+            ],
+          },
+          {
+            path: path.join(tmpDir, "backend/src/does-not-exist.ts"),
+            textEdits: [
+              {
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+                newText: "x",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(res.result.isError).toBe(true);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain("does-not-exist.ts ===\n[error: file does not exist]");
+    expect(fs.readFileSync(untouched, "utf-8")).toBe("keep me\n");
+  });
+
   // ── search_files (grep) ──────────────────────────────────────────────
 
   it("search_files finds literal text with file:line:col", async () => {
