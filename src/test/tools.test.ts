@@ -15,7 +15,7 @@ type MockWorkspace = {
   workspaceFile?: { uri?: vscode.Uri | { fsPath: string }; name?: string };
   fs?: { readFile: unknown; writeFile?: unknown; stat?: unknown };
   findFiles?: unknown;
-  openTextDocument?: unknown;
+  textDocuments?: unknown[];
   applyEdit?: { mockResolvedValue: (v: boolean) => unknown };
   updateWorkspaceFolders?: {
     mockReturnValue: (v: boolean) => unknown;
@@ -315,6 +315,8 @@ describe("handler behavior", () => {
     (vscode.workspace as unknown as MockWorkspace).workspaceFolders = undefined;
     (vscode.workspace as unknown as MockWorkspace).workspaceFile = undefined;
     (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi.fn();
+    (vscode.workspace as unknown as MockWorkspace).applyEdit = vi.fn().mockResolvedValue(true);
+    (vscode.workspace as unknown as MockWorkspace).textDocuments = [];
     (vscode as unknown as { debug: MockDebug }).debug.activeDebugSession = undefined;
     (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [];
     (vscode.debug.startDebugging as unknown as MockDebug["startDebugging"]).mockReset();
@@ -605,15 +607,17 @@ describe("handler behavior", () => {
           ? Promise.resolve(Buffer.from(files[uri.fsPath]))
           : Promise.reject(enoent()),
       );
-    ws.openTextDocument = vi.fn().mockImplementation((uri: vscode.Uri) => {
-      const text = docs[uri.fsPath];
-      if (text === undefined) return Promise.reject(enoent());
-      const lines = text.split("\n");
-      return Promise.resolve({
-        lineCount: lines.length,
-        lineAt: (i: number) => ({ text: lines[i] ?? "" }),
+    // Simulated open editors: only these count as live buffers.
+    ws.textDocuments = Object.entries(docs)
+      .filter(([, text]) => text !== undefined)
+      .map(([fsPath, text]) => {
+        const lines = (text as string).split("\n");
+        return {
+          uri: { fsPath, toString: () => fsPath },
+          lineCount: lines.length,
+          lineAt: (i: number) => ({ text: lines[i] ?? "" }),
+        };
       });
-    });
     ws.applyEdit = vi.fn().mockResolvedValue(true);
   }
 
@@ -820,6 +824,31 @@ describe("handler behavior", () => {
     expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
   });
 
+  it("apply_workspace_edit treats case-variant paths as the same file", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/X.ts": "a\n" });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        { path: "X.ts", delete: true },
+        {
+          path: "x.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+              newText: "b",
+            },
+          ],
+        },
+      ],
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("duplicate entry for the same file");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
   it("apply_workspace_edit rejects columns past the end of a line", async () => {
     const ws = vscode.workspace as unknown as MockWorkspace;
     ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
@@ -869,6 +898,53 @@ describe("handler behavior", () => {
     });
     expect(res.isError, res.content[0].text).toBe(false);
     expect(vscode.workspace.applyEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it("apply_workspace_edit saves documents it dirtied but leaves pre-existing unsaved work", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/a.ts": "a\n", "/ws/frontend/b.ts": "b\n" });
+
+    const saveA = vi.fn().mockResolvedValue(true);
+    const saveB = vi.fn().mockResolvedValue(true);
+    const docB = {
+      uri: { fsPath: "/ws/frontend/b.ts", toString: () => "/ws/frontend/b.ts" },
+      isDirty: true,
+      lineCount: 2,
+      lineAt: () => ({ text: "b" }),
+      save: saveB,
+    };
+    const docA = {
+      uri: { fsPath: "/ws/frontend/a.ts", toString: () => "/ws/frontend/a.ts" },
+      isDirty: true,
+      lineCount: 2,
+      lineAt: () => ({ text: "a" }),
+      save: saveA,
+    };
+    ws.textDocuments = [docB];
+    // The edit dirties both documents; only the one that was clean beforehand is ours to save.
+    (vscode.workspace as unknown as MockWorkspace).applyEdit = vi.fn().mockImplementation(() => {
+      ws.textDocuments = [docB, docA];
+      return Promise.resolve(true);
+    });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const textEdit = (path: string) => ({
+      path,
+      textEdits: [
+        {
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+          newText: "X",
+        },
+      ],
+    });
+    const res = await h({ edits: [textEdit("a.ts"), textEdit("b.ts")] });
+
+    expect(res.isError, res.content[0].text).toBe(false);
+    expect(saveA).toHaveBeenCalledTimes(1);
+    expect(saveB).not.toHaveBeenCalled();
+    expect(res.content[0].text).toContain("Left unsaved (document already had unsaved changes):");
+    expect(res.content[0].text).toContain("/ws/frontend/b.ts");
   });
 
   it("apply_workspace_edit refuses to delete a directory", async () => {

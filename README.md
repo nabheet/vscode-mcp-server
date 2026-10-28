@@ -110,7 +110,7 @@ VS Code Extension (onStartupFinished)
 | `list_files` | workspace | List files by glob pattern |
 | `read_file` | workspace | Read file content |
 | `read_files` | workspace | Read multiple files in one call (batch, per-file errors inline) |
-| `apply_workspace_edit` | workspace | Apply multi-file edits in one batch (ranges, create, delete) |
+| `apply_workspace_edit` | workspace | Multi-file edit batch (ranges, create, delete) |
 | `write_file` | workspace | Write content to a file (creates or overwrites) |
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |

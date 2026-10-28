@@ -48,17 +48,29 @@ interface FileMetrics {
   lineLengths: number[];
 }
 
-/** Line metrics for the document the edit will apply to (live buffer wins over disk). */
+/** Path identity for duplicate detection (case-insensitive filesystems included). */
+function uriKey(uri: vscode.Uri): string {
+  const normalized = path.normalize(uri.fsPath);
+  return process.platform === "darwin" || process.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+/**
+ * Line metrics for the document the edit will apply to.
+ *
+ * An already-open document wins (it may hold unsaved changes the edit will
+ * target), but this never opens one: `openTextDocument` would turn the edit
+ * into an unsaved buffer instead of a disk write.
+ */
 async function fileMetrics(uri: vscode.Uri): Promise<FileMetrics | string> {
-  try {
-    const doc = await vscode.workspace.openTextDocument(uri);
-    if (doc && typeof doc.lineCount === "number" && typeof doc.lineAt === "function") {
-      const lineLengths: number[] = [];
-      for (let i = 0; i < doc.lineCount; i++) lineLengths.push(doc.lineAt(i).text.length);
-      return { lineCount: doc.lineCount, lineLengths };
-    }
-  } catch {
-    /* fall back to the on-disk contents below */
+  const openDoc = vscode.workspace.textDocuments?.find(
+    (doc) => doc.uri.toString() === uri.toString(),
+  );
+  if (openDoc) {
+    const lineLengths: number[] = [];
+    for (let i = 0; i < openDoc.lineCount; i++) lineLengths.push(openDoc.lineAt(i).text.length);
+    return { lineCount: openDoc.lineCount, lineLengths };
   }
   try {
     const bytes = await vscode.workspace.fs.readFile(uri);
@@ -314,7 +326,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "apply_workspace_edit",
-      "Apply multiple edits across files in one VS Code WorkspaceEdit call. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion, and each path may appear once per batch. All entries are validated first; if any entry is invalid nothing is applied and per-file errors are reported inline. On success the whole batch is applied as a single undo step.",
+      "Apply multiple edits across files in one VS Code WorkspaceEdit call. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion, and each path may appear once per batch. All entries are validated first; if any entry is invalid nothing is applied and per-file errors are reported inline. On success the whole batch is applied as a single undo step, and edited buffers are saved to disk unless the file already had unsaved changes.",
       {
         type: "object",
         properties: {
@@ -426,7 +438,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
           // One entry per file: VS Code rejects batches that delete and then
           // edit the same URI, and duplicate creates would concatenate content.
-          const key = uri.toString();
+          const key = uriKey(uri);
           if (seenUris.has(key)) {
             fail("duplicate entry for the same file (edit each path once per batch)");
             continue;
@@ -533,6 +545,15 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           }
         }
 
+        // VS Code applies text edits to editor buffers; only files that were
+        // already open get persisted by the editor's own save rules. Record
+        // which documents were dirty beforehand so we save what we changed —
+        // and only that.
+        const dirtyBefore = new Map<string, boolean>();
+        for (const doc of vscode.workspace.textDocuments ?? []) {
+          dirtyBefore.set(doc.uri.toString(), doc.isDirty === true);
+        }
+
         let applied: boolean;
         try {
           applied = await vscode.workspace.applyEdit(edit);
@@ -559,6 +580,36 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           };
         }
 
+        const saveProblems: string[] = [];
+        const leftDirty: string[] = [];
+        for (const p of planned) {
+          if (p.kind === "delete") continue;
+          const doc = vscode.workspace.textDocuments?.find(
+            (d) => d.uri.toString() === p.uri.toString(),
+          );
+          if (!doc || doc.isDirty !== true || typeof doc.save !== "function") continue;
+          if (dirtyBefore.get(doc.uri.toString()) === true) {
+            leftDirty.push(p.uri.fsPath);
+            continue;
+          }
+          try {
+            await doc.save();
+          } catch (err) {
+            saveProblems.push(`${p.uri.fsPath}: ${errorMessage(err)}`);
+          }
+        }
+        if (saveProblems.length > 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Edit applied in the editor but could not be saved to disk for ${saveProblems.length} file(s):\n${saveProblems.join("\n")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
         const summary = planned.map((p) => {
           if (p.kind === "delete") return `=== ${p.uri.fsPath} ===\nDeleted`;
           if (p.kind === "create") {
@@ -567,11 +618,14 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           }
           return `=== ${p.uri.fsPath} ===\nApplied ${p.textEdits?.length ?? 0} text edit(s)`;
         });
+        const notes = leftDirty.length
+          ? `\n\nLeft unsaved (document already had unsaved changes):\n${leftDirty.join("\n")}`
+          : "";
         return {
           content: [
             {
               type: "text",
-              text: `Applied ${planned.length} file edit(s) in a single workspace edit\n\n${summary.join("\n\n")}`,
+              text: `Applied ${planned.length} file edit(s) in a single workspace edit\n\n${summary.join("\n\n")}${notes}`,
             },
           ],
           isError: false,

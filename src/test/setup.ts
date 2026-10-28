@@ -38,6 +38,7 @@ const mockWorkspace = {
     get: <T>(_: string, defaultValue?: T) => defaultValue,
   }),
   onDidChangeConfiguration: () => ({ dispose: () => {} }),
+  textDocuments: [] as unknown[],
   openTextDocument: vi.fn(),
 };
 
