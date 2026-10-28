@@ -543,13 +543,30 @@ describe("multi-root workspace (E2E)", () => {
 
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
+  /**
+   * Seed a file through VS Code's own filesystem instead of `fs`, so the state
+   * the batch validates against is the state the test just wrote. A batch that
+   * creates or deletes a path is checked against VS Code's file-system view,
+   * and a raw `fs.writeFileSync` can land before the watcher catches up.
+   *
+   * This alone did not stop the intermittent Linux rejection; the batch now
+   * names the refused entry instead of leaving it opaque.
+   */
+  async function seedFile(absPath: string, content: string): Promise<void> {
+    const res = await mcpRequest(port, "tools/call", {
+      name: "write_file",
+      arguments: { path: absPath, content },
+    });
+    expect(res.result.isError, `write_file ${absPath}: ${res.result.content[0].text}`).toBe(false);
+  }
+
   it("apply_workspace_edit applies text edits, create, and delete in one atomic call", async () => {
     if (!ENABLED || !tmpDir) return;
     const target = path.join(tmpDir, "frontend/src/atomic.ts");
     const created = path.join(tmpDir, "backend/src/created.ts");
     const doomed = path.join(tmpDir, "backend/src/doomed.ts");
-    fs.writeFileSync(target, "alpha\nbeta\n");
-    fs.writeFileSync(doomed, "delete me\n");
+    await seedFile(target, "alpha\nbeta\n");
+    await seedFile(doomed, "delete me\n");
 
     const res = await mcpRequest(port, "tools/call", {
       name: "apply_workspace_edit",

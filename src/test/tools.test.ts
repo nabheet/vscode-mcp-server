@@ -796,6 +796,47 @@ describe("handler behavior", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("rejected the batch");
     expect(res.content[0].text).toContain("not guaranteed to be a clean rollback");
+    // VS Code does not say which entry it refused; the tool names it instead.
+    expect(res.content[0].text).toContain("create /ws/frontend/fresh.ts: does not exist");
+    expect(res.content[0].text).toContain("Check the paths in this batch before retrying");
+  });
+
+  it("apply_workspace_edit names an existing path when a delete is refused", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/keep.ts": "a\n" }, {});
+    ws.applyEdit = vi.fn().mockResolvedValue(false);
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({ edits: [{ path: "keep.ts", delete: true }] });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("delete /ws/frontend/keep.ts: exists");
+  });
+
+  it("apply_workspace_edit names a path whose text edits were refused", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/edit.ts": "alpha\n" }, {});
+    ws.applyEdit = vi.fn().mockResolvedValue(false);
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "edit.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+              newText: "ALPHA",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("textEdits /ws/frontend/edit.ts: exists");
   });
 
   it("apply_workspace_edit rejects two entries that resolve to the same file", async () => {
