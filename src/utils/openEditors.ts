@@ -14,33 +14,30 @@ export interface OpenEditor {
   isActive: boolean;
   /** The tab has unsaved changes. */
   isDirty: boolean;
+  /**
+   * The tab is a preview tab: the next file opened in the same group replaces
+   * it instead of adding a tab.
+   */
+  isPreview: boolean;
   /** Index of the containing tab group. */
   group: number;
-}
-
-/**
- * `instanceof` against an API class that a test double may not define. VS Code
- * always defines these; unit-test mocks often stub only the ones in use.
- */
-function isInstance(input: unknown, ctor: unknown): boolean {
-  return typeof ctor === "function" && input instanceof (ctor as new (...a: never[]) => unknown);
 }
 
 function tabUri(tab: vscode.Tab): { uri: vscode.Uri; kind: OpenEditorKind } | undefined {
   const input = tab.input;
   // A diff tab compares two documents; the file on disk (and the one an agent
   // would edit) is the modified side.
-  if (isInstance(input, vscode.TabInputTextDiff)) {
-    return { uri: (input as vscode.TabInputTextDiff).modified, kind: "diff" };
+  if (input instanceof vscode.TabInputTextDiff) {
+    return { uri: input.modified, kind: "diff" };
   }
-  if (isInstance(input, vscode.TabInputText)) {
-    return { uri: (input as vscode.TabInputText).uri, kind: "text" };
+  if (input instanceof vscode.TabInputText) {
+    return { uri: input.uri, kind: "text" };
   }
-  if (isInstance(input, vscode.TabInputNotebook)) {
-    return { uri: (input as vscode.TabInputNotebook).uri, kind: "notebook" };
+  if (input instanceof vscode.TabInputNotebook) {
+    return { uri: input.uri, kind: "notebook" };
   }
-  if (isInstance(input, vscode.TabInputCustom)) {
-    return { uri: (input as vscode.TabInputCustom).uri, kind: "custom" };
+  if (input instanceof vscode.TabInputCustom) {
+    return { uri: input.uri, kind: "custom" };
   }
   return undefined;
 }
@@ -65,6 +62,7 @@ export function collectOpenEditors(): OpenEditor[] {
         isVisible: visible,
         isActive: visible && group.isActive === true,
         isDirty: tab.isDirty === true,
+        isPreview: tab.isPreview === true,
         group: groupIndex,
       });
     }

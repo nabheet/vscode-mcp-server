@@ -1971,6 +1971,7 @@ describe("handler behavior", () => {
     input?: unknown;
     isActive?: boolean;
     isDirty?: boolean;
+    isPreview?: boolean;
   };
   type MockTabGroup = { tabs: MockTab[]; isActive?: boolean };
 
@@ -1979,7 +1980,10 @@ describe("handler behavior", () => {
     (vscode.window as unknown as { tabGroups: { all: MockTabGroup[] } }).tabGroups.all = groups;
   }
 
-  function textTab(fsPath: string, opts: { isActive?: boolean; isDirty?: boolean } = {}): MockTab {
+  function textTab(
+    fsPath: string,
+    opts: { isActive?: boolean; isDirty?: boolean; isPreview?: boolean } = {},
+  ): MockTab {
     return { input: new vscode.TabInputText(vscode.Uri.file(fsPath)), ...opts };
   }
 
@@ -1987,7 +1991,10 @@ describe("handler behavior", () => {
     mockTabGroups([
       {
         isActive: true,
-        tabs: [textTab("/ws/a.ts", { isActive: true, isDirty: true }), textTab("/ws/b.ts")],
+        tabs: [
+          textTab("/ws/a.ts", { isActive: true, isDirty: true }),
+          textTab("/ws/b.ts", { isPreview: true }),
+        ],
       },
       { isActive: false, tabs: [textTab("/ws/c.ts", { isActive: true })] },
     ]);
@@ -1997,13 +2004,22 @@ describe("handler behavior", () => {
 
     expect(res.isError).toBe(false);
     expect(JSON.parse(res.content[0].text)).toEqual([
-      { path: "/ws/a.ts", kind: "text", isVisible: true, isActive: true, isDirty: true, group: 0 },
+      {
+        path: "/ws/a.ts",
+        kind: "text",
+        isVisible: true,
+        isActive: true,
+        isDirty: true,
+        isPreview: false,
+        group: 0,
+      },
       {
         path: "/ws/b.ts",
         kind: "text",
         isVisible: false,
         isActive: false,
         isDirty: false,
+        isPreview: true,
         group: 0,
       },
       {
@@ -2012,6 +2028,7 @@ describe("handler behavior", () => {
         isVisible: true,
         isActive: false,
         isDirty: false,
+        isPreview: false,
         group: 1,
       },
     ]);
@@ -2093,7 +2110,15 @@ describe("handler behavior", () => {
     const res = await h({});
 
     expect(JSON.parse(res.content[0].text)).toEqual([
-      { path: "/ws/a.ts", kind: "diff", isVisible: true, isActive: true, isDirty: false, group: 0 },
+      {
+        path: "/ws/a.ts",
+        kind: "diff",
+        isVisible: true,
+        isActive: true,
+        isDirty: false,
+        isPreview: false,
+        group: 0,
+      },
     ]);
   });
 

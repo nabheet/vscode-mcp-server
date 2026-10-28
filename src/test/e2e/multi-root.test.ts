@@ -1428,8 +1428,26 @@ describe("multi-root workspace (E2E)", () => {
       isVisible: boolean;
       isActive: boolean;
       isDirty: boolean;
+      isPreview: boolean;
       group: number;
     }[];
+  }
+
+  /**
+   * Editor state reaches the tab model asynchronously after a command, so a
+   * single read can observe the previous value. Poll until `done` or 5s.
+   */
+  async function openEditorsUntil(
+    done: (editors: Awaited<ReturnType<typeof openEditors>>) => boolean,
+    timeoutMs = 5000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    let editors = await openEditors();
+    while (!done(editors) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      editors = await openEditors();
+    }
+    return editors;
   }
 
   it("get_open_editors lists an open file with absolute path and flags", async () => {
@@ -1482,6 +1500,8 @@ describe("multi-root workspace (E2E)", () => {
 
     const visible = await openEditors({ includeVisible: true });
     expect(visible.map((e) => e.path)).toEqual([second]);
+    // open_file uses showTextDocument with default options: a preview tab.
+    expect(visible[0].isPreview).toBe(true);
   });
 
   it("get_open_editors flags an editor with unsaved changes", async () => {
@@ -1500,8 +1520,10 @@ describe("multi-root workspace (E2E)", () => {
     });
     expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
 
-    const editors = await openEditors();
-    expect(editors.find((e) => e.path === target)?.isDirty).toBe(true);
+    const editors = await openEditorsUntil((list) =>
+      list.some((e) => e.path === target && e.isDirty),
+    );
+    expect(editors.find((e) => e.path === target)?.isDirty, JSON.stringify(editors)).toBe(true);
 
     // Leave no dirty buffer behind for later tests.
     await mcpRequest(port, "tools/call", {
