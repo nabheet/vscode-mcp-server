@@ -574,20 +574,19 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `write_file ${absPath}: ${res.result.content[0].text}`).toBe(false);
   }
 
-  it("apply_workspace_edit applies text edits, create, and delete in one atomic call", async () => {
+  it("apply_workspace_edit applies text edits across files in one atomic call", async () => {
     if (!ENABLED || !tmpDir) return;
-    const target = path.join(tmpDir, "frontend/src/atomic.ts");
-    const created = path.join(tmpDir, "backend/src/created.ts");
-    const doomed = path.join(tmpDir, "backend/src/doomed.ts");
-    await seedFile(target, "alpha\nbeta\n");
-    await seedFile(doomed, "delete me\n");
+    const first = path.join(tmpDir, "frontend/src/atomic-a.ts");
+    const second = path.join(tmpDir, "backend/src/atomic-b.ts");
+    await seedFile(first, "alpha\nbeta\n");
+    await seedFile(second, "gamma\ndelta\n");
 
     const res = await mcpRequest(port, "tools/call", {
       name: "apply_workspace_edit",
       arguments: {
         edits: [
           {
-            path: target,
+            path: first,
             textEdits: [
               {
                 range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
@@ -595,6 +594,51 @@ describe("multi-root workspace (E2E)", () => {
               },
             ],
           },
+          {
+            path: second,
+            textEdits: [
+              {
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+                newText: "GAMMA",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
+    expect(text).toContain(`${first} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain(`${second} ===\nApplied 1 text edit(s)`);
+
+    // Disk is the source of truth: poll briefly (the edit lands on disk async).
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const applied =
+        fs.readFileSync(first, "utf-8") === "alpha\nBETA\n" &&
+        fs.readFileSync(second, "utf-8") === "GAMMA\ndelta\n";
+      if (applied) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(fs.readFileSync(first, "utf-8")).toBe("alpha\nBETA\n");
+    expect(fs.readFileSync(second, "utf-8")).toBe("GAMMA\ndelta\n");
+  });
+
+  it("apply_workspace_edit creates and deletes in one atomic call", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const created = path.join(tmpDir, "backend/src/created.ts");
+    const doomed = path.join(tmpDir, "backend/src/doomed.ts");
+    // A leftover from a previous attempt would make `create` fail and hide the
+    // behaviour under test, so assert the starting state.
+    expect(fs.existsSync(created), `${created} already exists`).toBe(false);
+    await seedFile(doomed, "delete me\n");
+
+    const res = await mcpRequest(port, "tools/call", {
+      name: "apply_workspace_edit",
+      arguments: {
+        edits: [
           { path: created, create: true, content: "// created atomically\n" },
           { path: doomed, delete: true },
         ],
@@ -603,19 +647,15 @@ describe("multi-root workspace (E2E)", () => {
 
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
-    expect(text).toContain("Applied 3 file edit(s) in a single workspace edit");
-    expect(text).toContain(`${target} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
     expect(text).toContain(`${created} ===\nCreated`);
     expect(text).toContain(`${doomed} ===\nDeleted`);
 
-    // Disk is the source of truth: poll briefly (the edit lands on disk async).
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
-      const applied = fs.existsSync(target) && fs.readFileSync(target, "utf-8") === "alpha\nBETA\n";
-      if (applied && fs.existsSync(created) && !fs.existsSync(doomed)) break;
+      if (fs.existsSync(created) && !fs.existsSync(doomed)) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    expect(fs.readFileSync(target, "utf-8")).toBe("alpha\nBETA\n");
     expect(fs.readFileSync(created, "utf-8")).toBe("// created atomically\n");
     expect(fs.existsSync(doomed)).toBe(false);
   });
