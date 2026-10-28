@@ -327,6 +327,7 @@ describe("handler behavior", () => {
       get: (_key: string, defaultValue?: unknown) => defaultValue,
       has: () => false,
     }));
+    (vscode.workspace as unknown as MockWorkspace).fs.stat = vi.fn();
     (vscode as unknown as { debug: MockDebug }).debug.activeDebugSession = undefined;
     (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [];
     (vscode.window as unknown as { tabGroups: { all: unknown[] } }).tabGroups.all = [];
@@ -2488,5 +2489,154 @@ describe("handler behavior", () => {
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("over the 200 KB limit");
+  });
+
+  // ── get_file_info ────────────────────────────────────────────────────────
+
+  /** Mock `workspace.fs.stat` per absolute path. */
+  function mockStat(entries: Record<string, { type: number; size: number; mtime: number }>): void {
+    (vscode.workspace as unknown as MockWorkspace).fs.stat = vi
+      .fn()
+      .mockImplementation((uri: vscode.Uri) => {
+        const entry = entries[uri.fsPath];
+        if (entry) return Promise.resolve(entry);
+        return Promise.reject(Object.assign(new Error("not found"), { code: "FileNotFound" }));
+      });
+  }
+
+  it("get_file_info returns size, modified and type for a file", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    mockStat({
+      "/ws/backend/src/index.ts": {
+        type: vscode.FileType.File,
+        size: 42,
+        mtime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      },
+    });
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["src/index.ts"] });
+
+    expect(res.isError).toBe(false);
+    const body = res.content[0].text as string;
+    expect(body).toContain("=== /ws/backend/src/index.ts ===");
+    expect(body).toContain(
+      JSON.stringify({
+        exists: true,
+        isDirectory: false,
+        size: 42,
+        modified: "2026-01-02T03:04:05.000Z",
+      }),
+    );
+  });
+
+  it("get_file_info reports a directory as isDirectory", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    mockStat({
+      "/ws/backend/src": { type: vscode.FileType.Directory, size: 0, mtime: 0 },
+    });
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["src"] });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse((res.content[0].text as string).split("\n")[1])).toMatchObject({
+      exists: true,
+      isDirectory: true,
+    });
+  });
+
+  it("get_file_info reports a missing path as exists:false, not an error", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    mockStat({});
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["nope.ts"] });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse((res.content[0].text as string).split("\n")[1])).toEqual({
+      exists: false,
+      isDirectory: false,
+      size: null,
+      modified: null,
+    });
+  });
+
+  it("get_file_info continues a batch past a missing path", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    mockStat({
+      "/ws/backend/b.ts": { type: vscode.FileType.File, size: 2, mtime: 0 },
+    });
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["a.ts", "b.ts"] });
+
+    expect(res.isError).toBe(false);
+    const body = res.content[0].text as string;
+    expect(body).toContain("=== /ws/backend/a.ts ===");
+    expect(body).toContain("=== /ws/backend/b.ts ===");
+    expect(body).toContain('"exists":false');
+    expect(body).toContain('"exists":true');
+  });
+
+  it("get_file_info reports a non-missing stat failure inline and flags the batch", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.stat = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("permission denied"), { code: "NoPermissions" }));
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["secret.ts"] });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("=== /ws/backend/secret.ts ===");
+    expect(res.content[0].text).toContain("[error: permission denied]");
+  });
+
+  it("get_file_info scopes paths to the requested workspace folder", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "frontend", uri: vscode.Uri.file("/ws/frontend") },
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    mockStat({
+      "/ws/backend/app.ts": { type: vscode.FileType.File, size: 1, mtime: 0 },
+    });
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["app.ts"], workspaceFolder: "backend" });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("=== /ws/backend/app.ts ===");
+  });
+
+  it("get_file_info rejects a path outside every workspace folder", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    mockStat({});
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["/etc/passwd"] });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("[error:");
+  });
+
+  it("get_file_info rejects an empty path list", async () => {
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: [] });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("No paths provided");
   });
 });

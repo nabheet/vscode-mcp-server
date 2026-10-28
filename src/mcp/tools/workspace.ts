@@ -688,6 +688,83 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
   server.registerTool(
     defineTool(
+      "get_file_info",
+      'Get metadata (size, modified time, type) for one or more paths in one call. Each result is prefixed with a "=== <path> ===" marker. A path that does not exist is reported inline with exists:false and null size/modified, not as an error; other per-path failures are reported inline without aborting the batch.',
+      {
+        type: "object",
+        properties: {
+          paths: {
+            type: "array",
+            items: {
+              type: "string",
+              description: "File path (absolute or relative to workspace root)",
+            },
+            description: "File paths to stat (absolute or relative to workspace root)",
+          },
+          workspaceFolder: {
+            type: "string",
+            description:
+              "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
+        },
+        required: ["paths"],
+      },
+      async (args) => {
+        const paths: string[] = Array.isArray(args.paths) ? args.paths.map(String) : [];
+        if (paths.length === 0) {
+          return { content: [{ type: "text", text: "No paths provided" }], isError: true };
+        }
+        const folderName = args.workspaceFolder ? String(args.workspaceFolder) : undefined;
+        const parts: string[] = [];
+        let failures = 0;
+        for (const p of paths) {
+          let uri: vscode.Uri;
+          try {
+            uri = resolvePath(p, folderName);
+          } catch (err) {
+            failures++;
+            parts.push(
+              `=== ${p} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`,
+            );
+            continue;
+          }
+          try {
+            const stat = await vscode.workspace.fs.stat(uri);
+            parts.push(
+              `=== ${uri.fsPath} ===\n${JSON.stringify({
+                exists: true,
+                isDirectory: (stat.type & vscode.FileType.Directory) !== 0,
+                size: stat.size,
+                modified: new Date(stat.mtime).toISOString(),
+              })}`,
+            );
+          } catch (err) {
+            // A missing path is a normal answer, not a batch failure.
+            const code = (err as { code?: string }).code;
+            if (code === "FileNotFound" || code === "EntryNotFound") {
+              parts.push(
+                `=== ${uri.fsPath} ===\n${JSON.stringify({
+                  exists: false,
+                  isDirectory: false,
+                  size: null,
+                  modified: null,
+                })}`,
+              );
+            } else {
+              failures++;
+              parts.push(
+                `=== ${uri.fsPath} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`,
+              );
+            }
+          }
+        }
+        return { content: [{ type: "text", text: parts.join("\n\n") }], isError: failures > 0 };
+      },
+    ),
+  );
+
+  server.registerTool(
+    defineTool(
       "write_file",
       "Write content to a file (creates or overwrites).",
       {

@@ -5,7 +5,7 @@
 
 Let AI agents read, write, debug, and execute commands in VS Code — just like a
 human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
-server exposes 53 VS Code tools (debugger, terminal, LSP, file ops, commands)
+server exposes 54 VS Code tools (debugger, terminal, LSP, file ops, commands)
 over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ```bash
@@ -112,6 +112,7 @@ VS Code Extension (onStartupFinished)
 | `read_file` | workspace | Read file content |
 | `read_files` | workspace | Read multiple files in one call (batch, per-file errors inline) |
 | `apply_workspace_edit` | workspace | Multi-file edit batch (ranges, create, delete) |
+| `get_file_info` | workspace | Get size, modified time and type for one or more paths (batch) |
 | `write_file` | workspace | Write content to a file (creates or overwrites) |
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
@@ -569,15 +570,15 @@ This server supports **both** transports transparently — no configuration
 change needed. Just use `POST /mcp` as the endpoint and the server handles
 everything synchronously.
 
-### Example: tool list (53 tools)
+### Example: tool list (54 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
 - **Editor** — `open_file`, `open_file_at_line`, `open_file_at_position`,
   `select_lines`, `reveal_in_explorer`, `focus_editor`, `close_editor`,
   `close_all_editors`, `get_open_editors`
-- **Workspace** — `read_file`, `read_files`, `write_file`, `create_file`,
-  `delete_file`, `list_files`, `apply_workspace_edit`,
+- **Workspace** — `read_file`, `read_files`, `get_file_info`, `write_file`,
+  `create_file`, `delete_file`, `list_files`, `apply_workspace_edit`,
   `get_workspace_folders`, `add_workspace_folder`,
   `update_workspace_folder`, `remove_workspace_folder`
 - **Settings** — `get_configuration`
