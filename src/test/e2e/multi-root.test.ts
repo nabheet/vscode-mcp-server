@@ -339,6 +339,11 @@ describe("multi-root workspace (E2E)", () => {
       JSON.stringify({
         "vscode-mcp-server.port": port,
         "vscode-mcp-server.authToken": E2E_AUTH_TOKEN,
+        // A WorkspaceEdit delete moves the file to the OS trash (the extension
+        // API has no per-edit opt-out). Headless Linux CI has no trash backend,
+        // so the delete fails and applyEdit returns false after the batch has
+        // already partly applied. Keep the tests off the trash service.
+        "files.enableTrash": false,
       }),
     );
 
@@ -561,25 +566,25 @@ describe("multi-root workspace (E2E)", () => {
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
   /**
-   * Type into the active editor until the buffer reports dirty.
+   * Make the active editor's buffer dirty, then confirm it through
+   * get_open_editors.
    *
-   * `type` needs a focused editor group; on a headless window it can resolve
-   * having done nothing, leaving `isDirty` false. Focus the group, type, then
-   * confirm through get_open_editors before the caller relies on the buffer
-   * being dirty.
+   * `editor.action.insertSnippet` falls back to the active editor and needs no
+   * DOM focus, unlike the `type` command, which silently does nothing when the
+   * headless window has no focused editor and still reports success.
    */
   async function typeUntilDirty(text: string, targetPath: string): Promise<void> {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const focused = await mcpRequest(port, "tools/call", {
+      const inserted = await mcpRequest(port, "tools/call", {
         name: "execute_command",
-        arguments: { command: "workbench.action.focusActiveEditorGroup" },
+        arguments: {
+          command: "editor.action.insertSnippet",
+          args: [{ snippet: text }],
+        },
       });
-      expect(focused.result.isError, `focus: ${focused.result.content[0].text}`).toBe(false);
-      const typed = await mcpRequest(port, "tools/call", {
-        name: "execute_command",
-        arguments: { command: "type", args: [{ text }] },
-      });
-      expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+      expect(inserted.result.isError, `insertSnippet: ${inserted.result.content[0].text}`).toBe(
+        false,
+      );
 
       const deadline = Date.now() + 1500;
       while (Date.now() < deadline) {
@@ -600,12 +605,10 @@ describe("multi-root workspace (E2E)", () => {
 
   /**
    * Seed a file through VS Code's own filesystem instead of `fs`, so the state
-   * the batch validates against is the state the test just wrote. A batch that
-   * creates or deletes a path is checked against VS Code's file-system view,
-   * and a raw `fs.writeFileSync` can land before the watcher catches up.
+   * the batch validates against is the state the test just wrote.
    *
-   * This alone did not stop the intermittent Linux rejection; the batch now
-   * names the refused entry instead of leaving it opaque.
+   * This did not fix the Linux rejection: that was the delete step hitting the
+   * OS trash (see `files.enableTrash` in the generated user settings).
    */
   async function seedFile(absPath: string, content: string): Promise<void> {
     const res = await mcpRequest(port, "tools/call", {
