@@ -603,11 +603,28 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           };
         }
         if (!applied) {
+          // VS Code resolves `false` without saying which entry it rejected, so
+          // re-read the state it validated against and name each path.
+          const observed: string[] = [];
+          for (const p of planned) {
+            const stat = await statPath(p.uri);
+            const state =
+              typeof stat === "string"
+                ? `unreadable (${stat})`
+                : stat.exists
+                  ? stat.isDirectory
+                    ? "exists (directory)"
+                    : "exists"
+                  : "does not exist";
+            const open = openDocument(p.uri);
+            const buffer = open ? `, open${open.isDirty === true ? " and dirty" : ""}` : "";
+            observed.push(`${p.kind} ${p.uri.fsPath}: ${state}${buffer}`);
+          }
           return {
             content: [
               {
                 type: "text",
-                text: "Failed to apply workspace edit: VS Code rejected the batch. Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.",
+                text: `Failed to apply workspace edit: VS Code rejected the batch. State now:\n${observed.join("\n")}\nCheck the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
               },
             ],
             isError: true,

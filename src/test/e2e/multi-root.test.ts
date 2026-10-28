@@ -544,10 +544,13 @@ describe("multi-root workspace (E2E)", () => {
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
   /**
-   * Seed a file through VS Code's own filesystem instead of `fs`. A batch that
-   * creates or deletes a path is validated against VS Code's file-system
-   * state, and a raw `fs.writeFileSync` can land before the watcher catches
-   * up — the batch is then rejected intermittently (seen on Linux CI).
+   * Seed a file through VS Code's own filesystem instead of `fs`, so the state
+   * the batch validates against is the state the test just wrote. A batch that
+   * creates or deletes a path is checked against VS Code's file-system view,
+   * and a raw `fs.writeFileSync` can land before the watcher catches up.
+   *
+   * This alone did not stop the intermittent Linux rejection; the batch now
+   * names the refused entry instead of leaving it opaque.
    */
   async function seedFile(absPath: string, content: string): Promise<void> {
     const res = await mcpRequest(port, "tools/call", {
