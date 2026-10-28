@@ -988,7 +988,7 @@ describe("multi-root workspace (E2E)", () => {
       name: "delete_file",
       arguments: { path: fname, workspaceFolder: "backend", useTrash: false },
     });
-    expect(res.result.isError).toBe(false);
+    expect(res.result.isError, res.result.content[0].text as string).toBe(false);
 
     // Verify it's gone
     const readRes = await mcpRequest(port, "tools/call", {
@@ -1020,7 +1020,7 @@ describe("multi-root workspace (E2E)", () => {
       name: "delete_file",
       arguments: { path: fname, useTrash: false },
     });
-    expect(res.result.isError).toBe(false);
+    expect(res.result.isError, res.result.content[0].text as string).toBe(false);
 
     // Verify it's gone from frontend
     const readRes = await mcpRequest(port, "tools/call", {
