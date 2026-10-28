@@ -566,13 +566,15 @@ describe("multi-root workspace (E2E)", () => {
 
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
-  // Unsaved-buffer cases are not reproduced here. Making a buffer dirty needs
-  // user input: `type` and `editor.action.insertSnippet` both resolve without
-  // error and without an edit when the window has no focused editor, which is
-  // what a headless CI window looks like, and no tool edits a buffer without
-  // saving it. The dirty-buffer semantics (`dirtyBefore`, "Left unsaved", never
-  // saving the user's own unsaved work) are covered in tools.test.ts, where the
-  // documents are controlled.
+  // Unsaved-buffer cases are not reproduced here. Neither `type` nor
+  // `editor.action.insertSnippet` marked the buffer dirty on the headless
+  // macOS runner — both resolved without error and without an edit (the case
+  // passed once, then failed). The tools that do leave a buffer dirty make
+  // poor setup for asserting it: `apply_workspace_edit` saves what it changed,
+  // and `rename_symbol` depends on the language server being ready. The
+  // semantics — `dirtyBefore`, "Left unsaved", never saving the user's own
+  // unsaved work — are covered in tools.test.ts with the documents under the
+  // test's control. Nothing now checks `isDirty` against a real tab.
 
   /**
    * Seed a file through VS Code's own filesystem instead of `fs`, so the state
