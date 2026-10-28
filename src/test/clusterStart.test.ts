@@ -38,8 +38,27 @@ vi.mock("vscode", () => ({
   },
   env: { remoteName: undefined },
   StatusBarAlignment: { Right: 1 },
-  TabInputText: class {},
-  TabInputTextDiff: class {},
+  TabInputText: class {
+    constructor(public uri: unknown) {}
+  },
+  TabInputTextDiff: class {
+    constructor(
+      public original: unknown,
+      public modified: unknown,
+    ) {}
+  },
+  TabInputNotebook: class {
+    constructor(
+      public uri: unknown,
+      public notebookType: string,
+    ) {}
+  },
+  TabInputCustom: class {
+    constructor(
+      public uri: unknown,
+      public viewType: string,
+    ) {}
+  },
 }));
 
 vi.mock("../mcp/cluster/bootstrap", () => ({
@@ -52,7 +71,14 @@ vi.mock("../mcp/tools/index", () => ({
   registerAllTools: vi.fn(),
 }));
 
-import { deactivate, resolveBindHost, resolveBindHostSetting, startCluster } from "../extension";
+import * as vscode from "vscode";
+import {
+  currentWindowState,
+  deactivate,
+  resolveBindHost,
+  resolveBindHostSetting,
+  startCluster,
+} from "../extension";
 import { bootstrapCluster, type ClusterMember } from "../mcp/cluster/bootstrap";
 
 function makeOpts(
@@ -494,5 +520,99 @@ describe("startCluster FATAL retry", () => {
     const callArgs = vi.mocked(bootstrapCluster).mock.calls[0][0];
     expect(callArgs).not.toHaveProperty("hosts");
     await p;
+  });
+});
+
+describe("currentWindowState", () => {
+  type Tab = { input: unknown; isActive?: boolean; isDirty?: boolean; isPreview?: boolean };
+  type Group = { tabs: Tab[]; isActive?: boolean };
+
+  function setGroups(groups: Group[]): void {
+    (vscode.window as unknown as { tabGroups: { all: Group[] } }).tabGroups.all = groups;
+  }
+  function file(fsPath: string, scheme = "file") {
+    return { fsPath, scheme, path: fsPath };
+  }
+
+  afterEach(() => setGroups([]));
+
+  it("dedupes a file open in two groups and keeps tab order", () => {
+    setGroups([
+      {
+        isActive: true,
+        tabs: [{ input: new vscode.TabInputText(file("/ws/a.ts")), isActive: true }],
+      },
+      {
+        isActive: false,
+        tabs: [
+          { input: new vscode.TabInputText(file("/ws/a.ts")), isActive: true },
+          { input: new vscode.TabInputText(file("/ws/b.ts")) },
+        ],
+      },
+    ]);
+
+    expect(currentWindowState()).toEqual({
+      activeFile: "/ws/a.ts",
+      openEditors: ["/ws/a.ts", "/ws/b.ts"],
+    });
+  });
+
+  it("reports the on-disk side of a diff tab and includes notebooks", () => {
+    setGroups([
+      {
+        isActive: true,
+        tabs: [
+          {
+            input: new vscode.TabInputTextDiff(file("/ws/a.ts", "git"), file("/ws/a.ts")),
+            isActive: true,
+          },
+          { input: new vscode.TabInputNotebook(file("/ws/n.ipynb"), "jupyter") },
+        ],
+      },
+    ]);
+
+    expect(currentWindowState()).toEqual({
+      activeFile: "/ws/a.ts",
+      openEditors: ["/ws/a.ts", "/ws/n.ipynb"],
+    });
+  });
+
+  it("picks the focused group's active tab, not any visible tab", () => {
+    setGroups([
+      // Visible but unfocused: not the window's active file.
+      {
+        isActive: false,
+        tabs: [{ input: new vscode.TabInputText(file("/ws/b.ts")), isActive: true }],
+      },
+      // Focused, and its active tab is a notebook — no activeTextEditor exists.
+      {
+        isActive: true,
+        tabs: [
+          { input: new vscode.TabInputText(file("/ws/a.ts")) },
+          { input: new vscode.TabInputNotebook(file("/ws/n.ipynb"), "jupyter"), isActive: true },
+        ],
+      },
+    ]);
+
+    expect(currentWindowState()).toEqual({
+      activeFile: "/ws/n.ipynb",
+      openEditors: ["/ws/b.ts", "/ws/a.ts", "/ws/n.ipynb"],
+    });
+  });
+
+  it("has no activeFile when the active tab is not a file", () => {
+    setGroups([
+      {
+        isActive: true,
+        tabs: [{ input: new vscode.TabInputText(file("", "untitled")), isActive: true }],
+      },
+    ]);
+
+    expect(currentWindowState()).toEqual({ openEditors: [] });
+  });
+
+  it("is empty when no editor is open", () => {
+    setGroups([]);
+    expect(currentWindowState()).toEqual({ openEditors: [] });
   });
 });

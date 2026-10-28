@@ -18,6 +18,7 @@ import type { WindowState } from "./mcp/cluster/protocol";
 import { ToolExecutor } from "./mcp/executor";
 import { registerAllTools } from "./mcp/tools/index";
 import { Metrics } from "./utils/metrics";
+import { collectOpenEditors } from "./utils/openEditors";
 import { ServerLog } from "./utils/serverLog";
 
 const OUTPUT_CHANNEL_NAME = "VS Code MCP Server";
@@ -48,24 +49,15 @@ const STARTUP_RETRY_MAX_MS = 30000;
  * list_workspaces, so clients can tell windows apart even when they share
  * a folder and display name.
  */
-function currentWindowState(): WindowState {
+export function currentWindowState(): WindowState {
+  const editors = collectOpenEditors();
   const openEditors: string[] = [];
-  for (const group of vscode.window.tabGroups.all) {
-    for (const tab of group.tabs) {
-      let uri: vscode.Uri | undefined;
-      if (tab.input instanceof vscode.TabInputText) {
-        uri = tab.input.uri;
-      } else if (tab.input instanceof vscode.TabInputTextDiff) {
-        uri = tab.input.modified;
-      }
-      if (uri?.scheme === "file") {
-        const p = uri.fsPath;
-        if (!openEditors.includes(p)) openEditors.push(p);
-      }
-    }
+  for (const editor of editors) {
+    if (!openEditors.includes(editor.path)) openEditors.push(editor.path);
   }
-  const active = vscode.window.activeTextEditor?.document.uri;
-  const activeFile = active?.scheme === "file" ? active.fsPath : undefined;
+  // The active tab, not activeTextEditor: a focused notebook has no
+  // activeTextEditor but is still the file the window is showing.
+  const activeFile = editors.find((editor) => editor.isActive)?.path;
   return activeFile ? { activeFile, openEditors } : { openEditors };
 }
 
