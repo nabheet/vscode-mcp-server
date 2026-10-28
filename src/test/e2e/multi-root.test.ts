@@ -567,10 +567,11 @@ describe("multi-root workspace (E2E)", () => {
    */
   async function typeUntilDirty(text: string, targetPath: string): Promise<void> {
     for (let attempt = 0; attempt < 3; attempt++) {
-      await mcpRequest(port, "tools/call", {
+      const focused = await mcpRequest(port, "tools/call", {
         name: "execute_command",
         arguments: { command: "workbench.action.focusActiveEditorGroup" },
       });
+      expect(focused.result.isError, `focus: ${focused.result.content[0].text}`).toBe(false);
       const typed = await mcpRequest(port, "tools/call", {
         name: "execute_command",
         arguments: { command: "type", args: [{ text }] },
@@ -725,10 +726,9 @@ describe("multi-root workspace (E2E)", () => {
     };
 
     try {
-      let res = await attempt();
-      for (let i = 0; i < 2 && !String(res.result.content[0].text).includes("Left unsaved"); i++) {
-        res = await attempt();
-      }
+      // One attempt: `typeUntilDirty` already handles the harness race, so a
+      // retry here would only hide a real dirty-buffer regression.
+      const res = await attempt();
 
       expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
       expect(res.result.content[0].text).toContain("Left unsaved");
@@ -1581,23 +1581,6 @@ describe("multi-root workspace (E2E)", () => {
     }[];
   }
 
-  /**
-   * Editor state reaches the tab model asynchronously after a command, so a
-   * single read can observe the previous value. Poll until `done` or 5s.
-   */
-  async function openEditorsUntil(
-    done: (editors: Awaited<ReturnType<typeof openEditors>>) => boolean,
-    timeoutMs = 5000,
-  ) {
-    const deadline = Date.now() + timeoutMs;
-    let editors = await openEditors();
-    while (!done(editors) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      editors = await openEditors();
-    }
-    return editors;
-  }
-
   it("get_open_editors lists an open file with absolute path and flags", async () => {
     if (!ENABLED) return;
     const target = path.join(tmpDir as string, "backend/src/listed.ts");
@@ -1662,18 +1645,22 @@ describe("multi-root workspace (E2E)", () => {
       arguments: { path: target },
     });
     expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-    await typeUntilDirty("unsaved\n", target);
+    try {
+      await typeUntilDirty("unsaved\n", target);
 
-    const editors = await openEditorsUntil((list) =>
-      list.some((e) => e.path === target && e.isDirty),
-    );
-    expect(editors.find((e) => e.path === target)?.isDirty, JSON.stringify(editors)).toBe(true);
-
-    // Leave no dirty buffer behind for later tests.
-    await mcpRequest(port, "tools/call", {
-      name: "execute_command",
-      arguments: { command: "workbench.action.files.revert" },
-    });
+      // typeUntilDirty already confirmed the dirty flag; this asserts the tool
+      // reports it too, for the same path.
+      const editors = await openEditors();
+      const entry = editors.find((e) => e.path === target);
+      expect(entry?.isDirty, JSON.stringify(editors)).toBe(true);
+    } finally {
+      // Leave no dirty buffer behind for later tests, even on failure.
+      const reverted = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "workbench.action.files.revert" },
+      });
+      expect(reverted.result.isError, `revert: ${reverted.result.content[0].text}`).toBe(false);
+    }
   });
 
   it("get_open_editors skips untitled buffers", async () => {
