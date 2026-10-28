@@ -10,13 +10,14 @@ const MAX_CONFIG_BYTES = 200 * 1024;
  * before they leave the extension host.
  *
  * Matching is per dotted-path segment: `token` is an end-of-segment suffix
- * (catches `authToken`, `access_token`, `apiToken`,; leaves
+ * (catches `authToken`, `access_token`, `apiToken`; leaves
  * `tokenColorCustomizations` alone), and `auth` / `bearer` match a whole
  * segment only. A section named `credentials` therefore redacts every child.
  *
  * This is a heuristic keyed on names. A secret stored under an innocuous key
  * (e.g. `myExt.value = "ghp_..."`) is not detected; URL userinfo is masked
- * separately in `redactDeep`.
+ * separately in `redactDeep` (best effort: an unencoded `@` inside a password
+ * leaves the text after it unmasked).
  */
 const SECRET_SEGMENT =
   /token$|secret|password|passwd|api[_-]?key|credential|connection[_-]?string|private[_-]?key|authorization|^auth$|^bearer$/i;
