@@ -824,29 +824,94 @@ describe("handler behavior", () => {
     expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
   });
 
-  it("apply_workspace_edit treats case-variant paths as the same file", async () => {
+  /** Run `fn` with `process.platform` stubbed (uriKey's case folding is platform-dependent). */
+  async function withPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
+    const original = process.platform;
+    Object.defineProperty(process, "platform", { value: platform, configurable: true });
+    try {
+      return await fn();
+    } finally {
+      Object.defineProperty(process, "platform", { value: original, configurable: true });
+    }
+  }
+
+  const caseVariantEdits = [
+    { path: "X.ts", delete: true },
+    {
+      path: "x.ts",
+      textEdits: [
+        {
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+          newText: "b",
+        },
+      ],
+    },
+  ];
+
+  it("apply_workspace_edit treats case-variant paths as one file on case-insensitive platforms", async () => {
     const ws = vscode.workspace as unknown as MockWorkspace;
     ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
     mockWorkspaceFiles({ "/ws/frontend/X.ts": "a\n" });
 
     const h = requireHandler(handlers, "apply_workspace_edit");
-    const res = await h({
-      edits: [
-        { path: "X.ts", delete: true },
-        {
-          path: "x.ts",
-          textEdits: [
-            {
-              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
-              newText: "b",
-            },
-          ],
-        },
-      ],
-    });
+    const res = await withPlatform("darwin", () => h({ edits: caseVariantEdits }));
+
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("duplicate entry for the same file");
     expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit keeps case-variant paths distinct on case-sensitive platforms", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/X.ts": "a\n" });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await withPlatform("linux", () => h({ edits: caseVariantEdits }));
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).not.toContain("duplicate entry");
+    expect(res.content[0].text).toContain("file does not exist");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit leaves a dirty buffer alone when the path is spelled differently", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    // Case-insensitive filesystem: both spellings reach the same file.
+    mockWorkspaceFiles({ "/ws/frontend/X.ts": "a\n", "/ws/frontend/x.ts": "a\n" });
+    const save = vi.fn().mockResolvedValue(true);
+    ws.textDocuments = [
+      {
+        uri: { fsPath: "/ws/frontend/X.ts", toString: () => "/ws/frontend/X.ts" },
+        isDirty: true,
+        lineCount: 2,
+        lineAt: () => ({ text: "a" }),
+        save,
+      },
+    ];
+    ws.applyEdit = vi.fn().mockResolvedValue(true);
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await withPlatform("darwin", () =>
+      h({
+        edits: [
+          {
+            path: "x.ts",
+            textEdits: [
+              {
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+                newText: "b",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(res.isError, res.content[0].text).toBe(false);
+    expect(save).not.toHaveBeenCalled();
+    expect(res.content[0].text).toContain("Left unsaved");
   });
 
   it("apply_workspace_edit rejects columns past the end of a line", async () => {
@@ -945,6 +1010,43 @@ describe("handler behavior", () => {
     expect(saveB).not.toHaveBeenCalled();
     expect(res.content[0].text).toContain("Left unsaved (document already had unsaved changes):");
     expect(res.content[0].text).toContain("/ws/frontend/b.ts");
+  });
+
+  it("apply_workspace_edit reports a failed save instead of claiming success", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/ro.ts": "a\n" });
+    const doc = {
+      uri: { fsPath: "/ws/frontend/ro.ts", toString: () => "/ws/frontend/ro.ts" },
+      isDirty: true,
+      lineCount: 2,
+      lineAt: () => ({ text: "a" }),
+      save: vi.fn().mockRejectedValue(new Error("EACCES: permission denied")),
+    };
+    ws.textDocuments = [];
+    ws.applyEdit = vi.fn().mockImplementation(() => {
+      ws.textDocuments = [doc];
+      return Promise.resolve(true);
+    });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "ro.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+              newText: "b",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("could not be saved to disk");
+    expect(res.content[0].text).toContain("EACCES");
   });
 
   it("apply_workspace_edit refuses to delete a directory", async () => {

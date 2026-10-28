@@ -48,9 +48,13 @@ interface FileMetrics {
   lineLengths: number[];
 }
 
-/** Path identity for duplicate detection (case-insensitive filesystems included). */
+/**
+ * File identity used throughout the batch: duplicate detection, the live
+ * document lookup and the save step must all agree, or a differently spelled
+ * path can bypass one of them.
+ */
 function uriKey(uri: vscode.Uri): string {
-  const normalized = path.normalize(uri.fsPath);
+  const normalized = path.normalize(uri.fsPath).normalize("NFC");
   return process.platform === "darwin" || process.platform === "win32"
     ? normalized.toLowerCase()
     : normalized;
@@ -64,8 +68,9 @@ function uriKey(uri: vscode.Uri): string {
  * into an unsaved buffer instead of a disk write.
  */
 async function fileMetrics(uri: vscode.Uri): Promise<FileMetrics | string> {
+  const key = uriKey(uri);
   const openDoc = vscode.workspace.textDocuments?.find(
-    (doc) => doc.uri.toString() === uri.toString(),
+    (doc) => uriKey(doc.uri as vscode.Uri) === key,
   );
   if (openDoc) {
     const lineLengths: number[] = [];
@@ -551,7 +556,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         // and only that.
         const dirtyBefore = new Map<string, boolean>();
         for (const doc of vscode.workspace.textDocuments ?? []) {
-          dirtyBefore.set(doc.uri.toString(), doc.isDirty === true);
+          dirtyBefore.set(uriKey(doc.uri as vscode.Uri), doc.isDirty === true);
         }
 
         let applied: boolean;
@@ -584,11 +589,12 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         const leftDirty: string[] = [];
         for (const p of planned) {
           if (p.kind === "delete") continue;
+          const key = uriKey(p.uri);
           const doc = vscode.workspace.textDocuments?.find(
-            (d) => d.uri.toString() === p.uri.toString(),
+            (d) => uriKey(d.uri as vscode.Uri) === key,
           );
           if (!doc || doc.isDirty !== true || typeof doc.save !== "function") continue;
-          if (dirtyBefore.get(doc.uri.toString()) === true) {
+          if (dirtyBefore.get(key) === true) {
             leftDirty.push(p.uri.fsPath);
             continue;
           }
