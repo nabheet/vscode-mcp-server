@@ -842,13 +842,15 @@ describe("multi-root workspace (E2E)", () => {
 
   it("get_file_info scopes a relative path to the workspace folder", async () => {
     if (!ENABLED || !tmpDir) return;
+    // Use the second folder: ignoring workspaceFolder would resolve against
+    // the first (frontend) and still pass.
     const res = await mcpRequest(port, "tools/call", {
       name: "get_file_info",
-      arguments: { paths: ["src/index.ts"], workspaceFolder: "frontend" },
+      arguments: { paths: ["src/index.ts"], workspaceFolder: "backend" },
     });
     expect(res.result.isError).toBe(false);
     expect(res.result.content[0].text as string).toContain(
-      `=== ${tmpDir}/frontend/src/index.ts ===`,
+      `=== ${tmpDir}/backend/src/index.ts ===`,
     );
   });
 

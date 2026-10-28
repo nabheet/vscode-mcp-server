@@ -2603,6 +2603,33 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("[error: permission denied]");
   });
 
+  it("get_file_info continues a batch after a failed path", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.stat = vi
+      .fn()
+      .mockImplementation((uri: vscode.Uri) => {
+        if (uri.fsPath === "/ws/backend/secret.ts") {
+          return Promise.reject(
+            Object.assign(new Error("permission denied"), { code: "NoPermissions" }),
+          );
+        }
+        return Promise.resolve({ type: vscode.FileType.File, size: 2, mtime: 0 });
+      });
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["secret.ts", "ok.ts"] });
+
+    expect(res.isError).toBe(true);
+    const body = res.content[0].text as string;
+    expect(body).toContain("=== /ws/backend/secret.ts ===");
+    expect(body).toContain("[error: permission denied]");
+    // The failure must not end the batch.
+    expect(body).toContain("=== /ws/backend/ok.ts ===");
+    expect(body).toContain('"exists":true');
+  });
+
   it("get_file_info scopes paths to the requested workspace folder", async () => {
     (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
       { name: "frontend", uri: vscode.Uri.file("/ws/frontend") },
