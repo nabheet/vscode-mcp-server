@@ -339,10 +339,11 @@ describe("multi-root workspace (E2E)", () => {
       JSON.stringify({
         "vscode-mcp-server.port": port,
         "vscode-mcp-server.authToken": E2E_AUTH_TOKEN,
-        // A WorkspaceEdit delete moves the file to the OS trash (the extension
-        // API has no per-edit opt-out). Headless Linux CI has no trash backend,
-        // so the delete fails and applyEdit returns false after the batch has
-        // already partly applied. Keep the tests off the trash service.
+        // A WorkspaceEdit delete moves the file to the OS trash; the extension
+        // API has no per-edit opt-out (`deleteFile` takes only recursive and
+        // ignoreIfNotExists). A host without a working trash service fails that
+        // step, and applyEdit applies the rest of the batch before returning
+        // false. Permanent delete keeps the tests off that path.
         "files.enableTrash": false,
       }),
     );
@@ -565,16 +566,50 @@ describe("multi-root workspace (E2E)", () => {
 
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
+  /** Whether get_open_editors reports the given path as having unsaved changes. */
+  async function isDirty(targetPath: string): Promise<boolean> {
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_open_editors",
+      arguments: {},
+    });
+    expect(res.result.isError, `get_open_editors: ${res.result.content[0].text}`).toBe(false);
+    const editors = JSON.parse(res.result.content[0].text) as { path: string; isDirty: boolean }[];
+    return editors.some((e) => e.path === targetPath && e.isDirty);
+  }
+
+  /**
+   * Discard unsaved changes in one file without a save prompt.
+   * `workbench.action.files.revert` acts on the active editor, so focus the
+   * file first.
+   */
+  async function revertFile(absPath: string): Promise<void> {
+    const opened = await mcpRequest(port, "tools/call", {
+      name: "open_file",
+      arguments: { path: absPath },
+    });
+    expect(opened.result.isError, `open_file ${absPath}: ${opened.result.content[0].text}`).toBe(
+      false,
+    );
+    const reverted = await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.files.revert" },
+    });
+    expect(reverted.result.isError, `revert: ${reverted.result.content[0].text}`).toBe(false);
+  }
+
   /**
    * Make the active editor's buffer dirty, then confirm it through
    * get_open_editors.
    *
-   * `editor.action.insertSnippet` falls back to the active editor and needs no
-   * DOM focus, unlike the `type` command, which silently does nothing when the
-   * headless window has no focused editor and still reports success.
+   * `editor.action.insertSnippet` edits the editor the action framework hands
+   * it and, like the `type` command, returns without error when there is no
+   * editor to edit. The command result therefore proves nothing; the poll is
+   * what detects the no-op, and it retries until the buffer reports dirty.
    */
   async function typeUntilDirty(text: string, targetPath: string): Promise<void> {
     for (let attempt = 0; attempt < 3; attempt++) {
+      if (await isDirty(targetPath)) return;
+
       const inserted = await mcpRequest(port, "tools/call", {
         name: "execute_command",
         arguments: {
@@ -588,15 +623,7 @@ describe("multi-root workspace (E2E)", () => {
 
       const deadline = Date.now() + 1500;
       while (Date.now() < deadline) {
-        const res = await mcpRequest(port, "tools/call", {
-          name: "get_open_editors",
-          arguments: {},
-        });
-        const editors = JSON.parse(res.result.content[0].text) as {
-          path: string;
-          isDirty: boolean;
-        }[];
-        if (editors.some((e) => e.path === targetPath && e.isDirty)) return;
+        if (await isDirty(targetPath)) return;
         await new Promise((r) => setTimeout(r, 100));
       }
     }
@@ -606,9 +633,6 @@ describe("multi-root workspace (E2E)", () => {
   /**
    * Seed a file through VS Code's own filesystem instead of `fs`, so the state
    * the batch validates against is the state the test just wrote.
-   *
-   * This did not fix the Linux rejection: that was the delete step hitting the
-   * OS trash (see `files.enableTrash` in the generated user settings).
    */
   async function seedFile(absPath: string, content: string): Promise<void> {
     const res = await mcpRequest(port, "tools/call", {
@@ -784,13 +808,14 @@ describe("multi-root workspace (E2E)", () => {
       // Leave no dirty buffer behind even when an assertion above fails: a
       // later close/prompt would block the window and take unrelated editor
       // tests down with it.
-      for (const command of ["workbench.action.files.revert", "workbench.action.closeAllEditors"]) {
-        const res = await mcpRequest(port, "tools/call", {
-          name: "execute_command",
-          arguments: { command },
-        });
-        expect(res.result.isError, `${command}: ${res.result.content[0].text}`).toBe(false);
-      }
+      await revertFile(target);
+      const closed = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "workbench.action.closeAllEditors" },
+      });
+      expect(closed.result.isError, `closeAllEditors: ${closed.result.content[0].text}`).toBe(
+        false,
+      );
     }
   });
 
@@ -1756,11 +1781,7 @@ describe("multi-root workspace (E2E)", () => {
       expect(entry?.isDirty, JSON.stringify(editors)).toBe(true);
     } finally {
       // Leave no dirty buffer behind for later tests, even on failure.
-      const reverted = await mcpRequest(port, "tools/call", {
-        name: "execute_command",
-        arguments: { command: "workbench.action.files.revert" },
-      });
-      expect(reverted.result.isError, `revert: ${reverted.result.content[0].text}`).toBe(false);
+      await revertFile(target);
     }
   });
 
