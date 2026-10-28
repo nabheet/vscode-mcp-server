@@ -739,9 +739,14 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
               })}`,
             );
           } catch (err) {
-            // A missing path is a normal answer, not a batch failure.
+            // A missing path is a normal answer, not a batch failure. A path
+            // under a file (FileNotADirectory) is missing too.
             const code = (err as { code?: string }).code;
-            if (code === "FileNotFound" || code === "EntryNotFound") {
+            if (
+              code === "FileNotFound" ||
+              code === "EntryNotFound" ||
+              code === "FileNotADirectory"
+            ) {
               parts.push(
                 `=== ${uri.fsPath} ===\n${JSON.stringify({
                   exists: false,

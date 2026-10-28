@@ -2603,6 +2603,25 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("[error: permission denied]");
   });
 
+  it("get_file_info treats a path under a file as missing", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.stat = vi
+      .fn()
+      .mockRejectedValue(
+        Object.assign(new Error("not a directory"), { code: "FileNotADirectory" }),
+      );
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["src/index.ts/child"] });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse((res.content[0].text as string).split("\n")[1])).toMatchObject({
+      exists: false,
+    });
+  });
+
   it("get_file_info continues a batch after a failed path", async () => {
     (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
       { name: "backend", uri: vscode.Uri.file("/ws/backend") },
