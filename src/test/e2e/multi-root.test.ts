@@ -572,7 +572,7 @@ describe("multi-root workspace (E2E)", () => {
 
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
-    expect(text).toContain("Applied 3 file edit(s) atomically");
+    expect(text).toContain("Applied 3 file edit(s) in a single workspace edit");
     expect(text).toContain(`${target} ===\nApplied 1 text edit(s)`);
     expect(text).toContain(`${created} ===\nCreated`);
     expect(text).toContain(`${doomed} ===\nDeleted`);

@@ -21,18 +21,55 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Returns an error string when the path's existence does not match `shouldExist`. */
-async function statProblem(uri: vscode.Uri, shouldExist: boolean): Promise<string | undefined> {
-  let exists = false;
+interface PathStat {
+  exists: boolean;
+  isDirectory: boolean;
+}
+
+/** Stat a path, treating only "not found" as absence (other errors propagate as text). */
+async function statPath(uri: vscode.Uri): Promise<PathStat | string> {
   try {
-    await vscode.workspace.fs.stat(uri);
-    exists = true;
-  } catch {
-    exists = false;
+    const stat = await vscode.workspace.fs.stat(uri);
+    const directoryBit =
+      typeof vscode.FileType?.Directory === "number" ? vscode.FileType.Directory : 2;
+    return {
+      exists: true,
+      isDirectory: typeof stat?.type === "number" && (stat.type & directoryBit) !== 0,
+    };
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code;
+    if (code === "FileNotFound" || code === "ENOENT") return { exists: false, isDirectory: false };
+    return `failed to stat path: ${errorMessage(err)}`;
   }
-  if (shouldExist && !exists) return "file does not exist";
-  if (!shouldExist && exists) return "file already exists";
-  return undefined;
+}
+
+interface FileMetrics {
+  lineCount: number;
+  lineLengths: number[];
+}
+
+/** Line metrics for the document the edit will apply to (live buffer wins over disk). */
+async function fileMetrics(uri: vscode.Uri): Promise<FileMetrics | string> {
+  try {
+    const doc = await vscode.workspace.openTextDocument(uri);
+    if (doc && typeof doc.lineCount === "number" && typeof doc.lineAt === "function") {
+      const lineLengths: number[] = [];
+      for (let i = 0; i < doc.lineCount; i++) lineLengths.push(doc.lineAt(i).text.length);
+      return { lineCount: doc.lineCount, lineLengths };
+    }
+  } catch {
+    /* fall back to the on-disk contents below */
+  }
+  try {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const lines = Buffer.from(bytes).toString("utf-8").split("\n");
+    return {
+      lineCount: lines.length,
+      lineLengths: lines.map((line) => (line.endsWith("\r") ? line.length - 1 : line.length)),
+    };
+  } catch (err) {
+    return `failed to read file for validation: ${errorMessage(err)}`;
+  }
 }
 
 /** Parse + validate the `textEdits` payload; returns an error message on failure. */
@@ -84,22 +121,22 @@ function parseTextEdits(raw: unknown): ParsedTextEdit[] | string {
   return parsed;
 }
 
-/** Reject ranges that point past the end of the file, before any edit applies. */
+/** Reject ranges that point past the end of the file or line, before any edit applies. */
 async function checkRangesAgainstFile(
   uri: vscode.Uri,
   edits: ParsedTextEdit[],
 ): Promise<string | undefined> {
-  let text: string;
-  try {
-    const bytes = await vscode.workspace.fs.readFile(uri);
-    text = Buffer.from(bytes).toString("utf-8");
-  } catch (err) {
-    return `failed to read file for validation: ${errorMessage(err)}`;
-  }
-  const lineCount = text.split("\n").length;
+  const metrics = await fileMetrics(uri);
+  if (typeof metrics === "string") return metrics;
   for (const [i, te] of edits.entries()) {
-    if (te.start.line >= lineCount || te.end.line >= lineCount) {
-      return `textEdits[${i}].range is outside the file (${lineCount} line(s))`;
+    if (te.start.line >= metrics.lineCount || te.end.line >= metrics.lineCount) {
+      return `textEdits[${i}].range is outside the file (${metrics.lineCount} line(s))`;
+    }
+    if (te.start.character > metrics.lineLengths[te.start.line]) {
+      return `textEdits[${i}].range.start.character ${te.start.character} exceeds line ${te.start.line} length (${metrics.lineLengths[te.start.line]})`;
+    }
+    if (te.end.character > metrics.lineLengths[te.end.line]) {
+      return `textEdits[${i}].range.end.character ${te.end.character} exceeds line ${te.end.line} length (${metrics.lineLengths[te.end.line]})`;
     }
   }
   return undefined;
@@ -277,7 +314,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "apply_workspace_edit",
-      "Apply multiple edits across files atomically via the VS Code WorkspaceEdit API. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion. All entries are validated first; if any entry is invalid nothing is applied and per-file errors are reported inline. On success the whole batch applies as one undoable transaction.",
+      "Apply multiple edits across files in one VS Code WorkspaceEdit call. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion, and each path may appear once per batch. All entries are validated first; if any entry is invalid nothing is applied and per-file errors are reported inline. On success the whole batch is applied as a single undo step.",
       {
         type: "object",
         properties: {
@@ -362,6 +399,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
 
         const problems: string[] = [];
         const planned: PlannedEdit[] = [];
+        const seenUris = new Set<string>();
 
         for (const entry of raw) {
           const label =
@@ -379,12 +417,21 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           try {
             uri = resolvePath(
               entry.path,
-              typeof entry.workspaceFolder === "string" ? entry.workspaceFolder : undefined,
+              entry.workspaceFolder ? String(entry.workspaceFolder) : undefined,
             );
           } catch (err) {
             fail(errorMessage(err));
             continue;
           }
+
+          // One entry per file: VS Code rejects batches that delete and then
+          // edit the same URI, and duplicate creates would concatenate content.
+          const key = uri.toString();
+          if (seenUris.has(key)) {
+            fail("duplicate entry for the same file (edit each path once per batch)");
+            continue;
+          }
+          seenUris.add(key);
 
           const hasTextEdits = entry.textEdits !== undefined;
           const hasCreate = entry.create === true;
@@ -400,9 +447,17 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           }
 
           if (hasDelete) {
-            const statErr = await statProblem(uri, true);
-            if (statErr) {
-              fail(statErr);
+            const stat = await statPath(uri);
+            if (typeof stat === "string") {
+              fail(stat);
+              continue;
+            }
+            if (!stat.exists) {
+              fail("file does not exist");
+              continue;
+            }
+            if (stat.isDirectory) {
+              fail("path is a directory (only files can be deleted here)");
               continue;
             }
             planned.push({ kind: "delete", uri, label });
@@ -410,14 +465,19 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           }
 
           if (hasCreate) {
-            const statErr = await statProblem(uri, false);
-            if (statErr) {
-              fail(statErr);
+            const stat = await statPath(uri);
+            if (typeof stat === "string") {
+              fail(stat);
+              continue;
+            }
+            if (stat.exists) {
+              fail("file already exists");
               continue;
             }
             const content = typeof entry.content === "string" ? entry.content : "";
-            if (content.length > MAX_EDIT_CONTENT_SIZE) {
-              fail(`content too large: ${content.length} bytes (max ${MAX_EDIT_CONTENT_SIZE})`);
+            const bytes = Buffer.byteLength(content, "utf-8");
+            if (bytes > MAX_EDIT_CONTENT_SIZE) {
+              fail(`content too large: ${bytes} bytes (max ${MAX_EDIT_CONTENT_SIZE})`);
               continue;
             }
             planned.push({ kind: "create", uri, label, content });
@@ -429,9 +489,17 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             fail(parsed);
             continue;
           }
-          const statErr = await statProblem(uri, true);
-          if (statErr) {
-            fail(statErr);
+          const stat = await statPath(uri);
+          if (typeof stat === "string") {
+            fail(stat);
+            continue;
+          }
+          if (!stat.exists) {
+            fail("file does not exist");
+            continue;
+          }
+          if (stat.isDirectory) {
+            fail("path is a directory (only files can be edited here)");
             continue;
           }
           const lineErr = await checkRangesAgainstFile(uri, parsed);
@@ -473,7 +541,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             content: [
               {
                 type: "text",
-                text: `Failed to apply workspace edit: ${errorMessage(err)} (no changes applied)`,
+                text: `Failed to apply workspace edit: ${errorMessage(err)}. Nothing further was applied — verify any paths in this batch that were created or deleted.`,
               },
             ],
             isError: true,
@@ -484,7 +552,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             content: [
               {
                 type: "text",
-                text: "Failed to apply workspace edit: VS Code rejected the batch (no changes applied)",
+                text: "Failed to apply workspace edit: VS Code rejected the batch. Text edits were not applied — verify any paths in this batch that were created or deleted.",
               },
             ],
             isError: true,
@@ -503,7 +571,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           content: [
             {
               type: "text",
-              text: `Applied ${planned.length} file edit(s) atomically\n\n${summary.join("\n\n")}`,
+              text: `Applied ${planned.length} file edit(s) in a single workspace edit\n\n${summary.join("\n\n")}`,
             },
           ],
           isError: false,

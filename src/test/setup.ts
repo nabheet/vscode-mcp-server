@@ -25,7 +25,7 @@ const mockWorkspace = {
   workspaceFile: undefined as { uri: { scheme: string; fsPath: string } } | undefined,
   fs: {
     readFile: vi.fn(),
-    stat: vi.fn().mockRejectedValue(new Error("ENOENT")),
+    stat: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
   },
   findFiles: vi.fn().mockResolvedValue([]),
   applyEdit: vi.fn().mockResolvedValue(true),
@@ -111,6 +111,7 @@ const mockVscode = {
   commands: mockCommands,
   debug: mockDebug,
   SymbolKind: mockSymbolKind,
+  FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
   // For ExtensionContext type used in path.ts indirectly
   ExtensionContext: class {
     subscriptions: { dispose: () => void }[] = [];

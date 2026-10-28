@@ -15,6 +15,7 @@ type MockWorkspace = {
   workspaceFile?: { uri?: vscode.Uri | { fsPath: string }; name?: string };
   fs?: { readFile: unknown; writeFile?: unknown; stat?: unknown };
   findFiles?: unknown;
+  openTextDocument?: unknown;
   applyEdit?: { mockResolvedValue: (v: boolean) => unknown };
   updateWorkspaceFolders?: {
     mockReturnValue: (v: boolean) => unknown;
@@ -581,21 +582,38 @@ describe("handler behavior", () => {
 
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
-  /** Route fs.stat/fs.readFile over an in-memory file map (missing ⇒ ENOENT). */
-  function mockWorkspaceFiles(files: Record<string, string>) {
+  /**
+   * Route fs.stat/fs.readFile/openTextDocument over an in-memory file map
+   * (missing ⇒ ENOENT). `docs` simulates live editor buffers: they default to
+   * the on-disk contents but can diverge to model an unsaved document.
+   */
+  function mockWorkspaceFiles(
+    files: Record<string, string>,
+    docs: Record<string, string | undefined> = files,
+  ) {
     const ws = vscode.workspace as unknown as MockWorkspace;
+    const enoent = () => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
     ws.fs.stat = vi
       .fn()
       .mockImplementation((uri: vscode.Uri) =>
-        files[uri.fsPath] !== undefined ? Promise.resolve({}) : Promise.reject(new Error("ENOENT")),
+        files[uri.fsPath] !== undefined ? Promise.resolve({}) : Promise.reject(enoent()),
       );
     ws.fs.readFile = vi
       .fn()
       .mockImplementation((uri: vscode.Uri) =>
         files[uri.fsPath] !== undefined
           ? Promise.resolve(Buffer.from(files[uri.fsPath]))
-          : Promise.reject(new Error("ENOENT")),
+          : Promise.reject(enoent()),
       );
+    ws.openTextDocument = vi.fn().mockImplementation((uri: vscode.Uri) => {
+      const text = docs[uri.fsPath];
+      if (text === undefined) return Promise.reject(enoent());
+      const lines = text.split("\n");
+      return Promise.resolve({
+        lineCount: lines.length,
+        lineAt: (i: number) => ({ text: lines[i] ?? "" }),
+      });
+    });
     ws.applyEdit = vi.fn().mockResolvedValue(true);
   }
 
@@ -647,8 +665,10 @@ describe("handler behavior", () => {
     expect(ops[1].uri.fsPath).toBe("/ws/backend/new.ts");
     expect(ops[2].newText).toBe("hello\n");
     expect(ops[3].uri.fsPath).toBe("/ws/backend/old.ts");
+    expect(ops[1].options).toEqual({ ignoreIfExists: false, overwrite: false });
+    expect(ops[3].options).toEqual({ ignoreIfNotExists: false, recursive: false });
     const text: string = res.content[0].text;
-    expect(text).toContain("Applied 3 file edit(s) atomically");
+    expect(text).toContain("Applied 3 file edit(s) in a single workspace edit");
     expect(text).toContain("=== /ws/frontend/a.ts ===\nApplied 1 text edit(s)");
     expect(text).toContain("=== /ws/backend/new.ts ===\nCreated (6 bytes)");
     expect(text).toContain("=== /ws/backend/old.ts ===\nDeleted");
@@ -657,7 +677,7 @@ describe("handler behavior", () => {
   it("apply_workspace_edit reports per-file errors inline and applies nothing", async () => {
     const ws = vscode.workspace as unknown as MockWorkspace;
     ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
-    mockWorkspaceFiles({ "/ws/frontend/ok.ts": "a\nb\n" });
+    mockWorkspaceFiles({ "/ws/frontend/ok.ts": "a\nb\n", "/ws/frontend/present.ts": "x\n" });
 
     const h = requireHandler(handlers, "apply_workspace_edit");
     const res = await h({
@@ -681,7 +701,7 @@ describe("handler behavior", () => {
           ],
         },
         { path: "/etc/passwd", delete: true },
-        { path: "ok.ts", create: true, content: "dup" },
+        { path: "present.ts", create: true, content: "dup" },
         { path: "no-mode.ts" },
       ],
     });
@@ -692,7 +712,7 @@ describe("handler behavior", () => {
     expect(text).toContain("=== missing.ts ===\n[error: file does not exist]");
     expect(text).toContain("=== /etc/passwd ===\n[error:");
     expect(text).toContain("outside the workspace");
-    expect(text).toContain("=== ok.ts ===\n[error: file already exists]");
+    expect(text).toContain("=== present.ts ===\n[error: file already exists]");
     expect(text).toContain("=== no-mode.ts ===\n[error:");
     expect(text).not.toContain("ok.ts ===\n[error: file does not exist]");
   });
@@ -771,7 +791,112 @@ describe("handler behavior", () => {
     const res = await h({ edits: [{ path: "fresh.ts", create: true, content: "x" }] });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("rejected the batch");
-    expect(res.content[0].text).toContain("no changes applied");
+    expect(res.content[0].text).toContain("Text edits were not applied");
+  });
+
+  it("apply_workspace_edit rejects two entries that resolve to the same file", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/x.ts": "a\n" });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "x.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+              newText: "b",
+            },
+          ],
+        },
+        { path: "/ws/frontend/x.ts", delete: true },
+      ],
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("duplicate entry for the same file");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit rejects columns past the end of a line", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/a.ts": "short\n" });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "a.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 99 }, end: { line: 0, character: 99 } },
+              newText: "x",
+            },
+          ],
+        },
+      ],
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("exceeds line 0 length (5)");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit validates ranges against the live document, not stale disk bytes", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    // On disk: one line. Unsaved buffer: three lines.
+    mockWorkspaceFiles(
+      { "/ws/frontend/dirty.ts": "only\n" },
+      { "/ws/frontend/dirty.ts": "a\nb\nc\n" },
+    );
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "dirty.ts",
+          textEdits: [
+            {
+              range: { start: { line: 2, character: 0 }, end: { line: 2, character: 1 } },
+              newText: "C",
+            },
+          ],
+        },
+      ],
+    });
+    expect(res.isError, res.content[0].text).toBe(false);
+    expect(vscode.workspace.applyEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it("apply_workspace_edit refuses to delete a directory", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/src": "" });
+    ws.fs.stat = vi.fn().mockResolvedValue({ type: 2 }); // FileType.Directory
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({ edits: [{ path: "src", delete: true }] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("path is a directory");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit surfaces non-ENOENT stat failures as per-file errors", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({});
+    ws.fs.stat = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({ edits: [{ path: "locked.ts", create: true }] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("failed to stat path: EACCES");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
   });
 
   it("apply_workspace_edit errors on an empty edits array", async () => {
