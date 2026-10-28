@@ -558,6 +558,44 @@ describe("multi-root workspace (E2E)", () => {
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
   /**
+   * Type into the active editor until the buffer reports dirty.
+   *
+   * `type` needs a focused editor group; on a headless window it can resolve
+   * having done nothing, leaving `isDirty` false. Focus the group, type, then
+   * confirm through get_open_editors before the caller relies on the buffer
+   * being dirty.
+   */
+  async function typeUntilDirty(text: string, targetPath: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const focused = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "workbench.action.focusActiveEditorGroup" },
+      });
+      expect(focused.result.isError, `focus: ${focused.result.content[0].text}`).toBe(false);
+      const typed = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "type", args: [{ text }] },
+      });
+      expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+
+      const deadline = Date.now() + 1500;
+      while (Date.now() < deadline) {
+        const res = await mcpRequest(port, "tools/call", {
+          name: "get_open_editors",
+          arguments: {},
+        });
+        const editors = JSON.parse(res.result.content[0].text) as {
+          path: string;
+          isDirty: boolean;
+        }[];
+        if (editors.some((e) => e.path === targetPath && e.isDirty)) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    throw new Error(`could not make ${targetPath} dirty`);
+  }
+
+  /**
    * Seed a file through VS Code's own filesystem instead of `fs`, so the state
    * the batch validates against is the state the test just wrote. A batch that
    * creates or deletes a path is checked against VS Code's file-system view,
@@ -574,20 +612,19 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `write_file ${absPath}: ${res.result.content[0].text}`).toBe(false);
   }
 
-  it("apply_workspace_edit applies text edits, create, and delete in one atomic call", async () => {
+  it("apply_workspace_edit applies text edits across files in one atomic call", async () => {
     if (!ENABLED || !tmpDir) return;
-    const target = path.join(tmpDir, "frontend/src/atomic.ts");
-    const created = path.join(tmpDir, "backend/src/created.ts");
-    const doomed = path.join(tmpDir, "backend/src/doomed.ts");
-    await seedFile(target, "alpha\nbeta\n");
-    await seedFile(doomed, "delete me\n");
+    const first = path.join(tmpDir, "frontend/src/atomic-a.ts");
+    const second = path.join(tmpDir, "backend/src/atomic-b.ts");
+    await seedFile(first, "alpha\nbeta\n");
+    await seedFile(second, "gamma\ndelta\n");
 
     const res = await mcpRequest(port, "tools/call", {
       name: "apply_workspace_edit",
       arguments: {
         edits: [
           {
-            path: target,
+            path: first,
             textEdits: [
               {
                 range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
@@ -595,6 +632,51 @@ describe("multi-root workspace (E2E)", () => {
               },
             ],
           },
+          {
+            path: second,
+            textEdits: [
+              {
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+                newText: "GAMMA",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
+    expect(text).toContain(`${first} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain(`${second} ===\nApplied 1 text edit(s)`);
+
+    // Disk is the source of truth: poll briefly (the edit lands on disk async).
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const applied =
+        fs.readFileSync(first, "utf-8") === "alpha\nBETA\n" &&
+        fs.readFileSync(second, "utf-8") === "GAMMA\ndelta\n";
+      if (applied) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(fs.readFileSync(first, "utf-8")).toBe("alpha\nBETA\n");
+    expect(fs.readFileSync(second, "utf-8")).toBe("GAMMA\ndelta\n");
+  });
+
+  it("apply_workspace_edit creates and deletes in one atomic call", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const created = path.join(tmpDir, "backend/src/created.ts");
+    const doomed = path.join(tmpDir, "backend/src/doomed.ts");
+    // A leftover from a previous attempt would make `create` fail and hide the
+    // behaviour under test, so assert the starting state.
+    expect(fs.existsSync(created), `${created} already exists`).toBe(false);
+    await seedFile(doomed, "delete me\n");
+
+    const res = await mcpRequest(port, "tools/call", {
+      name: "apply_workspace_edit",
+      arguments: {
+        edits: [
           { path: created, create: true, content: "// created atomically\n" },
           { path: doomed, delete: true },
         ],
@@ -603,19 +685,15 @@ describe("multi-root workspace (E2E)", () => {
 
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
-    expect(text).toContain("Applied 3 file edit(s) in a single workspace edit");
-    expect(text).toContain(`${target} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
     expect(text).toContain(`${created} ===\nCreated`);
     expect(text).toContain(`${doomed} ===\nDeleted`);
 
-    // Disk is the source of truth: poll briefly (the edit lands on disk async).
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
-      const applied = fs.existsSync(target) && fs.readFileSync(target, "utf-8") === "alpha\nBETA\n";
-      if (applied && fs.existsSync(created) && !fs.existsSync(doomed)) break;
+      if (fs.existsSync(created) && !fs.existsSync(doomed)) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    expect(fs.readFileSync(target, "utf-8")).toBe("alpha\nBETA\n");
     expect(fs.readFileSync(created, "utf-8")).toBe("// created atomically\n");
     expect(fs.existsSync(doomed)).toBe(false);
   });
@@ -668,12 +746,7 @@ describe("multi-root workspace (E2E)", () => {
         arguments: { path: target },
       });
       expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-      const typed = await mcpRequest(port, "tools/call", {
-        name: "execute_command",
-        arguments: { command: "type", args: [{ text: "unsaved line\n" }] },
-      });
-      expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
-      await new Promise((r) => setTimeout(r, 250));
+      await typeUntilDirty("unsaved line\n", target);
       return mcpRequest(port, "tools/call", {
         name: "apply_workspace_edit",
         arguments: {
@@ -693,10 +766,9 @@ describe("multi-root workspace (E2E)", () => {
     };
 
     try {
-      let res = await attempt();
-      for (let i = 0; i < 2 && !String(res.result.content[0].text).includes("Left unsaved"); i++) {
-        res = await attempt();
-      }
+      // One attempt: `typeUntilDirty` already handles the harness race, so a
+      // retry here would only hide a real dirty-buffer regression.
+      const res = await attempt();
 
       expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
       expect(res.result.content[0].text).toContain("Left unsaved");
@@ -1549,23 +1621,6 @@ describe("multi-root workspace (E2E)", () => {
     }[];
   }
 
-  /**
-   * Editor state reaches the tab model asynchronously after a command, so a
-   * single read can observe the previous value. Poll until `done` or 5s.
-   */
-  async function openEditorsUntil(
-    done: (editors: Awaited<ReturnType<typeof openEditors>>) => boolean,
-    timeoutMs = 5000,
-  ) {
-    const deadline = Date.now() + timeoutMs;
-    let editors = await openEditors();
-    while (!done(editors) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      editors = await openEditors();
-    }
-    return editors;
-  }
-
   it("get_open_editors lists an open file with absolute path and flags", async () => {
     if (!ENABLED) return;
     const target = path.join(tmpDir as string, "backend/src/listed.ts");
@@ -1630,22 +1685,22 @@ describe("multi-root workspace (E2E)", () => {
       arguments: { path: target },
     });
     expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-    const typed = await mcpRequest(port, "tools/call", {
-      name: "execute_command",
-      arguments: { command: "type", args: [{ text: "unsaved\n" }] },
-    });
-    expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+    try {
+      await typeUntilDirty("unsaved\n", target);
 
-    const editors = await openEditorsUntil((list) =>
-      list.some((e) => e.path === target && e.isDirty),
-    );
-    expect(editors.find((e) => e.path === target)?.isDirty, JSON.stringify(editors)).toBe(true);
-
-    // Leave no dirty buffer behind for later tests.
-    await mcpRequest(port, "tools/call", {
-      name: "execute_command",
-      arguments: { command: "workbench.action.files.revert" },
-    });
+      // typeUntilDirty already confirmed the dirty flag; this asserts the tool
+      // reports it too, for the same path.
+      const editors = await openEditors();
+      const entry = editors.find((e) => e.path === target);
+      expect(entry?.isDirty, JSON.stringify(editors)).toBe(true);
+    } finally {
+      // Leave no dirty buffer behind for later tests, even on failure.
+      const reverted = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "workbench.action.files.revert" },
+      });
+      expect(reverted.result.isError, `revert: ${reverted.result.content[0].text}`).toBe(false);
+    }
   });
 
   it("get_open_editors skips untitled buffers", async () => {
