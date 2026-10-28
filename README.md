@@ -5,7 +5,7 @@
 
 Let AI agents read, write, debug, and execute commands in VS Code — just like a
 human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
-server exposes 51 VS Code tools (debugger, terminal, LSP, file ops, commands)
+server exposes 52 VS Code tools (debugger, terminal, LSP, file ops, commands)
 over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ```bash
@@ -568,7 +568,7 @@ This server supports **both** transports transparently — no configuration
 change needed. Just use `POST /mcp` as the endpoint and the server handles
 everything synchronously.
 
-### Example: tool list (51 tools)
+### Example: tool list (52 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
