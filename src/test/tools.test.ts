@@ -325,6 +325,7 @@ describe("handler behavior", () => {
     (vscode.workspace as unknown as MockWorkspace).textDocuments = [];
     (vscode.workspace as unknown as { getConfiguration: unknown }).getConfiguration = vi.fn(() => ({
       get: (_key: string, defaultValue?: unknown) => defaultValue,
+      has: () => false,
     }));
     (vscode as unknown as { debug: MockDebug }).debug.activeDebugSession = undefined;
     (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [];
@@ -2162,7 +2163,10 @@ describe("handler behavior", () => {
     ]);
   // ── get_configuration ────────────────────────────────────────────────────
 
-  type MockConfig = { get: (key: string, defaultValue?: unknown) => unknown };
+  type MockConfig = {
+    get: (key: string, defaultValue?: unknown) => unknown;
+    has: (key: string) => boolean;
+  };
   type MockGetConfiguration = {
     mockImplementation: (fn: (section?: string, scope?: unknown) => MockConfig) => unknown;
     mock: { calls: unknown[][] };
@@ -2177,7 +2181,9 @@ describe("handler behavior", () => {
       const values = section === undefined ? {} : (sections[section] ?? empty);
       return {
         ...values,
-        get: (key: string, defaultValue?: unknown) => values[key] ?? defaultValue,
+        get: (key: string, defaultValue?: unknown) =>
+          Object.hasOwn(values, key) ? values[key] : defaultValue,
+        has: (key: string) => Object.hasOwn(values, key),
       };
     });
     (vscode.workspace as unknown as { getConfiguration: unknown }).getConfiguration = fn;
@@ -2208,14 +2214,25 @@ describe("handler behavior", () => {
     expect(JSON.parse(res.content[0].text)).toBe(2);
   });
 
-  it("get_configuration reports a missing key as null", async () => {
+  it("get_configuration reports a missing key as an error", async () => {
     mockConfiguration({ editor: {} });
 
     const h = requireHandler(handlers, "get_configuration");
     const res = await h({ section: "editor", key: "nope" });
 
-    expect(res.isError).toBe(false);
-    expect(JSON.parse(res.content[0].text)).toBeNull();
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("editor.nope");
+    expect(res.content[0].text).toContain("not set");
+  });
+
+  it("get_configuration preserves an explicit-null key from an unset key", async () => {
+    mockConfiguration({ editor: { tabSize: null } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const explicitNull = await h({ section: "editor", key: "tabSize" });
+
+    expect(explicitNull.isError).toBe(false);
+    expect(JSON.parse(explicitNull.content[0].text)).toBeNull();
   });
 
   it("get_configuration returns an empty object for an unknown section", async () => {
@@ -2226,6 +2243,38 @@ describe("handler behavior", () => {
 
     expect(res.isError).toBe(false);
     expect(JSON.parse(res.content[0].text)).toEqual({});
+  });
+
+  it("get_configuration redacts secret-looking values in a section dump", async () => {
+    mockConfiguration({
+      "vscode-mcp-server": { authToken: "supersecret", port: 9876 },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "vscode-mcp-server" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({ authToken: "<redacted>", port: 9876 });
+  });
+
+  it("get_configuration redacts a secret-looking key read directly", async () => {
+    mockConfiguration({ "some.api": { apiKey: "hunter2" } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "some.api", key: "apiKey" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toBe("<redacted>");
+  });
+
+  it("get_configuration treats an empty section as absent", async () => {
+    mockConfiguration({});
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Pass a section");
   });
 
   it("get_configuration scopes to the requested workspace folder", async () => {
@@ -2247,7 +2296,7 @@ describe("handler behavior", () => {
   it("get_configuration applies a languageId against the folder's resource", async () => {
     const ws = vscode.workspace as unknown as MockWorkspace;
     ws.workspaceFolders = [{ name: "backend", uri: vscode.Uri.file("/ws/backend") }];
-    const getConfiguration = mockConfiguration({ "editor.tabSize": {} });
+    const getConfiguration = mockConfiguration({ editor: { tabSize: 4 } });
 
     const h = requireHandler(handlers, "get_configuration");
     const res = await h({
@@ -2264,15 +2313,31 @@ describe("handler behavior", () => {
     });
   });
 
-  it("get_configuration rejects a languageId with no workspace folder", async () => {
-    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [];
-    mockConfiguration({});
+  it("get_configuration applies a languageId at window scope without a folder", async () => {
+    // Two folders open; languageId alone must not borrow folders[0].
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [
+      { name: "frontend", uri: vscode.Uri.file("/ws/frontend") },
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    const getConfiguration = mockConfiguration({ editor: { tabSize: 4 } });
 
     const h = requireHandler(handlers, "get_configuration");
     const res = await h({ section: "editor", key: "tabSize", languageId: "typescript" });
 
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("needs a workspace folder");
+    expect(res.isError).toBe(false);
+    expect(getConfiguration.mock.calls[0][1]).toEqual({ languageId: "typescript" });
+  });
+
+  it("get_configuration accepts a languageId with no workspace folder open", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [];
+    const getConfiguration = mockConfiguration({ editor: { tabSize: 4 } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor", key: "tabSize", languageId: "typescript" });
+
+    expect(res.isError).toBe(false);
+    expect(getConfiguration.mock.calls[0][1]).toEqual({ languageId: "typescript" });
   });
 
   it("get_configuration rejects an unknown workspace folder", async () => {

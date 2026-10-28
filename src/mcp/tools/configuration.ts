@@ -4,6 +4,18 @@ import { defineTool, type ToolRegistrar } from "./index";
 /** A section dump can serialize to megabytes (`"*"`); keep the round trip sane. */
 const MAX_CONFIG_BYTES = 200 * 1024;
 
+/**
+ * Settings can hold credentials (extension API keys, `vscode-mcp-server.authToken`).
+ * This tool has no workspace boundary, so redact obvious secret-looking values
+ * before they leave the extension host.
+ */
+const SECRET_KEY = /token|secret|password|passwd|api[_-]?key|credential|private[_-]?key/i;
+
+function redact(name: string, value: unknown): unknown {
+  if (value === undefined || value === null) return value;
+  return SECRET_KEY.test(name) ? "<redacted>" : value;
+}
+
 /** Resolve the `workspaceFolder` argument to the folder's URI. */
 function folderUri(ref: string): vscode.Uri {
   const folders = vscode.workspace.workspaceFolders;
@@ -22,10 +34,9 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "get_configuration",
-      // Language-scoped values need a resource: VS Code cannot resolve a
-      // `[typescript]` override without one, so `languageId` borrows the
-      // workspace folder (the first one when unspecified).
-      "Read VS Code settings, the effective values rather than the raw settings files. Returns a section as a JSON object, or one key's JSON value. Values include defaults, user and workspace-folder settings, which is what the editor actually applies. A section nobody defines returns {}. Pass languageId to apply language-specific overrides (e.g. editor.tabSize for typescript); it needs a workspace folder as its resource.",
+      // Reads user/default/folder-scoped settings without a workspace boundary,
+      // so secret-looking keys are redacted to "<redacted>".
+      "Read VS Code settings, the effective values rather than the raw settings files. Returns a section as a JSON object, or one key's JSON value. Values include defaults, user and workspace-folder settings, which is what the editor actually applies. A section nobody defines returns {}. Pass languageId to apply language-specific overrides such as \"[typescript]\"; pass workspaceFolder to also fold in that folder's settings in a multi-root workspace. Secret-looking values (tokens, passwords, API keys) are redacted.",
       {
         type: "object",
         properties: {
@@ -47,14 +58,18 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
           languageId: {
             type: "string",
             description:
-              'Optional language for language-specific overrides, e.g. "typescript". Needs a workspace folder as its resource.',
+              'Optional language for language-specific overrides, e.g. "typescript". Applies user/default language overrides; combine with workspaceFolder for folder-scoped overrides.',
           },
         },
       },
       async (args) => {
-        const section = args.section === undefined ? undefined : String(args.section);
-        const key = args.key === undefined ? undefined : String(args.key);
-        const languageId = args.languageId === undefined ? undefined : String(args.languageId);
+        const section =
+          args.section === undefined || args.section === "" ? undefined : String(args.section);
+        const key = args.key === undefined || args.key === "" ? undefined : String(args.key);
+        const languageId =
+          args.languageId === undefined || args.languageId === ""
+            ? undefined
+            : String(args.languageId);
 
         if (section === undefined && key === undefined) {
           return {
@@ -70,23 +85,14 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
 
         let scope: vscode.ConfigurationScope | undefined;
         try {
-          if (args.workspaceFolder !== undefined) {
+          if (args.workspaceFolder !== undefined && args.workspaceFolder !== "") {
             const uri = folderUri(String(args.workspaceFolder));
             scope = languageId ? { uri, languageId } : uri;
           } else if (languageId) {
-            const folders = vscode.workspace.workspaceFolders;
-            if (!folders || folders.length === 0) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `languageId '${languageId}' needs a workspace folder as its resource, and no folder is open.`,
-                  },
-                ],
-                isError: true,
-              };
-            }
-            scope = { uri: folders[0].uri, languageId };
+            // Language overrides at window scope: `{ languageId }` is a valid
+            // ConfigurationScope on its own (applies user/default overrides),
+            // so there is no reason to borrow a folder.
+            scope = { languageId };
           }
         } catch (err) {
           return {
@@ -95,14 +101,30 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
           };
         }
 
-        // A section-only call (no key, no section) is unreachable: guarded above.
         const config = vscode.workspace.getConfiguration(section, scope);
         let value: unknown;
         if (key !== undefined) {
-          value = config.get(key) ?? null;
+          if (!config.has(key)) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Setting '${section ? `${section}.` : ""}${key}' is not set.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          value = redact(key, config.get(key));
         } else {
           const entries: Record<string, unknown> = {};
-          for (const name of Object.keys(config)) entries[name] = config.get(name);
+          // WorkspaceConfiguration mixes `has`/`get`/`update`/`inspect` in with
+          // the section keys; read through `get` so only effective values land.
+          for (const name of Object.keys(config)) {
+            if (typeof (config as unknown as Record<string, unknown>)[name] === "function")
+              continue;
+            entries[name] = redact(name, config.get(name));
+          }
           value = entries;
         }
 

@@ -594,6 +594,12 @@ When connected, `tools/list` returns schemas for all tools. Key categories:
   `rename_symbol`, `get_completions`, `get_code_actions`
 - **Commands** — `execute_command`, `list_commands`
 
+`get_configuration` reads the effective settings the editor applies (defaults +
+user + workspace, and folder-scoped when `workspaceFolder` is given). It has no
+workspace boundary — it can see user-scope settings for any section — so
+secret-looking values (`authToken`, `password`, `apiKey`, …) are redacted to
+`<redacted>` before they leave the extension host.
+
 ## MCP Protocol
 
 ### Transport
