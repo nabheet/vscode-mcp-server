@@ -597,8 +597,10 @@ When connected, `tools/list` returns schemas for all tools. Key categories:
 `get_configuration` reads the effective settings the editor applies (defaults +
 user + workspace, and folder-scoped when `workspaceFolder` is given). It has no
 workspace boundary — it can see user-scope settings for any section — so
-secret-looking values (`authToken`, `password`, `apiKey`, …) are redacted to
-`<redacted>` before they leave the extension host.
+secret-looking keys (`authToken`, `password`, `apiKey`, `credential`,
+`connectionString`, …) are redacted to `<redacted>`, and URL userinfo is masked
+(`https://user:pass@host` → `https://<redacted>@host`). Redaction is name-based:
+a secret stored under an innocuous key is not detected.
 
 ## MCP Protocol
 

@@ -9,29 +9,44 @@ const MAX_CONFIG_BYTES = 200 * 1024;
  * This tool has no workspace boundary, so redact obvious secret-looking values
  * before they leave the extension host.
  *
- * `token` is a plain end-of-key suffix: it catches `authToken`, `access_token`,
- * `apiToken`, `id_token`, etc., while `editor.tokenColorCustomizations` and
- * `editor.semanticTokenColorCustomizations` end in "Customizations" and are
- * left alone.
+ * Matching is per dotted-path segment: `token` is an end-of-segment suffix
+ * (catches `authToken`, `access_token`, `apiToken`,; leaves
+ * `tokenColorCustomizations` alone), and `auth` / `bearer` match a whole
+ * segment only. A section named `credentials` therefore redacts every child.
+ *
+ * This is a heuristic keyed on names. A secret stored under an innocuous key
+ * (e.g. `myExt.value = "ghp_..."`) is not detected; URL userinfo is masked
+ * separately in `redactDeep`.
  */
-const SECRET_KEY =
-  /token$|secret|password|passwd|api[_-]?key|credential|private[_-]?key|authorization/i;
+const SECRET_SEGMENT =
+  /token$|secret|password|passwd|api[_-]?key|credential|connection[_-]?string|private[_-]?key|authorization|^auth$|^bearer$/i;
+
+/** True when any segment of a dotted key looks secret. */
+function isSecretName(name: string): boolean {
+  return name.split(".").some((segment) => SECRET_SEGMENT.test(segment));
+}
+
+/** Mask URL userinfo: `scheme://user:pass@host` → `scheme://<redacted>@host`. */
+function redactUrlUserinfo(value: string): string {
+  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/i, "$1<redacted>@");
+}
 
 function redactDeep(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((v) => redactDeep(v));
+  if (Array.isArray(value)) return value.map(redactDeep);
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = SECRET_KEY.test(k) && v !== undefined && v !== null ? "<redacted>" : redactDeep(v);
+      out[k] = isSecretName(k) && v !== undefined && v !== null ? "<redacted>" : redactDeep(v);
     }
     return out;
   }
+  if (typeof value === "string") return redactUrlUserinfo(value);
   return value;
 }
 
-/** Redact a value named `name`, recursing into nested objects/arrays. */
-function redactValue(name: string, value: unknown): unknown {
-  if (SECRET_KEY.test(name) && value !== undefined && value !== null) return "<redacted>";
+/** Redact a value by its dotted path, recursing into nested objects/arrays. */
+function redactValue(path: string, value: unknown): unknown {
+  if (isSecretName(path) && value !== undefined && value !== null) return "<redacted>";
   return redactDeep(value);
 }
 
@@ -54,8 +69,10 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
     defineTool(
       "get_configuration",
       // Reads user/default/folder-scoped settings without a workspace boundary,
-      // so secret-looking keys are redacted to "<redacted>".
-      "Read VS Code settings, the effective values rather than the raw settings files. Returns a section as a JSON object, or one key's JSON value. Values include defaults, user and workspace-folder settings, which is what the editor actually applies. A section nobody defines returns {}. Pass languageId to apply language-specific overrides such as \"[typescript]\"; pass workspaceFolder to also fold in that folder's settings in a multi-root workspace. Secret-looking values (tokens, passwords, API keys) are redacted.",
+      // so secret-looking keys are redacted to "<redacted>" and URL userinfo is
+      // masked. The redaction is name-based: a secret under an innocuous key is
+      // not detected.
+      "Read VS Code settings, the effective values rather than the raw settings files. Returns a section as a JSON object, or one key's JSON value. Values include defaults, user and workspace-folder settings, which is what the editor actually applies. A section nobody defines returns {}. Pass languageId to apply language-specific overrides such as \"[typescript]\"; pass workspaceFolder to also fold in that folder's settings in a multi-root workspace. Secret-looking keys (tokens, passwords, API keys, credentials) are redacted and URL userinfo is masked, but redaction is name-based: a secret stored under an innocuous key name is not detected.",
       {
         type: "object",
         properties: {
@@ -134,7 +151,7 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
               isError: true,
             };
           }
-          value = redactValue(key, config.get(key));
+          value = redactValue(section ? `${section}.${key}` : key, config.get(key));
         } else {
           const entries: Record<string, unknown> = {};
           // WorkspaceConfiguration mixes `has`/`get`/`update`/`inspect` in with
@@ -142,7 +159,7 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
           for (const name of Object.keys(config)) {
             if (typeof (config as unknown as Record<string, unknown>)[name] === "function")
               continue;
-            entries[name] = redactValue(name, config.get(name));
+            entries[name] = redactValue(`${section}.${name}`, config.get(name));
           }
           value = entries;
         }

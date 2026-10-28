@@ -2327,6 +2327,46 @@ describe("handler behavior", () => {
     });
   });
 
+  it("get_configuration redacts every child of a secret-named section", async () => {
+    mockConfiguration({ credentials: { github: "ghp_LEAK", gitlab: "glpat_LEAK" } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const dump = await h({ section: "credentials" });
+    expect(JSON.parse(dump.content[0].text)).toEqual({
+      github: "<redacted>",
+      gitlab: "<redacted>",
+    });
+
+    // Same leak via key mode, where the child key alone looks innocuous.
+    const keyed = await h({ section: "credentials", key: "github" });
+    expect(JSON.parse(keyed.content[0].text)).toBe("<redacted>");
+  });
+
+  it("get_configuration redacts connection strings and exact auth/bearer segments", async () => {
+    mockConfiguration({
+      db: { connectionString: "postgres://u:p@h/db", auth: "basic", bearer: "abc", author: "me" },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "db" });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      connectionString: "<redacted>",
+      auth: "<redacted>",
+      bearer: "<redacted>",
+      author: "me",
+    });
+  });
+
+  it("get_configuration masks URL userinfo in an ordinary string value", async () => {
+    mockConfiguration({ http: { proxy: "http://user:pass@proxy.local:8080" } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "http", key: "proxy" });
+
+    expect(JSON.parse(res.content[0].text)).toBe("http://<redacted>@proxy.local:8080");
+  });
+
   it("get_configuration treats an empty section as absent", async () => {
     mockConfiguration({});
 
