@@ -775,6 +775,95 @@ describe("multi-root workspace (E2E)", () => {
     expect(fs.readFileSync(untouched, "utf-8")).toBe("keep me\n");
   });
 
+  // ── get_file_info ────────────────────────────────────────────────────
+
+  /** Parse the JSON body that follows the `=== <path> ===` marker. */
+  function infoBody(text: string): Record<string, unknown> {
+    return JSON.parse(text.split("\n")[1]);
+  }
+
+  it("get_file_info returns size, modified and type for a file", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const target = path.join(tmpDir, "backend/src/index.ts");
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_file_info",
+      arguments: { paths: [target] },
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+
+    const text: string = res.result.content[0].text;
+    expect(text).toContain(`=== ${target} ===`);
+    const info = infoBody(text);
+    expect(info).toMatchObject({ exists: true, isDirectory: false });
+    expect(info.size as number).toBeGreaterThan(0);
+    expect(new Date(info.modified as string).toISOString()).toBe(info.modified);
+  });
+
+  it("get_file_info reports a directory", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const dir = path.join(tmpDir, "backend/src");
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_file_info",
+      arguments: { paths: [dir] },
+    });
+    expect(res.result.isError).toBe(false);
+    expect(infoBody(res.result.content[0].text)).toMatchObject({
+      exists: true,
+      isDirectory: true,
+    });
+  });
+
+  it("get_file_info reports a missing path as exists:false without failing", async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_file_info",
+      arguments: { paths: ["src/nope.ts"], workspaceFolder: "backend" },
+    });
+    expect(res.result.isError).toBe(false);
+    expect(infoBody(res.result.content[0].text)).toEqual({
+      exists: false,
+      isDirectory: false,
+      size: null,
+      modified: null,
+    });
+  });
+
+  it("get_file_info continues a batch past a missing path", async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_file_info",
+      arguments: { paths: ["src/index.ts", "src/nope.ts"], workspaceFolder: "backend" },
+    });
+    expect(res.result.isError).toBe(false);
+    const text: string = res.result.content[0].text;
+    expect(text).toContain('"exists":true');
+    expect(text).toContain('"exists":false');
+  });
+
+  it("get_file_info scopes a relative path to the workspace folder", async () => {
+    if (!ENABLED || !tmpDir) return;
+    // Use the second folder: ignoring workspaceFolder would resolve against
+    // the first (frontend) and still pass.
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_file_info",
+      arguments: { paths: ["src/index.ts"], workspaceFolder: "backend" },
+    });
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text as string).toContain(
+      `=== ${tmpDir}/backend/src/index.ts ===`,
+    );
+  });
+
+  it("get_file_info reports an out-of-workspace path inline", async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_file_info",
+      arguments: { paths: ["/etc/passwd"] },
+    });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text as string).toContain("[error:");
+  });
+
   // ── search_files (grep) ──────────────────────────────────────────────
 
   it("search_files finds literal text with file:line:col", async () => {

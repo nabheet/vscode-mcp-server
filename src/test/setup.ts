@@ -113,6 +113,7 @@ const mockVscode = {
   commands: mockCommands,
   debug: mockDebug,
   SymbolKind: mockSymbolKind,
+  // File system types used by get_file_info's `stat()` result.
   FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
   // For ExtensionContext type used in path.ts indirectly
   ExtensionContext: class {
