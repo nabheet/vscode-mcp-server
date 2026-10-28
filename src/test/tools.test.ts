@@ -2161,6 +2161,8 @@ describe("handler behavior", () => {
       ["/ws/n.ipynb", "notebook"],
       ["/ws/img.png", "custom"],
     ]);
+  });
+
   // ── get_configuration ────────────────────────────────────────────────────
 
   type MockConfig = {

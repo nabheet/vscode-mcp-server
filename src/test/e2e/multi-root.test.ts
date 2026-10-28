@@ -1577,6 +1577,8 @@ describe("multi-root workspace (E2E)", () => {
     });
 
     expect(await openEditors()).toEqual([]);
+  });
+
   // ── get_configuration ────────────────────────────────────────────────
 
   /** Call get_configuration and parse its JSON payload. */
