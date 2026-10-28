@@ -23,8 +23,12 @@ const mockUri = {
 const mockWorkspace = {
   workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
   workspaceFile: undefined as { uri: { scheme: string; fsPath: string } } | undefined,
-  fs: { readFile: vi.fn() },
+  fs: {
+    readFile: vi.fn(),
+    stat: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
+  },
   findFiles: vi.fn().mockResolvedValue([]),
+  applyEdit: vi.fn().mockResolvedValue(true),
   updateWorkspaceFolders: vi.fn(),
   onDidChangeWorkspaceFolders: vi.fn().mockImplementation((cb: () => void) => {
     cb();
@@ -34,6 +38,7 @@ const mockWorkspace = {
     get: <T>(_: string, defaultValue?: T) => defaultValue,
   }),
   onDidChangeConfiguration: () => ({ dispose: () => {} }),
+  textDocuments: [] as unknown[],
   openTextDocument: vi.fn(),
 };
 
@@ -107,6 +112,7 @@ const mockVscode = {
   commands: mockCommands,
   debug: mockDebug,
   SymbolKind: mockSymbolKind,
+  FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
   // For ExtensionContext type used in path.ts indirectly
   ExtensionContext: class {
     subscriptions: { dispose: () => void }[] = [];
@@ -149,6 +155,32 @@ const mockVscode = {
       public start: unknown,
       public end: unknown,
     ) {}
+  },
+  /**
+   * Records operations so tests can assert on the batch that was handed to
+   * `workspace.applyEdit` (the real apply is mocked out in unit tests).
+   */
+  WorkspaceEdit: class {
+    ops: {
+      kind: string;
+      uri: unknown;
+      range?: unknown;
+      position?: unknown;
+      newText?: string;
+      options?: unknown;
+    }[] = [];
+    createFile(uri: unknown, options?: unknown) {
+      this.ops.push({ kind: "createFile", uri, options });
+    }
+    deleteFile(uri: unknown, options?: unknown) {
+      this.ops.push({ kind: "deleteFile", uri, options });
+    }
+    replace(uri: unknown, range: unknown, newText: string) {
+      this.ops.push({ kind: "replace", uri, range, newText });
+    }
+    insert(uri: unknown, position: unknown, newText: string) {
+      this.ops.push({ kind: "insert", uri, position, newText });
+    }
   },
   TextEditorRevealType: { InCenter: 0 },
 };

@@ -3,6 +3,186 @@ import * as vscode from "vscode";
 import { resolvePath } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";
 
+/** Upper bound for a single created-file payload in `apply_workspace_edit`. */
+const MAX_EDIT_CONTENT_SIZE = 1 * 1024 * 1024; // 1 MB
+
+interface ParsedTextEdit {
+  start: vscode.Position;
+  end: vscode.Position;
+  newText: string;
+}
+
+type PlannedEdit =
+  | { kind: "textEdits"; uri: vscode.Uri; label: string; textEdits: ParsedTextEdit[] }
+  | { kind: "create"; uri: vscode.Uri; label: string; content: string }
+  | { kind: "delete"; uri: vscode.Uri; label: string };
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+interface PathStat {
+  exists: boolean;
+  isDirectory: boolean;
+}
+
+/** Stat a path, treating only "not found" as absence (other errors propagate as text). */
+async function statPath(uri: vscode.Uri): Promise<PathStat | string> {
+  try {
+    const stat = await vscode.workspace.fs.stat(uri);
+    const directoryBit =
+      typeof vscode.FileType?.Directory === "number" ? vscode.FileType.Directory : 2;
+    return {
+      exists: true,
+      isDirectory: typeof stat?.type === "number" && (stat.type & directoryBit) !== 0,
+    };
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code;
+    if (code === "FileNotFound" || code === "ENOENT") return { exists: false, isDirectory: false };
+    return `failed to stat path: ${errorMessage(err)}`;
+  }
+}
+
+interface FileMetrics {
+  lineCount: number;
+  lineLengths: number[];
+}
+
+/**
+ * File identity used throughout the batch: duplicate detection, the live
+ * document lookup and the save step must all agree, or a differently spelled
+ * path can bypass one of them.
+ */
+function uriKey(uri: vscode.Uri): string {
+  // Scheme stays in the key: a `git:` diff document for the same fsPath is a
+  // different document and must never shadow the user's file buffer.
+  const normalized = `${uri.scheme ?? "file"}:${path.normalize(uri.fsPath).normalize("NFC")}`;
+  return process.platform === "darwin" || process.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+/** The open document for `uri`, matched by file identity (not raw URI string). */
+function openDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
+  const key = uriKey(uri);
+  return vscode.workspace.textDocuments?.find((doc) => uriKey(doc.uri) === key);
+}
+
+/**
+ * Line metrics for the document the edit will apply to.
+ *
+ * An already-open document wins because that is what the edit mutates. Never
+ * open one here: `openTextDocument` would turn a pending disk write into an
+ * unsaved buffer.
+ */
+async function fileMetrics(uri: vscode.Uri): Promise<FileMetrics | string> {
+  const openDoc = openDocument(uri);
+  if (openDoc) {
+    const lineLengths: number[] = [];
+    for (let i = 0; i < openDoc.lineCount; i++) lineLengths.push(openDoc.lineAt(i).text.length);
+    return { lineCount: openDoc.lineCount, lineLengths };
+  }
+  try {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const lines = Buffer.from(bytes).toString("utf-8").split("\n");
+    return {
+      lineCount: lines.length,
+      lineLengths: lines.map((line) => (line.endsWith("\r") ? line.length - 1 : line.length)),
+    };
+  } catch (err) {
+    return `failed to read file for validation: ${errorMessage(err)}`;
+  }
+}
+
+/** Parse + validate the `textEdits` payload; returns an error message on failure. */
+function parseTextEdits(raw: unknown): ParsedTextEdit[] | string {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return "`textEdits` must be a non-empty array";
+  }
+  const parsed: ParsedTextEdit[] = [];
+  for (const [i, item] of raw.entries()) {
+    const te = item as { range?: unknown; newText?: unknown } | null;
+    if (!te || typeof te !== "object") return `textEdits[${i}] must be an object`;
+    if (typeof te.newText !== "string") return `textEdits[${i}].newText must be a string`;
+    const range = te.range as
+      | {
+          start?: { line?: unknown; character?: unknown };
+          end?: { line?: unknown; character?: unknown };
+        }
+      | undefined;
+    const start = range?.start;
+    const end = range?.end;
+    if (!start || !end) return `textEdits[${i}].range requires both \`start\` and \`end\``;
+    for (const [name, pos] of [
+      ["start", start],
+      ["end", end],
+    ] as const) {
+      const { line, character } = pos;
+      if (
+        typeof line !== "number" ||
+        typeof character !== "number" ||
+        !Number.isInteger(line) ||
+        !Number.isInteger(character) ||
+        line < 0 ||
+        character < 0
+      ) {
+        return `textEdits[${i}].range.${name} requires non-negative integer \`line\` and \`character\``;
+      }
+    }
+    const startPos = new vscode.Position(start.line as number, start.character as number);
+    const endPos = new vscode.Position(end.line as number, end.character as number);
+    if (
+      (end.line as number) < (start.line as number) ||
+      ((end.line as number) === (start.line as number) &&
+        (end.character as number) < (start.character as number))
+    ) {
+      return `textEdits[${i}].range.end must not precede range.start`;
+    }
+    parsed.push({ start: startPos, end: endPos, newText: te.newText });
+  }
+  // VS Code rejects overlapping edits in one file; catch it here so the error
+  // names the offending entries instead of failing the whole apply opaquely.
+  const ordered = parsed
+    .map((te, index) => ({ te, index }))
+    .sort((a, b) =>
+      a.te.start.line === b.te.start.line
+        ? a.te.start.character - b.te.start.character
+        : a.te.start.line - b.te.start.line,
+    );
+  for (let i = 1; i < ordered.length; i++) {
+    const prev = ordered[i - 1].te;
+    const next = ordered[i].te;
+    const nextStartsBeforePrevEnds =
+      next.start.line < prev.end.line ||
+      (next.start.line === prev.end.line && next.start.character < prev.end.character);
+    if (nextStartsBeforePrevEnds) {
+      return `textEdits[${ordered[i - 1].index}] and textEdits[${ordered[i].index}] overlap`;
+    }
+  }
+  return parsed;
+}
+
+/** Reject ranges that point past the end of the file or line, before any edit applies. */
+async function checkRangesAgainstFile(
+  uri: vscode.Uri,
+  edits: ParsedTextEdit[],
+): Promise<string | undefined> {
+  const metrics = await fileMetrics(uri);
+  if (typeof metrics === "string") return metrics;
+  for (const [i, te] of edits.entries()) {
+    if (te.start.line >= metrics.lineCount || te.end.line >= metrics.lineCount) {
+      return `textEdits[${i}].range is outside the file (${metrics.lineCount} line(s))`;
+    }
+    if (te.start.character > metrics.lineLengths[te.start.line]) {
+      return `textEdits[${i}].range.start.character ${te.start.character} exceeds line ${te.start.line} length (${metrics.lineLengths[te.start.line]})`;
+    }
+    if (te.end.character > metrics.lineLengths[te.end.line]) {
+      return `textEdits[${i}].range.end.character ${te.end.character} exceeds line ${te.end.line} length (${metrics.lineLengths[te.end.line]})`;
+    }
+  }
+  return undefined;
+}
+
 export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
@@ -168,6 +348,323 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           }
         }
         return { content: [{ type: "text", text: parts.join("\n\n") }], isError: failures > 0 };
+      },
+    ),
+  );
+
+  server.registerTool(
+    defineTool(
+      "apply_workspace_edit",
+      "Apply multiple edits across files in one VS Code WorkspaceEdit call. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion, and each path may appear once per batch. All entries are validated first; if any entry is invalid nothing is applied and per-file errors are reported inline. On success the whole batch is applied as a single undo step, and edited buffers are saved to disk unless the file already had unsaved changes.",
+      {
+        type: "object",
+        properties: {
+          edits: {
+            type: "array",
+            description:
+              "Batch of file edits applied atomically. Each entry must set exactly one of `textEdits`, `create: true`, or `delete: true`.",
+            items: {
+              type: "object",
+              properties: {
+                path: {
+                  type: "string",
+                  description: "File path (absolute or relative to workspace root)",
+                },
+                workspaceFolder: {
+                  type: "string",
+                  description:
+                    "Optional workspace folder name (for multi-root workspaces). Resolves a relative path against this folder.",
+                },
+                textEdits: {
+                  type: "array",
+                  description:
+                    "Text edits applied to an existing file. Ranges are 0-based (line, character) and applied in one group.",
+                  items: {
+                    type: "object",
+                    properties: {
+                      range: {
+                        type: "object",
+                        properties: {
+                          start: {
+                            type: "object",
+                            properties: {
+                              line: { type: "number", description: "0-based line number" },
+                              character: { type: "number", description: "0-based column" },
+                            },
+                            required: ["line", "character"],
+                          },
+                          end: {
+                            type: "object",
+                            properties: {
+                              line: { type: "number", description: "0-based line number" },
+                              character: { type: "number", description: "0-based column" },
+                            },
+                            required: ["line", "character"],
+                          },
+                        },
+                        required: ["start", "end"],
+                      },
+                      newText: {
+                        type: "string",
+                        description: "Replacement text (empty string deletes)",
+                      },
+                    },
+                    required: ["range", "newText"],
+                  },
+                },
+                create: {
+                  type: "boolean",
+                  description: "Create the file (fails atomically if it already exists)",
+                },
+                content: {
+                  type: "string",
+                  description:
+                    "Initial content for a created file (ignored unless `create` is true)",
+                },
+                delete: {
+                  type: "boolean",
+                  description: "Delete the file (fails atomically if missing)",
+                },
+              },
+              required: ["path"],
+            },
+          },
+        },
+        required: ["edits"],
+      },
+      async (args) => {
+        const raw = Array.isArray(args.edits) ? (args.edits as Record<string, unknown>[]) : [];
+        if (raw.length === 0) {
+          return { content: [{ type: "text", text: "No edits provided" }], isError: true };
+        }
+
+        const problems: string[] = [];
+        const planned: PlannedEdit[] = [];
+        const seenUris = new Set<string>();
+
+        for (const entry of raw) {
+          const label =
+            typeof entry?.path === "string" && entry.path ? entry.path : "(missing path)";
+          const fail = (message: string) => {
+            problems.push(`=== ${label} ===\n[error: ${message}]`);
+          };
+
+          if (typeof entry?.path !== "string" || entry.path.length === 0) {
+            fail("edit entry requires a non-empty string `path`");
+            continue;
+          }
+
+          let uri: vscode.Uri;
+          try {
+            uri = resolvePath(
+              entry.path,
+              entry.workspaceFolder ? String(entry.workspaceFolder) : undefined,
+            );
+          } catch (err) {
+            fail(errorMessage(err));
+            continue;
+          }
+
+          // One entry per file: VS Code rejects batches that delete and then
+          // edit the same URI, and duplicate creates would concatenate content.
+          const key = uriKey(uri);
+          if (seenUris.has(key)) {
+            fail("duplicate entry for the same file (edit each path once per batch)");
+            continue;
+          }
+          seenUris.add(key);
+
+          const hasTextEdits = entry.textEdits !== undefined;
+          const hasCreate = entry.create === true;
+          const hasDelete = entry.delete === true;
+          const modes = [hasTextEdits, hasCreate, hasDelete].filter(Boolean).length;
+          if (modes === 0) {
+            fail("edit entry requires one of `textEdits`, `create: true`, or `delete: true`");
+            continue;
+          }
+          if (modes > 1) {
+            fail("edit entry sets more than one of `textEdits`, `create`, `delete`");
+            continue;
+          }
+
+          if (hasDelete) {
+            const stat = await statPath(uri);
+            if (typeof stat === "string") {
+              fail(stat);
+              continue;
+            }
+            if (!stat.exists) {
+              fail("file does not exist");
+              continue;
+            }
+            if (stat.isDirectory) {
+              fail("path is a directory (only files can be deleted here)");
+              continue;
+            }
+            const openDelete = openDocument(uri);
+            if (openDelete?.isDirty === true) {
+              fail("file has unsaved changes in an open editor; save or close it before deleting");
+              continue;
+            }
+            planned.push({ kind: "delete", uri, label });
+            continue;
+          }
+
+          if (hasCreate) {
+            const stat = await statPath(uri);
+            if (typeof stat === "string") {
+              fail(stat);
+              continue;
+            }
+            if (stat.exists) {
+              fail("file already exists");
+              continue;
+            }
+            const content = typeof entry.content === "string" ? entry.content : "";
+            const bytes = Buffer.byteLength(content, "utf-8");
+            if (bytes > MAX_EDIT_CONTENT_SIZE) {
+              fail(`content too large: ${bytes} bytes (max ${MAX_EDIT_CONTENT_SIZE})`);
+              continue;
+            }
+            planned.push({ kind: "create", uri, label, content });
+            continue;
+          }
+
+          const parsed = parseTextEdits(entry.textEdits);
+          if (typeof parsed === "string") {
+            fail(parsed);
+            continue;
+          }
+          const stat = await statPath(uri);
+          if (typeof stat === "string") {
+            fail(stat);
+            continue;
+          }
+          if (!stat.exists) {
+            fail("file does not exist");
+            continue;
+          }
+          if (stat.isDirectory) {
+            fail("path is a directory (only files can be edited here)");
+            continue;
+          }
+          const lineErr = await checkRangesAgainstFile(uri, parsed);
+          if (lineErr) {
+            fail(lineErr);
+            continue;
+          }
+          planned.push({ kind: "textEdits", uri, label, textEdits: parsed });
+        }
+
+        // Atomicity: never apply a partial batch. Any per-file problem aborts
+        // the whole call; read_files-style inline errors explain each failure.
+        if (problems.length > 0) {
+          return {
+            content: [{ type: "text", text: problems.join("\n\n") }],
+            isError: true,
+          };
+        }
+
+        const edit = new vscode.WorkspaceEdit();
+        for (const p of planned) {
+          if (p.kind === "delete") {
+            edit.deleteFile(p.uri, { ignoreIfNotExists: false, recursive: false });
+          } else if (p.kind === "create") {
+            edit.createFile(p.uri, { ignoreIfExists: false, overwrite: false });
+            if (p.content) edit.insert(p.uri, new vscode.Position(0, 0), p.content);
+          } else {
+            for (const te of p.textEdits ?? []) {
+              edit.replace(p.uri, new vscode.Range(te.start, te.end), te.newText);
+            }
+          }
+        }
+
+        // VS Code applies text edits to editor buffers; only files that were
+        // already open get persisted by the editor's own save rules. Record
+        // which documents were dirty beforehand so we save what we changed —
+        // and only that.
+        const dirtyBefore = new Map<string, boolean>();
+        for (const doc of vscode.workspace.textDocuments ?? []) {
+          dirtyBefore.set(uriKey(doc.uri), doc.isDirty === true);
+        }
+
+        let applied: boolean;
+        try {
+          applied = await vscode.workspace.applyEdit(edit);
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to apply workspace edit: ${errorMessage(err)}. Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (!applied) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Failed to apply workspace edit: VS Code rejected the batch. Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const saveProblems: string[] = [];
+        const leftDirty: string[] = [];
+        for (const p of planned) {
+          if (p.kind === "delete") continue;
+          const key = uriKey(p.uri);
+          const doc = openDocument(p.uri);
+          if (!doc || doc.isDirty !== true || typeof doc.save !== "function") continue;
+          if (dirtyBefore.get(key) === true) {
+            leftDirty.push(p.uri.fsPath);
+            continue;
+          }
+          try {
+            // VS Code resolves `false` when a save fails; it does not reject.
+            const saved = await doc.save();
+            if (saved === false) saveProblems.push(`${p.uri.fsPath}: the editor could not save it`);
+          } catch (err) {
+            saveProblems.push(`${p.uri.fsPath}: ${errorMessage(err)}`);
+          }
+        }
+        if (saveProblems.length > 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Edit applied in the editor but could not be saved to disk for ${saveProblems.length} file(s):\n${saveProblems.join("\n")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const summary = planned.map((p) => {
+          if (p.kind === "delete") return `=== ${p.uri.fsPath} ===\nDeleted`;
+          if (p.kind === "create") {
+            const bytes = Buffer.byteLength(p.content ?? "", "utf-8");
+            return `=== ${p.uri.fsPath} ===\nCreated (${bytes} bytes)`;
+          }
+          return `=== ${p.uri.fsPath} ===\nApplied ${p.textEdits?.length ?? 0} text edit(s)`;
+        });
+        const notes = leftDirty.length
+          ? `\n\nLeft unsaved (document already had unsaved changes):\n${leftDirty.join("\n")}`
+          : "";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Applied ${planned.length} file edit(s) in a single workspace edit\n\n${summary.join("\n\n")}${notes}`,
+            },
+          ],
+          isError: false,
+        };
       },
     ),
   );
