@@ -6,12 +6,20 @@ import { vi } from "vitest";
  */
 const mockUri = {
   file: (path: string) => ({ fsPath: path, scheme: "file", path, toString: () => path }),
-  parse: (uri: string) => ({
-    fsPath: uri.replace("file://", ""),
-    scheme: "file",
-    path: uri,
-    toString: () => uri,
-  }),
+  /**
+   * Split a URI into scheme + path the way VS Code's own URI parser does:
+   * any `[a-z][a-z0-9+.-]*:` prefix is a scheme — including a single letter,
+   * so `C:/x` parses as scheme "c". That is precisely why callers must choose
+   * between `Uri.parse` and `Uri.file` for a Windows path. Percent-encoded
+   * paths are decoded.
+   */
+  parse: (uri: string) => {
+    const match = /^([a-z][a-z0-9+.-]*):(.*)$/i.exec(uri);
+    if (!match) return { fsPath: uri, scheme: "file", path: uri, toString: () => uri };
+    const scheme = match[1].toLowerCase();
+    const rest = decodeURIComponent(match[2].replace(/^\/\//, ""));
+    return { fsPath: rest, scheme, path: rest, toString: () => uri };
+  },
   joinPath: (uri: { fsPath?: string; scheme?: string; path?: string }, ...paths: string[]) => ({
     fsPath: [uri.fsPath, ...paths].join("/"),
     scheme: uri.scheme ?? "file",
@@ -88,6 +96,11 @@ const mockCommands = {
   getCommands: vi.fn().mockResolvedValue(["cmd1", "cmd2"]),
 };
 
+/** Language API surface used by lsp.ts. `getDiagnostics` has two overloads. */
+const mockLanguages = {
+  getDiagnostics: vi.fn().mockReturnValue([]),
+};
+
 /** Minimal reverse mapping for `vscode.SymbolKind[kind]` lookups in lsp.ts. */
 const mockSymbolKind: Record<number, string> = {
   0: "File",
@@ -111,6 +124,7 @@ const mockVscode = {
   window: mockWindow,
   env: mockEnv,
   commands: mockCommands,
+  languages: mockLanguages,
   debug: mockDebug,
   SymbolKind: mockSymbolKind,
   // File system types used by get_file_info's `stat()` result.
