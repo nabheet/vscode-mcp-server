@@ -21,6 +21,14 @@ function activeEditor(): vscode.TextEditor | undefined {
   return vscode.window.activeTextEditor;
 }
 
+/**
+ * Accept either a `file:///abs/path` URI or a raw filesystem path. A bare
+ * drive letter (`C:/x`) is a path, not a scheme, so a scheme needs 2+ chars.
+ */
+function parseUriArg(value: string): vscode.Uri {
+  return /^[a-z][a-z0-9+.-]+:/i.test(value) ? vscode.Uri.parse(value) : vscode.Uri.file(value);
+}
+
 /** Tool result for "no active text editor". */
 function noEditorError(): { content: { type: "text"; text: string }[]; isError: true } {
   return { content: [{ type: "text", text: "No active text editor" }], isError: true };
@@ -52,16 +60,6 @@ function normaliseLocation(loc: unknown): NormalisedLocation {
   throw new Error(
     `Unexpected location format from language server: ${JSON.stringify(loc).slice(0, 200)}`,
   );
-}
-
-/** Diagnostics grouped by document, as returned by the diagnostics provider. */
-interface DocumentDiagnostics {
-  uri: vscode.Uri;
-  diagnostics: vscode.Diagnostic[];
-}
-
-function isDocumentDiagnostics(value: unknown): value is DocumentDiagnostics {
-  return typeof value === "object" && value !== null && "uri" in value && "diagnostics" in value;
 }
 
 /** Arrays and other iterables — main iterated any truthy `children` value. */
@@ -273,55 +271,54 @@ export function registerLspTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "get_diagnostics",
-      "Get diagnostics for the active file (or all files if no editor active).",
+      "Get diagnostics for the active file, for a specific file, or for every file when nothing is open. Returns `path:line:col [severity] message` lines, capped at 200 with a count of the remainder.",
       {
         type: "object",
         properties: {
-          uri: { type: "string", description: "Optional file URI to get diagnostics for" },
+          uri: {
+            type: "string",
+            description:
+              "Optional file to get diagnostics for, as a `file:///abs/path` URI or a raw absolute path",
+          },
         },
       },
       async (args) => {
+        // Both getDiagnostics overloads are normalised to [uri, diagnostics]
+        // pairs. The no-arg form already returns that shape — positional
+        // arrays, which have no `uri`/`diagnostics` properties — while the
+        // targeted form returns a bare Diagnostic[].
+        let entries: Array<{ uri?: vscode.Uri; diagnostics: readonly vscode.Diagnostic[] }>;
         let targetUri: vscode.Uri | undefined;
         if (args.uri) {
-          targetUri = vscode.Uri.file(String(args.uri));
+          targetUri = parseUriArg(String(args.uri));
+          entries = [{ uri: targetUri, diagnostics: vscode.languages.getDiagnostics(targetUri) }];
         } else if (vscode.window.activeTextEditor) {
           targetUri = vscode.window.activeTextEditor.document.uri;
+          entries = [{ uri: targetUri, diagnostics: vscode.languages.getDiagnostics(targetUri) }];
+        } else {
+          entries = vscode.languages
+            .getDiagnostics()
+            .map(([uri, diagnostics]) => ({ uri, diagnostics }));
         }
 
-        const diagnostics = targetUri
-          ? vscode.languages.getDiagnostics(targetUri)
-          : vscode.languages.getDiagnostics();
+        const MAX_DIAG_LINES = 200;
+        const lines: string[] = [];
+        let total = 0;
+        for (const entry of entries) {
+          const diagnostics = Array.isArray(entry.diagnostics) ? entry.diagnostics : [];
+          total += diagnostics.length;
+          if (lines.length >= MAX_DIAG_LINES) continue;
+          const file = entry.uri?.fsPath ?? targetUri?.fsPath ?? "?";
+          for (const d of diagnostics) {
+            if (lines.length >= MAX_DIAG_LINES) break;
+            const line = `${file}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
+            lines.push(line);
+          }
+        }
 
-        if (!diagnostics || (Array.isArray(diagnostics) && diagnostics.length === 0)) {
+        if (total === 0) {
           return { content: [{ type: "text", text: "No diagnostics" }], isError: false };
         }
-
-        const lines: string[] = [];
-        const MAX_DIAG_LINES = 200;
-        const entries = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
-        for (const diag of entries) {
-          if (isDocumentDiagnostics(diag)) {
-            for (const d of diag.diagnostics) {
-              const line = `${diag.uri.fsPath}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
-              if (lines.length < MAX_DIAG_LINES) {
-                lines.push(line);
-              }
-            }
-          } else {
-            const d = diag as vscode.Diagnostic;
-            const line = `${targetUri?.fsPath || "?"}:${d.range.start.line + 1}:${d.range.start.character + 1} [${d.severity}] ${d.message}`;
-            if (lines.length < MAX_DIAG_LINES) {
-              lines.push(line);
-            }
-          }
-        }
-        const rawDiag: unknown[] = Array.isArray(diagnostics) ? diagnostics : [diagnostics];
-        const total = rawDiag.reduce((sum: number, entry: unknown) => {
-          if (isDocumentDiagnostics(entry)) {
-            return sum + (Array.isArray(entry.diagnostics) ? entry.diagnostics.length : 1);
-          }
-          return sum + 1;
-        }, 0);
         const tail = total > MAX_DIAG_LINES ? `\n... and ${total - MAX_DIAG_LINES} more` : "";
         return { content: [{ type: "text", text: lines.join("\n") + tail }], isError: false };
       },

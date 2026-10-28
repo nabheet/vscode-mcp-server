@@ -332,6 +332,10 @@ describe("handler behavior", () => {
     (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [];
     (vscode.window as unknown as { tabGroups: { all: unknown[] } }).tabGroups.all = [];
     (vscode.debug.startDebugging as unknown as MockDebug["startDebugging"]).mockReset();
+    (vscode.window as unknown as { activeTextEditor?: unknown }).activeTextEditor = undefined;
+    (vscode as unknown as { languages: { getDiagnostics: unknown } }).languages.getDiagnostics = vi
+      .fn()
+      .mockReturnValue([]);
     vi.clearAllMocks();
 
     // Load all tool modules and capture handlers via MockServer
@@ -342,6 +346,7 @@ describe("handler behavior", () => {
     const { registerSearchTools } = await import("../mcp/tools/search");
     const { registerEditorsTools } = await import("../mcp/tools/editors");
     const { registerConfigurationTools } = await import("../mcp/tools/configuration");
+    const { registerLspTools } = await import("../mcp/tools/lsp");
 
     handlers = new Map();
     class MockServer {
@@ -356,6 +361,7 @@ describe("handler behavior", () => {
     registerSearchTools(new MockServer() as unknown as McpServer);
     registerEditorsTools(new MockServer() as unknown as McpServer);
     registerConfigurationTools(new MockServer() as unknown as McpServer);
+    registerLspTools(new MockServer() as unknown as McpServer);
   });
 
   /**
@@ -2684,5 +2690,99 @@ describe("handler behavior", () => {
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("No paths provided");
+  });
+
+  // ── get_diagnostics ──────────────────────────────────────────────────────
+
+  type MockLanguages = {
+    getDiagnostics: (uri?: vscode.Uri) => unknown;
+  };
+
+  /** A minimal Diagnostic, as the language server would deliver it. */
+  function diag(message: string, line = 0, character = 0, severity = 0) {
+    return { range: { start: { line, character }, end: { line, character } }, message, severity };
+  }
+
+  it("get_diagnostics handles the no-argument tuple form without crashing", async () => {
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = vi
+      .fn()
+      .mockReturnValue([
+        [vscode.Uri.file("/ws/a.ts"), [diag("boom")]],
+        [vscode.Uri.file("/ws/b.ts"), [diag("bang", 3, 4)]],
+      ]);
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    const res = await h({});
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("/ws/a.ts:1:1 [0] boom");
+    expect(res.content[0].text).toContain("/ws/b.ts:4:5 [0] bang");
+  });
+
+  it("get_diagnostics reports No diagnostics for an empty no-argument result", async () => {
+    const h = requireHandler(handlers, "get_diagnostics");
+    const res = await h({});
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toBe("No diagnostics");
+  });
+
+  it("get_diagnostics accepts a file:// URI instead of mangling it", async () => {
+    const getDiagnostics = vi.fn().mockReturnValue([diag("from uri")]);
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = getDiagnostics;
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    const res = await h({ uri: "file:///ws/src/app.ts" });
+
+    expect(res.isError).toBe(false);
+    // Uri.file("file:///ws/src/app.ts") would yield a broken double scheme.
+    expect(getDiagnostics).toHaveBeenCalledWith(
+      expect.objectContaining({ fsPath: "/ws/src/app.ts", scheme: "file" }),
+    );
+    expect(res.content[0].text).toContain("/ws/src/app.ts:1:1 [0] from uri");
+  });
+
+  it("get_diagnostics accepts a raw absolute path", async () => {
+    const getDiagnostics = vi.fn().mockReturnValue([diag("from path")]);
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = getDiagnostics;
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    const res = await h({ uri: "/ws/src/plain.ts" });
+
+    expect(res.isError).toBe(false);
+    expect(getDiagnostics).toHaveBeenCalledWith(
+      expect.objectContaining({ fsPath: "/ws/src/plain.ts" }),
+    );
+  });
+
+  it("get_diagnostics prefers the active editor when no uri is given", async () => {
+    (vscode.window as unknown as { activeTextEditor?: unknown }).activeTextEditor = {
+      document: { uri: vscode.Uri.file("/ws/active.ts") },
+      selection: { active: { line: 0, character: 0 } },
+    };
+    const getDiagnostics = vi.fn().mockReturnValue([diag("active")]);
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = getDiagnostics;
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    const res = await h({});
+
+    expect(res.isError).toBe(false);
+    expect(getDiagnostics).toHaveBeenCalledTimes(1);
+    expect(res.content[0].text).toContain("/ws/active.ts:1:1 [0] active");
+  });
+
+  it("get_diagnostics caps the output and counts the remainder", async () => {
+    const many = Array.from({ length: 205 }, (_, i) => diag(`m${i}`, i));
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = vi
+      .fn()
+      .mockReturnValue([[vscode.Uri.file("/ws/big.ts"), many]]);
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    const res = await h({});
+
+    const body = res.content[0].text as string;
+    const lines = body.split("\n");
+    expect(lines.length).toBe(201); // 200 diagnostics + the "and N more" line
+    expect(body).toContain("... and 5 more");
   });
 });

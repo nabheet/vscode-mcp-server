@@ -1218,6 +1218,48 @@ describe("multi-root workspace (E2E)", () => {
     expect(readRes.result.isError).toBe(true);
   });
 
+  // ── get_diagnostics ──────────────────────────────────────────────────
+
+  it("get_diagnostics accepts a file:// URI and a raw path alike", async () => {
+    if (!ENABLED || !tmpDir) return;
+    const abs = path.join(tmpDir, "backend/src/index.ts");
+    await mcpRequest(port, "tools/call", { name: "open_file", arguments: { path: abs } });
+
+    const asUri = await mcpRequest(port, "tools/call", {
+      name: "get_diagnostics",
+      arguments: { uri: `file://${abs}` },
+    });
+    const asPath = await mcpRequest(port, "tools/call", {
+      name: "get_diagnostics",
+      arguments: { uri: abs },
+    });
+
+    // A mangled URI (Uri.file("file:///…")) looks up a non-existent document,
+    // so the two forms would disagree.
+    for (const res of [asUri, asPath]) {
+      expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+      expect(typeof res.result.content[0].text).toBe("string");
+    }
+    expect(asUri.result.content[0].text).toBe(asPath.result.content[0].text);
+  });
+
+  it("get_diagnostics with no uri does not crash when no editor is active", async () => {
+    if (!ENABLED) return;
+    await mcpRequest(port, "tools/call", { name: "close_all_editors", arguments: {} });
+
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_diagnostics",
+      arguments: {},
+    });
+
+    // The no-argument overload returns [uri, diagnostics] tuples; mishandling
+    // them threw a TypeError. Whatever the workspace reports, this must be a
+    // normal result — "No diagnostics" when clean, otherwise path:line lines.
+    expect(res.result.isError).toBe(false);
+    expect(typeof res.result.content[0].text).toBe("string");
+    expect(res.result.content[0].text.length).toBeGreaterThan(0);
+  });
+
   // ── open_file with workspaceFolder ───────────────────────────────────
 
   it("open_file with workspaceFolder opens from correct folder", async () => {

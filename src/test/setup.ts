@@ -88,6 +88,11 @@ const mockCommands = {
   getCommands: vi.fn().mockResolvedValue(["cmd1", "cmd2"]),
 };
 
+/** Language API surface used by lsp.ts. `getDiagnostics` has two overloads. */
+const mockLanguages = {
+  getDiagnostics: vi.fn().mockReturnValue([]),
+};
+
 /** Minimal reverse mapping for `vscode.SymbolKind[kind]` lookups in lsp.ts. */
 const mockSymbolKind: Record<number, string> = {
   0: "File",
@@ -111,6 +116,7 @@ const mockVscode = {
   window: mockWindow,
   env: mockEnv,
   commands: mockCommands,
+  languages: mockLanguages,
   debug: mockDebug,
   SymbolKind: mockSymbolKind,
   // File system types used by get_file_info's `stat()` result.
