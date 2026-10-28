@@ -54,24 +54,29 @@ interface FileMetrics {
  * path can bypass one of them.
  */
 function uriKey(uri: vscode.Uri): string {
-  const normalized = path.normalize(uri.fsPath).normalize("NFC");
+  // Scheme stays in the key: a `git:` diff document for the same fsPath is a
+  // different document and must never shadow the user's file buffer.
+  const normalized = `${uri.scheme ?? "file"}:${path.normalize(uri.fsPath).normalize("NFC")}`;
   return process.platform === "darwin" || process.platform === "win32"
     ? normalized.toLowerCase()
     : normalized;
 }
 
+/** The open document for `uri`, matched by file identity (not raw URI string). */
+function openDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
+  const key = uriKey(uri);
+  return vscode.workspace.textDocuments?.find((doc) => uriKey(doc.uri) === key);
+}
+
 /**
  * Line metrics for the document the edit will apply to.
  *
- * An already-open document wins (it may hold unsaved changes the edit will
- * target), but this never opens one: `openTextDocument` would turn the edit
- * into an unsaved buffer instead of a disk write.
+ * An already-open document wins because that is what the edit mutates. Never
+ * open one here: `openTextDocument` would turn a pending disk write into an
+ * unsaved buffer.
  */
 async function fileMetrics(uri: vscode.Uri): Promise<FileMetrics | string> {
-  const key = uriKey(uri);
-  const openDoc = vscode.workspace.textDocuments?.find(
-    (doc) => uriKey(doc.uri as vscode.Uri) === key,
-  );
+  const openDoc = openDocument(uri);
   if (openDoc) {
     const lineLengths: number[] = [];
     for (let i = 0; i < openDoc.lineCount; i++) lineLengths.push(openDoc.lineAt(i).text.length);
@@ -134,6 +139,25 @@ function parseTextEdits(raw: unknown): ParsedTextEdit[] | string {
       return `textEdits[${i}].range.end must not precede range.start`;
     }
     parsed.push({ start: startPos, end: endPos, newText: te.newText });
+  }
+  // VS Code rejects overlapping edits in one file; catch it here so the error
+  // names the offending entries instead of failing the whole apply opaquely.
+  const ordered = parsed
+    .map((te, index) => ({ te, index }))
+    .sort((a, b) =>
+      a.te.start.line === b.te.start.line
+        ? a.te.start.character - b.te.start.character
+        : a.te.start.line - b.te.start.line,
+    );
+  for (let i = 1; i < ordered.length; i++) {
+    const prev = ordered[i - 1].te;
+    const next = ordered[i].te;
+    const nextStartsBeforePrevEnds =
+      next.start.line < prev.end.line ||
+      (next.start.line === prev.end.line && next.start.character < prev.end.character);
+    if (nextStartsBeforePrevEnds) {
+      return `textEdits[${ordered[i - 1].index}] and textEdits[${ordered[i].index}] overlap`;
+    }
   }
   return parsed;
 }
@@ -477,6 +501,11 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
               fail("path is a directory (only files can be deleted here)");
               continue;
             }
+            const openDelete = openDocument(uri);
+            if (openDelete?.isDirty === true) {
+              fail("file has unsaved changes in an open editor; save or close it before deleting");
+              continue;
+            }
             planned.push({ kind: "delete", uri, label });
             continue;
           }
@@ -556,7 +585,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         // and only that.
         const dirtyBefore = new Map<string, boolean>();
         for (const doc of vscode.workspace.textDocuments ?? []) {
-          dirtyBefore.set(uriKey(doc.uri as vscode.Uri), doc.isDirty === true);
+          dirtyBefore.set(uriKey(doc.uri), doc.isDirty === true);
         }
 
         let applied: boolean;
@@ -567,7 +596,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             content: [
               {
                 type: "text",
-                text: `Failed to apply workspace edit: ${errorMessage(err)}. Nothing further was applied — verify any paths in this batch that were created or deleted.`,
+                text: `Failed to apply workspace edit: ${errorMessage(err)}. Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
               },
             ],
             isError: true,
@@ -578,7 +607,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             content: [
               {
                 type: "text",
-                text: "Failed to apply workspace edit: VS Code rejected the batch. Text edits were not applied — verify any paths in this batch that were created or deleted.",
+                text: "Failed to apply workspace edit: VS Code rejected the batch. Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.",
               },
             ],
             isError: true,
@@ -590,16 +619,16 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         for (const p of planned) {
           if (p.kind === "delete") continue;
           const key = uriKey(p.uri);
-          const doc = vscode.workspace.textDocuments?.find(
-            (d) => uriKey(d.uri as vscode.Uri) === key,
-          );
+          const doc = openDocument(p.uri);
           if (!doc || doc.isDirty !== true || typeof doc.save !== "function") continue;
           if (dirtyBefore.get(key) === true) {
             leftDirty.push(p.uri.fsPath);
             continue;
           }
           try {
-            await doc.save();
+            // VS Code resolves `false` when a save fails; it does not reject.
+            const saved = await doc.save();
+            if (saved === false) saveProblems.push(`${p.uri.fsPath}: the editor could not save it`);
           } catch (err) {
             saveProblems.push(`${p.uri.fsPath}: ${errorMessage(err)}`);
           }

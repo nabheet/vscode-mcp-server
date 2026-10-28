@@ -613,7 +613,7 @@ describe("handler behavior", () => {
       .map(([fsPath, text]) => {
         const lines = (text as string).split("\n");
         return {
-          uri: { fsPath, toString: () => fsPath },
+          uri: { fsPath, scheme: "file", toString: () => fsPath },
           lineCount: lines.length,
           lineAt: (i: number) => ({ text: lines[i] ?? "" }),
         };
@@ -795,7 +795,7 @@ describe("handler behavior", () => {
     const res = await h({ edits: [{ path: "fresh.ts", create: true, content: "x" }] });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("rejected the batch");
-    expect(res.content[0].text).toContain("Text edits were not applied");
+    expect(res.content[0].text).toContain("not guaranteed to be a clean rollback");
   });
 
   it("apply_workspace_edit rejects two entries that resolve to the same file", async () => {
@@ -883,7 +883,7 @@ describe("handler behavior", () => {
     const save = vi.fn().mockResolvedValue(true);
     ws.textDocuments = [
       {
-        uri: { fsPath: "/ws/frontend/X.ts", toString: () => "/ws/frontend/X.ts" },
+        uri: { fsPath: "/ws/frontend/X.ts", scheme: "file", toString: () => "/ws/frontend/X.ts" },
         isDirty: true,
         lineCount: 2,
         lineAt: () => ({ text: "a" }),
@@ -973,14 +973,14 @@ describe("handler behavior", () => {
     const saveA = vi.fn().mockResolvedValue(true);
     const saveB = vi.fn().mockResolvedValue(true);
     const docB = {
-      uri: { fsPath: "/ws/frontend/b.ts", toString: () => "/ws/frontend/b.ts" },
+      uri: { fsPath: "/ws/frontend/b.ts", scheme: "file", toString: () => "/ws/frontend/b.ts" },
       isDirty: true,
       lineCount: 2,
       lineAt: () => ({ text: "b" }),
       save: saveB,
     };
     const docA = {
-      uri: { fsPath: "/ws/frontend/a.ts", toString: () => "/ws/frontend/a.ts" },
+      uri: { fsPath: "/ws/frontend/a.ts", scheme: "file", toString: () => "/ws/frontend/a.ts" },
       isDirty: true,
       lineCount: 2,
       lineAt: () => ({ text: "a" }),
@@ -1017,7 +1017,7 @@ describe("handler behavior", () => {
     ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
     mockWorkspaceFiles({ "/ws/frontend/ro.ts": "a\n" });
     const doc = {
-      uri: { fsPath: "/ws/frontend/ro.ts", toString: () => "/ws/frontend/ro.ts" },
+      uri: { fsPath: "/ws/frontend/ro.ts", scheme: "file", toString: () => "/ws/frontend/ro.ts" },
       isDirty: true,
       lineCount: 2,
       lineAt: () => ({ text: "a" }),
@@ -1047,6 +1047,142 @@ describe("handler behavior", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("could not be saved to disk");
     expect(res.content[0].text).toContain("EACCES");
+  });
+
+  it("apply_workspace_edit treats a failed save (resolved false) as an error", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/a.ts": "a\n" });
+    const doc = {
+      uri: { fsPath: "/ws/frontend/a.ts", scheme: "file", toString: () => "/ws/frontend/a.ts" },
+      isDirty: true,
+      lineCount: 2,
+      lineAt: () => ({ text: "a" }),
+      // Real VS Code resolves false when a save fails; it does not reject.
+      save: vi.fn().mockResolvedValue(false),
+    };
+    ws.textDocuments = [];
+    ws.applyEdit = vi.fn().mockImplementation(() => {
+      ws.textDocuments = [doc];
+      return Promise.resolve(true);
+    });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "a.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+              newText: "b",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("could not be saved to disk");
+    expect(res.content[0].text).toContain("the editor could not save it");
+  });
+
+  it("apply_workspace_edit rejects overlapping edits in one file", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/a.ts": "abcdef\n" });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "a.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } },
+              newText: "X",
+            },
+            {
+              range: { start: { line: 0, character: 2 }, end: { line: 0, character: 5 } },
+              newText: "Y",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("textEdits[0] and textEdits[1] overlap");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit refuses to delete a file with unsaved changes", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/a.ts": "a\n" });
+    ws.textDocuments = [
+      {
+        uri: { fsPath: "/ws/frontend/a.ts", scheme: "file", toString: () => "/ws/frontend/a.ts" },
+        isDirty: true,
+      },
+    ];
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({ edits: [{ path: "a.ts", delete: true }] });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("unsaved changes in an open editor");
+    expect(vscode.workspace.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("apply_workspace_edit does not let a diff-view document shadow the file's dirty state", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "frontend", uri: vscode.Uri.file("/ws/frontend") }];
+    mockWorkspaceFiles({ "/ws/frontend/a.ts": "a\n" });
+    const save = vi.fn().mockResolvedValue(true);
+    const dirtyFileDoc = {
+      uri: { fsPath: "/ws/frontend/a.ts", scheme: "file", toString: () => "/ws/frontend/a.ts" },
+      isDirty: true,
+      lineCount: 2,
+      lineAt: () => ({ text: "a" }),
+      save,
+    };
+    // A read-only `git:` diff document for the same path, still clean.
+    ws.textDocuments = [
+      {
+        uri: {
+          fsPath: "/ws/frontend/a.ts",
+          scheme: "git",
+          toString: () => "git:/ws/frontend/a.ts",
+        },
+        isDirty: false,
+        lineCount: 2,
+        lineAt: () => ({ text: "a" }),
+      },
+    ];
+    ws.applyEdit = vi.fn().mockImplementation(() => {
+      ws.textDocuments = [...(ws.textDocuments ?? []), dirtyFileDoc];
+      return Promise.resolve(true);
+    });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "a.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+              newText: "b",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(res.isError, res.content[0].text).toBe(false);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(res.content[0].text).not.toContain("Left unsaved");
   });
 
   it("apply_workspace_edit refuses to delete a directory", async () => {
