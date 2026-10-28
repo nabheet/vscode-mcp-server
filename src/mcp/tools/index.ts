@@ -3,6 +3,7 @@ import type { ToolDefinition } from "../../utils/types";
 
 import { registerCommandsTools } from "./commands";
 import { registerDebugTools } from "./debug";
+import { registerEditorsTools } from "./editors";
 import { registerLogsTools } from "./logs";
 import { registerLspTools } from "./lsp";
 import { registerNavigationTools } from "./navigation";
@@ -23,6 +24,7 @@ export function registerAllTools(server: ToolRegistrar, context: vscode.Extensio
   registerCommandsTools(server);
   registerNavigationTools(server);
   registerWorkspaceTools(server);
+  registerEditorsTools(server);
   registerLspTools(server);
   registerDebugTools(server);
   registerTerminalTools(server, context);

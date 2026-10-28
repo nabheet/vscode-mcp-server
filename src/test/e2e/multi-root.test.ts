@@ -1413,6 +1413,136 @@ describe("multi-root workspace (E2E)", () => {
     }
   }, 120000);
 
+  // ── get_open_editors ─────────────────────────────────────────────────
+
+  /** Call get_open_editors in the real window and parse its JSON payload. */
+  async function openEditors(args: Record<string, unknown> = {}) {
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_open_editors",
+      arguments: args,
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    return JSON.parse(res.result.content[0].text) as {
+      path: string;
+      kind: string;
+      isVisible: boolean;
+      isActive: boolean;
+      isDirty: boolean;
+      group: number;
+    }[];
+  }
+
+  it("get_open_editors lists an open file with absolute path and flags", async () => {
+    if (!ENABLED) return;
+    const target = path.join(tmpDir as string, "backend/src/listed.ts");
+    fs.writeFileSync(target, "listed\n");
+
+    const opened = await mcpRequest(port, "tools/call", {
+      name: "open_file",
+      arguments: { path: target },
+    });
+    expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
+
+    const editors = await openEditors();
+    const entry = editors.find((e) => e.path === target);
+    expect(entry, `editors: ${JSON.stringify(editors)}`).toBeDefined();
+    expect(entry).toMatchObject({ kind: "text", isVisible: true, isActive: true, isDirty: false });
+    expect(path.isAbsolute(entry?.path as string)).toBe(true);
+  });
+
+  it("get_open_editors hides background tabs when includeVisible is set", async () => {
+    if (!ENABLED) return;
+    const first = path.join(tmpDir as string, "backend/src/bg-one.ts");
+    const second = path.join(tmpDir as string, "backend/src/bg-two.ts");
+    fs.writeFileSync(first, "one\n");
+    fs.writeFileSync(second, "two\n");
+
+    const opened = await mcpRequest(port, "tools/call", {
+      name: "open_file",
+      arguments: { path: first },
+    });
+    expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
+    // Without this the next open reuses the preview tab and the first file
+    // never becomes a second tab.
+    await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.keepEditor" },
+    });
+
+    const secondOpened = await mcpRequest(port, "tools/call", {
+      name: "open_file",
+      arguments: { path: second },
+    });
+    expect(secondOpened.result.isError, `open_file: ${secondOpened.result.content[0].text}`).toBe(
+      false,
+    );
+
+    const all = await openEditors();
+    expect(all.map((e) => e.path)).toEqual(expect.arrayContaining([first, second]));
+
+    const visible = await openEditors({ includeVisible: true });
+    expect(visible.map((e) => e.path)).toEqual([second]);
+  });
+
+  it("get_open_editors flags an editor with unsaved changes", async () => {
+    if (!ENABLED) return;
+    const target = path.join(tmpDir as string, "backend/src/dirty-tab.ts");
+    fs.writeFileSync(target, "clean\n");
+
+    const opened = await mcpRequest(port, "tools/call", {
+      name: "open_file",
+      arguments: { path: target },
+    });
+    expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
+    const typed = await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "type", args: [{ text: "unsaved\n" }] },
+    });
+    expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+
+    const editors = await openEditors();
+    expect(editors.find((e) => e.path === target)?.isDirty).toBe(true);
+
+    // Leave no dirty buffer behind for later tests.
+    await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.files.revert" },
+    });
+  });
+
+  it("get_open_editors skips untitled buffers", async () => {
+    if (!ENABLED) return;
+    const untitled = await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.files.newUntitledFile" },
+    });
+    expect(untitled.result.isError, `newUntitledFile: ${untitled.result.content[0].text}`).toBe(
+      false,
+    );
+
+    const editors = await openEditors();
+    // Only files on disk: every entry is an absolute path that exists.
+    for (const editor of editors) {
+      expect(path.isAbsolute(editor.path)).toBe(true);
+      expect(fs.existsSync(editor.path), `missing on disk: ${editor.path}`).toBe(true);
+    }
+
+    await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.closeActiveEditor" },
+    });
+  });
+
+  it("get_open_editors returns an empty list when nothing is open", async () => {
+    if (!ENABLED) return;
+    await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.closeAllEditors" },
+    });
+
+    expect(await openEditors()).toEqual([]);
+  });
+
   // ── Error cases ──────────────────────────────────────────────────────
 
   it("list_files with nonexistent workspaceFolder returns error", async () => {

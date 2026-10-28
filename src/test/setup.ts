@@ -43,6 +43,7 @@ const mockWorkspace = {
 };
 
 const mockWindow = {
+  tabGroups: { all: [] as unknown[] },
   createOutputChannel: () => ({
     appendLine: vi.fn(),
     append: vi.fn(),
@@ -116,6 +117,29 @@ const mockVscode = {
   // For ExtensionContext type used in path.ts indirectly
   ExtensionContext: class {
     subscriptions: { dispose: () => void }[] = [];
+  },
+  // Tab inputs: real constructors, so `instanceof` checks in openEditors.ts
+  // behave the way they do in VS Code.
+  TabInputText: class {
+    constructor(public uri: unknown) {}
+  },
+  TabInputTextDiff: class {
+    constructor(
+      public original: unknown,
+      public modified: unknown,
+    ) {}
+  },
+  TabInputNotebook: class {
+    constructor(
+      public uri: unknown,
+      public notebookType: string,
+    ) {}
+  },
+  TabInputCustom: class {
+    constructor(
+      public uri: unknown,
+      public viewType: string,
+    ) {}
   },
   // Placeholder for types used but not called during unit tests
   Position: class {

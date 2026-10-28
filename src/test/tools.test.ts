@@ -86,6 +86,7 @@ describe("tool schemas", () => {
     const { registerNavigationTools } = await import("../mcp/tools/navigation");
     const { registerWorkspaceTools } = await import("../mcp/tools/workspace");
     const { registerDebugTools } = await import("../mcp/tools/debug");
+    const { registerEditorsTools } = await import("../mcp/tools/editors");
     // registerTerminalTools needs real ExtensionContext, skip
 
     // We can't easily extract definitions without a server instance,
@@ -105,6 +106,7 @@ describe("tool schemas", () => {
     registerNavigationTools(new MockServer() as unknown as McpServer);
     registerWorkspaceTools(new MockServer() as unknown as McpServer);
     registerDebugTools(new MockServer() as unknown as McpServer);
+    registerEditorsTools(new MockServer() as unknown as McpServer);
     // LSP tools need document, skip in unit test
     // registerTerminalTools needs real ExtensionContext, skip
 
@@ -126,6 +128,7 @@ describe("tool schemas", () => {
     const { registerNavigationTools } = await import("../mcp/tools/navigation");
     const { registerWorkspaceTools } = await import("../mcp/tools/workspace");
     const { registerDebugTools } = await import("../mcp/tools/debug");
+    const { registerEditorsTools } = await import("../mcp/tools/editors");
 
     const allDefs: ToolDefinition[] = [];
     class MockServer {
@@ -138,6 +141,7 @@ describe("tool schemas", () => {
     registerNavigationTools(new MockServer() as unknown as McpServer);
     registerWorkspaceTools(new MockServer() as unknown as McpServer);
     registerDebugTools(new MockServer() as unknown as McpServer);
+    registerEditorsTools(new MockServer() as unknown as McpServer);
 
     for (const def of allDefs) {
       const schema = def.inputSchema as unknown as InputSchema;
@@ -319,6 +323,7 @@ describe("handler behavior", () => {
     (vscode.workspace as unknown as MockWorkspace).textDocuments = [];
     (vscode as unknown as { debug: MockDebug }).debug.activeDebugSession = undefined;
     (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [];
+    (vscode.window as unknown as { tabGroups: { all: unknown[] } }).tabGroups.all = [];
     (vscode.debug.startDebugging as unknown as MockDebug["startDebugging"]).mockReset();
     vi.clearAllMocks();
 
@@ -328,6 +333,7 @@ describe("handler behavior", () => {
     const { registerWorkspaceTools } = await import("../mcp/tools/workspace");
     const { registerDebugTools } = await import("../mcp/tools/debug");
     const { registerSearchTools } = await import("../mcp/tools/search");
+    const { registerEditorsTools } = await import("../mcp/tools/editors");
 
     handlers = new Map();
     class MockServer {
@@ -340,6 +346,7 @@ describe("handler behavior", () => {
     registerWorkspaceTools(new MockServer() as unknown as McpServer);
     registerDebugTools(new MockServer() as unknown as McpServer);
     registerSearchTools(new MockServer() as unknown as McpServer);
+    registerEditorsTools(new MockServer() as unknown as McpServer);
   });
 
   /**
@@ -1955,5 +1962,171 @@ describe("handler behavior", () => {
     );
     expect(res.isError).toBe(false);
     expect(res.content[0].text).toContain("/ws/be/src/app.ts:1:7: const x = 1;");
+  });
+
+  // ── get_open_editors ────────────────────────────────────────────────────
+
+  type MockTab = {
+    label?: string;
+    input?: unknown;
+    isActive?: boolean;
+    isDirty?: boolean;
+  };
+  type MockTabGroup = { tabs: MockTab[]; isActive?: boolean };
+
+  /** Replace the mocked tab groups; each group is a list of tabs. */
+  function mockTabGroups(groups: MockTabGroup[]): void {
+    (vscode.window as unknown as { tabGroups: { all: MockTabGroup[] } }).tabGroups.all = groups;
+  }
+
+  function textTab(fsPath: string, opts: { isActive?: boolean; isDirty?: boolean } = {}): MockTab {
+    return { input: new vscode.TabInputText(vscode.Uri.file(fsPath)), ...opts };
+  }
+
+  it("get_open_editors lists open files with visibility, focus and dirty flags", async () => {
+    mockTabGroups([
+      {
+        isActive: true,
+        tabs: [textTab("/ws/a.ts", { isActive: true, isDirty: true }), textTab("/ws/b.ts")],
+      },
+      { isActive: false, tabs: [textTab("/ws/c.ts", { isActive: true })] },
+    ]);
+
+    const h = requireHandler(handlers, "get_open_editors");
+    const res = await h({});
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual([
+      { path: "/ws/a.ts", kind: "text", isVisible: true, isActive: true, isDirty: true, group: 0 },
+      {
+        path: "/ws/b.ts",
+        kind: "text",
+        isVisible: false,
+        isActive: false,
+        isDirty: false,
+        group: 0,
+      },
+      {
+        path: "/ws/c.ts",
+        kind: "text",
+        isVisible: true,
+        isActive: false,
+        isDirty: false,
+        group: 1,
+      },
+    ]);
+  });
+
+  it("get_open_editors returns an empty list when no editor is open", async () => {
+    mockTabGroups([]);
+
+    const h = requireHandler(handlers, "get_open_editors");
+    const res = await h({});
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual([]);
+  });
+
+  it("get_open_editors filters to the visible tab of each group", async () => {
+    mockTabGroups([
+      {
+        isActive: true,
+        tabs: [textTab("/ws/a.ts", { isActive: true }), textTab("/ws/b.ts")],
+      },
+      { isActive: false, tabs: [textTab("/ws/c.ts", { isActive: true })] },
+    ]);
+
+    const h = requireHandler(handlers, "get_open_editors");
+    const res = await h({ includeVisible: true });
+
+    expect(JSON.parse(res.content[0].text).map((e: { path: string }) => e.path)).toEqual([
+      "/ws/a.ts",
+      "/ws/c.ts",
+    ]);
+  });
+
+  it("get_open_editors skips untitled buffers and virtual documents", async () => {
+    mockTabGroups([
+      {
+        isActive: true,
+        tabs: [
+          {
+            input: new vscode.TabInputText({ fsPath: "", scheme: "untitled", path: "Untitled-1" }),
+          },
+          {
+            input: new vscode.TabInputText({
+              fsPath: "",
+              scheme: "vscode-settings",
+              path: "settings",
+            }),
+          },
+          textTab("/ws/real.ts", { isActive: true }),
+        ],
+      },
+    ]);
+
+    const h = requireHandler(handlers, "get_open_editors");
+    const res = await h({});
+
+    const editors = JSON.parse(res.content[0].text);
+    expect(editors.map((e: { path: string }) => e.path)).toEqual(["/ws/real.ts"]);
+  });
+
+  it("get_open_editors reports the on-disk side of a diff tab", async () => {
+    mockTabGroups([
+      {
+        isActive: true,
+        tabs: [
+          {
+            input: new vscode.TabInputTextDiff(
+              { fsPath: "/ws/a.ts", scheme: "git", path: "/ws/a.ts" },
+              vscode.Uri.file("/ws/a.ts"),
+            ),
+            isActive: true,
+            isDirty: false,
+          },
+        ],
+      },
+    ]);
+
+    const h = requireHandler(handlers, "get_open_editors");
+    const res = await h({});
+
+    expect(JSON.parse(res.content[0].text)).toEqual([
+      { path: "/ws/a.ts", kind: "diff", isVisible: true, isActive: true, isDirty: false, group: 0 },
+    ]);
+  });
+
+  it("get_open_editors includes notebook and custom editor tabs", async () => {
+    mockTabGroups([
+      {
+        isActive: true,
+        tabs: [
+          {
+            input: new vscode.TabInputNotebook(vscode.Uri.file("/ws/n.ipynb"), "jupyter"),
+            isActive: true,
+          },
+          {
+            input: new vscode.TabInputCustom(
+              vscode.Uri.file("/ws/img.png"),
+              "imagePreview.previewEditor",
+            ),
+          },
+          { input: { viewType: "mainThreadWebview-markdown.preview" } },
+        ],
+      },
+    ]);
+
+    const h = requireHandler(handlers, "get_open_editors");
+    const res = await h({});
+
+    const kinds = JSON.parse(res.content[0].text).map((e: { path: string; kind: string }) => [
+      e.path,
+      e.kind,
+    ]);
+    expect(kinds).toEqual([
+      ["/ws/n.ipynb", "notebook"],
+      ["/ws/img.png", "custom"],
+    ]);
   });
 });
