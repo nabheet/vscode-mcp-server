@@ -566,69 +566,13 @@ describe("multi-root workspace (E2E)", () => {
 
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
-  /** Whether get_open_editors reports the given path as having unsaved changes. */
-  async function isDirty(targetPath: string): Promise<boolean> {
-    const res = await mcpRequest(port, "tools/call", {
-      name: "get_open_editors",
-      arguments: {},
-    });
-    expect(res.result.isError, `get_open_editors: ${res.result.content[0].text}`).toBe(false);
-    const editors = JSON.parse(res.result.content[0].text) as { path: string; isDirty: boolean }[];
-    return editors.some((e) => e.path === targetPath && e.isDirty);
-  }
-
-  /**
-   * Discard unsaved changes in one file without a save prompt.
-   * `workbench.action.files.revert` acts on the active editor, so focus the
-   * file first.
-   */
-  async function revertFile(absPath: string): Promise<void> {
-    const opened = await mcpRequest(port, "tools/call", {
-      name: "open_file",
-      arguments: { path: absPath },
-    });
-    expect(opened.result.isError, `open_file ${absPath}: ${opened.result.content[0].text}`).toBe(
-      false,
-    );
-    const reverted = await mcpRequest(port, "tools/call", {
-      name: "execute_command",
-      arguments: { command: "workbench.action.files.revert" },
-    });
-    expect(reverted.result.isError, `revert: ${reverted.result.content[0].text}`).toBe(false);
-  }
-
-  /**
-   * Make the active editor's buffer dirty, then confirm it through
-   * get_open_editors.
-   *
-   * `editor.action.insertSnippet` edits the editor the action framework hands
-   * it and, like the `type` command, returns without error when there is no
-   * editor to edit. The command result therefore proves nothing; the poll is
-   * what detects the no-op, and it retries until the buffer reports dirty.
-   */
-  async function typeUntilDirty(text: string, targetPath: string): Promise<void> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (await isDirty(targetPath)) return;
-
-      const inserted = await mcpRequest(port, "tools/call", {
-        name: "execute_command",
-        arguments: {
-          command: "editor.action.insertSnippet",
-          args: [{ snippet: text }],
-        },
-      });
-      expect(inserted.result.isError, `insertSnippet: ${inserted.result.content[0].text}`).toBe(
-        false,
-      );
-
-      const deadline = Date.now() + 1500;
-      while (Date.now() < deadline) {
-        if (await isDirty(targetPath)) return;
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    }
-    throw new Error(`could not make ${targetPath} dirty`);
-  }
+  // Unsaved-buffer cases are not reproduced here. Making a buffer dirty needs
+  // user input: `type` and `editor.action.insertSnippet` both resolve without
+  // error and without an edit when the window has no focused editor, which is
+  // what a headless CI window looks like, and no tool edits a buffer without
+  // saving it. The dirty-buffer semantics (`dirtyBefore`, "Left unsaved", never
+  // saving the user's own unsaved work) are covered in tools.test.ts, where the
+  // documents are controlled.
 
   /**
    * Seed a file through VS Code's own filesystem instead of `fs`, so the state
@@ -758,65 +702,6 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     expect(res.result.content[0].text).not.toContain("Left unsaved");
     expect(fs.readFileSync(target, "utf-8")).toBe("ONE\ntwo\n");
-  });
-
-  it("apply_workspace_edit leaves a dirty editor buffer unsaved", async () => {
-    if (!ENABLED || !tmpDir) return;
-    const target = path.join(tmpDir, "frontend/src/dirty.ts");
-
-    // Set the scenario up from scratch. `type` can resolve before VS Code
-    // marks the document dirty, and no tool exposes `isDirty` yet, so the
-    // "buffer already had unsaved changes" precondition is retried rather
-    // than assumed — a tool that never honours it still fails every attempt.
-    const attempt = async () => {
-      await mcpRequest(port, "tools/call", { name: "close_all_editors", arguments: {} });
-      fs.writeFileSync(target, "one\n");
-      const opened = await mcpRequest(port, "tools/call", {
-        name: "open_file",
-        arguments: { path: target },
-      });
-      expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-      await typeUntilDirty("unsaved line\n", target);
-      return mcpRequest(port, "tools/call", {
-        name: "apply_workspace_edit",
-        arguments: {
-          edits: [
-            {
-              path: target,
-              textEdits: [
-                {
-                  range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
-                  newText: "ONE",
-                },
-              ],
-            },
-          ],
-        },
-      });
-    };
-
-    try {
-      // One attempt: `typeUntilDirty` already handles the harness race, so a
-      // retry here would only hide a real dirty-buffer regression.
-      const res = await attempt();
-
-      expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
-      expect(res.result.content[0].text).toContain("Left unsaved");
-      // The user's unsaved work must not be written behind their back.
-      expect(fs.readFileSync(target, "utf-8")).toBe("one\n");
-    } finally {
-      // Leave no dirty buffer behind even when an assertion above fails: a
-      // later close/prompt would block the window and take unrelated editor
-      // tests down with it.
-      await revertFile(target);
-      const closed = await mcpRequest(port, "tools/call", {
-        name: "execute_command",
-        arguments: { command: "workbench.action.closeAllEditors" },
-      });
-      expect(closed.result.isError, `closeAllEditors: ${closed.result.content[0].text}`).toBe(
-        false,
-      );
-    }
   });
 
   it("apply_workspace_edit resolves relative paths against workspaceFolder", async () => {
@@ -1759,30 +1644,6 @@ describe("multi-root workspace (E2E)", () => {
     expect(visible.map((e) => e.path)).toEqual([second]);
     // open_file uses showTextDocument with default options: a preview tab.
     expect(visible[0].isPreview).toBe(true);
-  });
-
-  it("get_open_editors flags an editor with unsaved changes", async () => {
-    if (!ENABLED) return;
-    const target = path.join(tmpDir as string, "backend/src/dirty-tab.ts");
-    fs.writeFileSync(target, "clean\n");
-
-    const opened = await mcpRequest(port, "tools/call", {
-      name: "open_file",
-      arguments: { path: target },
-    });
-    expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-    try {
-      await typeUntilDirty("unsaved\n", target);
-
-      // typeUntilDirty already confirmed the dirty flag; this asserts the tool
-      // reports it too, for the same path.
-      const editors = await openEditors();
-      const entry = editors.find((e) => e.path === target);
-      expect(entry?.isDirty, JSON.stringify(editors)).toBe(true);
-    } finally {
-      // Leave no dirty buffer behind for later tests, even on failure.
-      await revertFile(target);
-    }
   });
 
   it("get_open_editors skips untitled buffers", async () => {
