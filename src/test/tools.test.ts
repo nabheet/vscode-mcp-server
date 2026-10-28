@@ -87,6 +87,7 @@ describe("tool schemas", () => {
     const { registerWorkspaceTools } = await import("../mcp/tools/workspace");
     const { registerDebugTools } = await import("../mcp/tools/debug");
     const { registerEditorsTools } = await import("../mcp/tools/editors");
+    const { registerConfigurationTools } = await import("../mcp/tools/configuration");
     // registerTerminalTools needs real ExtensionContext, skip
 
     // We can't easily extract definitions without a server instance,
@@ -107,6 +108,7 @@ describe("tool schemas", () => {
     registerWorkspaceTools(new MockServer() as unknown as McpServer);
     registerDebugTools(new MockServer() as unknown as McpServer);
     registerEditorsTools(new MockServer() as unknown as McpServer);
+    registerConfigurationTools(new MockServer() as unknown as McpServer);
     // LSP tools need document, skip in unit test
     // registerTerminalTools needs real ExtensionContext, skip
 
@@ -321,6 +323,10 @@ describe("handler behavior", () => {
     (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi.fn();
     (vscode.workspace as unknown as MockWorkspace).applyEdit = vi.fn().mockResolvedValue(true);
     (vscode.workspace as unknown as MockWorkspace).textDocuments = [];
+    (vscode.workspace as unknown as { getConfiguration: unknown }).getConfiguration = vi.fn(() => ({
+      get: (_key: string, defaultValue?: unknown) => defaultValue,
+      has: () => false,
+    }));
     (vscode as unknown as { debug: MockDebug }).debug.activeDebugSession = undefined;
     (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [];
     (vscode.window as unknown as { tabGroups: { all: unknown[] } }).tabGroups.all = [];
@@ -334,6 +340,7 @@ describe("handler behavior", () => {
     const { registerDebugTools } = await import("../mcp/tools/debug");
     const { registerSearchTools } = await import("../mcp/tools/search");
     const { registerEditorsTools } = await import("../mcp/tools/editors");
+    const { registerConfigurationTools } = await import("../mcp/tools/configuration");
 
     handlers = new Map();
     class MockServer {
@@ -347,6 +354,7 @@ describe("handler behavior", () => {
     registerDebugTools(new MockServer() as unknown as McpServer);
     registerSearchTools(new MockServer() as unknown as McpServer);
     registerEditorsTools(new MockServer() as unknown as McpServer);
+    registerConfigurationTools(new MockServer() as unknown as McpServer);
   });
 
   /**
@@ -2153,5 +2161,332 @@ describe("handler behavior", () => {
       ["/ws/n.ipynb", "notebook"],
       ["/ws/img.png", "custom"],
     ]);
+  });
+
+  // ── get_configuration ────────────────────────────────────────────────────
+
+  type MockConfig = {
+    get: (key: string, defaultValue?: unknown) => unknown;
+    has: (key: string) => boolean;
+  };
+  type MockGetConfiguration = {
+    mockImplementation: (fn: (section?: string, scope?: unknown) => MockConfig) => unknown;
+    mock: { calls: unknown[][] };
+  };
+
+  /** Mock `workspace.getConfiguration` with a per-section lookup. */
+  function mockConfiguration(
+    sections: Record<string, Record<string, unknown>>,
+    empty: Record<string, unknown> = {},
+  ): MockGetConfiguration {
+    const fn = vi.fn((section?: string) => {
+      const values = section === undefined ? {} : (sections[section] ?? empty);
+      return {
+        ...values,
+        get: (key: string, defaultValue?: unknown) =>
+          Object.hasOwn(values, key) ? values[key] : defaultValue,
+        has: (key: string) => Object.hasOwn(values, key),
+      };
+    });
+    (vscode.workspace as unknown as { getConfiguration: unknown }).getConfiguration = fn;
+    return fn as unknown as MockGetConfiguration;
+  }
+
+  it("get_configuration returns a section as a JSON object", async () => {
+    const getConfiguration = mockConfiguration({
+      editor: { tabSize: 2, insertSpaces: true },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({ tabSize: 2, insertSpaces: true });
+    expect(getConfiguration.mock.calls[0][0]).toBe("editor");
+    expect(getConfiguration.mock.calls[0][1]).toBeUndefined();
+  });
+
+  it("get_configuration returns one key's value", async () => {
+    mockConfiguration({ editor: { tabSize: 2 } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor", key: "tabSize" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toBe(2);
+  });
+
+  it("get_configuration reports a missing key as an error", async () => {
+    mockConfiguration({ editor: {} });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor", key: "nope" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("editor.nope");
+    expect(res.content[0].text).toContain("not set");
+  });
+
+  it("get_configuration preserves an explicit-null key from an unset key", async () => {
+    mockConfiguration({ editor: { tabSize: null } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const explicitNull = await h({ section: "editor", key: "tabSize" });
+
+    expect(explicitNull.isError).toBe(false);
+    expect(JSON.parse(explicitNull.content[0].text)).toBeNull();
+  });
+
+  it("get_configuration returns an empty object for an unknown section", async () => {
+    mockConfiguration({});
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "does.not.exist" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({});
+  });
+
+  it("get_configuration redacts secret-looking values in a section dump", async () => {
+    mockConfiguration({
+      "vscode-mcp-server": { authToken: "supersecret", port: 9876 },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "vscode-mcp-server" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({ authToken: "<redacted>", port: 9876 });
+  });
+
+  it("get_configuration redacts a secret-looking key read directly", async () => {
+    mockConfiguration({ "some.api": { apiKey: "hunter2" } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "some.api", key: "apiKey" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toBe("<redacted>");
+  });
+
+  it("get_configuration redacts nested secrets in a section dump", async () => {
+    mockConfiguration({
+      "github.copilot": {
+        advanced: { authToken: "nested", access_token: "underscore", apiToken: "camel" },
+        env: { API_KEY: "x", id_token: "oidc" },
+        plain: "visible",
+      },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "github.copilot" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      advanced: { authToken: "<redacted>", access_token: "<redacted>", apiToken: "<redacted>" },
+      env: { API_KEY: "<redacted>", id_token: "<redacted>" },
+      plain: "visible",
+    });
+  });
+
+  it("get_configuration redacts secrets inside arrays", async () => {
+    mockConfiguration({ some: { creds: [{ password: "a" }, { user: "b" }] } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "some" });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      creds: [{ password: "<redacted>" }, { user: "b" }],
+    });
+  });
+
+  it("get_configuration redacts a secret read through a parent key (no section)", async () => {
+    const root = { "vscode-mcp-server": { authToken: "supersecret", port: 9876 } };
+    (vscode.workspace as unknown as { getConfiguration: unknown }).getConfiguration = vi.fn(() => ({
+      ...root,
+      get: (k: string, d?: unknown) => (Object.hasOwn(root, k) ? root[k as keyof typeof root] : d),
+      has: (k: string) => Object.hasOwn(root, k),
+    }));
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ key: "vscode-mcp-server" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({ authToken: "<redacted>", port: 9876 });
+  });
+
+  it("get_configuration leaves tokenColorCustomizations unredacted", async () => {
+    mockConfiguration({
+      editor: { tabSize: 4, tokenColorCustomizations: { textMateRules: [] } },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor" });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      tabSize: 4,
+      tokenColorCustomizations: { textMateRules: [] },
+    });
+  });
+
+  it("get_configuration redacts every child of a secret-named section", async () => {
+    mockConfiguration({ credentials: { github: "ghp_LEAK", gitlab: "glpat_LEAK" } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const dump = await h({ section: "credentials" });
+    expect(JSON.parse(dump.content[0].text)).toEqual({
+      github: "<redacted>",
+      gitlab: "<redacted>",
+    });
+
+    // Same leak via key mode, where the child key alone looks innocuous.
+    const keyed = await h({ section: "credentials", key: "github" });
+    expect(JSON.parse(keyed.content[0].text)).toBe("<redacted>");
+  });
+
+  it("get_configuration redacts connection strings and exact auth/bearer segments", async () => {
+    mockConfiguration({
+      db: { connectionString: "postgres://u:p@h/db", auth: "basic", bearer: "abc", author: "me" },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "db" });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      connectionString: "<redacted>",
+      auth: "<redacted>",
+      bearer: "<redacted>",
+      author: "me",
+    });
+  });
+
+  it("get_configuration masks URL userinfo in an ordinary string value", async () => {
+    mockConfiguration({ http: { proxy: "http://user:pass@proxy.local:8080" } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "http", key: "proxy" });
+
+    expect(JSON.parse(res.content[0].text)).toBe("http://<redacted>@proxy.local:8080");
+  });
+
+  it("get_configuration masks URL userinfo embedded in a larger string", async () => {
+    mockConfiguration({
+      some: { cmd: "--proxy http://u:p@h and https://a:b@c/d" },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "some", key: "cmd" });
+
+    expect(JSON.parse(res.content[0].text)).toBe(
+      "--proxy http://<redacted>@h and https://<redacted>@c/d",
+    );
+  });
+
+  it("get_configuration treats an empty section as absent", async () => {
+    mockConfiguration({});
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Pass a section");
+  });
+
+  it("get_configuration scopes to the requested workspace folder", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [
+      { name: "frontend", uri: vscode.Uri.file("/ws/frontend") },
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    const getConfiguration = mockConfiguration({ "mcp.fixture": { value: 42 } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "mcp.fixture", workspaceFolder: "backend" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({ value: 42 });
+    expect(getConfiguration.mock.calls[0][1]).toMatchObject({ fsPath: "/ws/backend" });
+  });
+
+  it("get_configuration applies a languageId against the folder's resource", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "backend", uri: vscode.Uri.file("/ws/backend") }];
+    const getConfiguration = mockConfiguration({ editor: { tabSize: 4 } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({
+      section: "editor",
+      key: "tabSize",
+      workspaceFolder: "backend",
+      languageId: "typescript",
+    });
+
+    expect(res.isError).toBe(false);
+    expect(getConfiguration.mock.calls[0][1]).toMatchObject({
+      uri: expect.objectContaining({ fsPath: "/ws/backend" }),
+      languageId: "typescript",
+    });
+  });
+
+  it("get_configuration applies a languageId at window scope without a folder", async () => {
+    // Two folders open; languageId alone must not borrow folders[0].
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [
+      { name: "frontend", uri: vscode.Uri.file("/ws/frontend") },
+      { name: "backend", uri: vscode.Uri.file("/ws/backend") },
+    ];
+    const getConfiguration = mockConfiguration({ editor: { tabSize: 4 } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor", key: "tabSize", languageId: "typescript" });
+
+    expect(res.isError).toBe(false);
+    expect(getConfiguration.mock.calls[0][1]).toEqual({ languageId: "typescript" });
+  });
+
+  it("get_configuration accepts a languageId with no workspace folder open", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [];
+    const getConfiguration = mockConfiguration({ editor: { tabSize: 4 } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor", key: "tabSize", languageId: "typescript" });
+
+    expect(res.isError).toBe(false);
+    expect(getConfiguration.mock.calls[0][1]).toEqual({ languageId: "typescript" });
+  });
+
+  it("get_configuration rejects an unknown workspace folder", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "backend", uri: vscode.Uri.file("/ws/backend") }];
+    mockConfiguration({});
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor", workspaceFolder: "bogus" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("not found");
+    expect(res.content[0].text).toContain("backend (/ws/backend)");
+  });
+
+  it("get_configuration rejects a call with neither section nor key", async () => {
+    mockConfiguration({});
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({});
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Pass a section");
+  });
+
+  it("get_configuration refuses a section too large for the round trip", async () => {
+    const huge: Record<string, unknown> = {};
+    for (let i = 0; i < 4000; i++) huge[`key${i}`] = "x".repeat(64);
+    mockConfiguration({ huge });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "huge" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("over the 200 KB limit");
   });
 });

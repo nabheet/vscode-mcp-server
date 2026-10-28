@@ -209,6 +209,20 @@ describe("multi-root workspace (E2E)", () => {
     fs.writeFileSync(path.join(folderA, "src", "index.ts"), "// frontend code\nconst a = 1;\n");
     fs.writeFileSync(path.join(folderB, "src", "index.ts"), "// backend code\nconst b = 2;\n");
     fs.writeFileSync(path.join(folderB, "src", "util.ts"), "// shared util in backend\n");
+    // Folder-scoped settings for get_configuration: a plain section plus a
+    // language override, so scoping can be proven against real VS Code.
+    fs.mkdirSync(path.join(folderB, ".vscode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(folderB, ".vscode", "settings.json"),
+      `${JSON.stringify(
+        {
+          mcpFixture: { value: 42 },
+          "[typescript]": { "editor.tabSize": 8 },
+        },
+        null,
+        2,
+      )}\n`,
+    );
 
     const workspaceFile = path.join(tmpDir, "test.code-workspace");
     // Deliberately JSONC (comments + trailing commas), not JSON.stringify'd —
@@ -678,15 +692,28 @@ describe("multi-root workspace (E2E)", () => {
       });
     };
 
-    let res = await attempt();
-    for (let i = 0; i < 2 && !String(res.result.content[0].text).includes("Left unsaved"); i++) {
-      res = await attempt();
-    }
+    try {
+      let res = await attempt();
+      for (let i = 0; i < 2 && !String(res.result.content[0].text).includes("Left unsaved"); i++) {
+        res = await attempt();
+      }
 
-    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
-    expect(res.result.content[0].text).toContain("Left unsaved");
-    // The user's unsaved work must not be written behind their back.
-    expect(fs.readFileSync(target, "utf-8")).toBe("one\n");
+      expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+      expect(res.result.content[0].text).toContain("Left unsaved");
+      // The user's unsaved work must not be written behind their back.
+      expect(fs.readFileSync(target, "utf-8")).toBe("one\n");
+    } finally {
+      // Leave no dirty buffer behind even when an assertion above fails: a
+      // later close/prompt would block the window and take unrelated editor
+      // tests down with it.
+      for (const command of ["workbench.action.files.revert", "workbench.action.closeAllEditors"]) {
+        const res = await mcpRequest(port, "tools/call", {
+          name: "execute_command",
+          arguments: { command },
+        });
+        expect(res.result.isError, `${command}: ${res.result.content[0].text}`).toBe(false);
+      }
+    }
   });
 
   it("apply_workspace_edit resolves relative paths against workspaceFolder", async () => {
@@ -1563,6 +1590,71 @@ describe("multi-root workspace (E2E)", () => {
     });
 
     expect(await openEditors()).toEqual([]);
+  });
+
+  // ── get_configuration ────────────────────────────────────────────────
+
+  /** Call get_configuration and parse its JSON payload. */
+  async function configuration(args: Record<string, unknown>) {
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_configuration",
+      arguments: args,
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    return JSON.parse(res.result.content[0].text);
+  }
+
+  it("get_configuration reads folder-scoped settings", async () => {
+    if (!ENABLED) return;
+    expect(await configuration({ section: "mcpFixture", workspaceFolder: "backend" })).toEqual({
+      value: 42,
+    });
+  });
+
+  it("get_configuration applies language-specific overrides", async () => {
+    if (!ENABLED) return;
+    // backend/.vscode/settings.json sets "[typescript]": { "editor.tabSize": 8 }
+    expect(
+      await configuration({
+        section: "editor",
+        key: "tabSize",
+        workspaceFolder: "backend",
+        languageId: "typescript",
+      }),
+    ).toBe(8);
+  });
+
+  it("get_configuration applies a language override without a workspace folder", async () => {
+    if (!ENABLED) return;
+    // backend/.vscode/settings.json sets "[typescript]": { "editor.tabSize": 8 },
+    // but a languageId with no workspaceFolder is window scope and must not read
+    // that folder's override, so it returns the default (4), not 8. (It does not
+    // distinguish window scope from borrowing folders[0]; the unit tests pin the
+    // exact scope object `{ languageId }`.)
+    expect(
+      await configuration({ section: "editor", key: "tabSize", languageId: "typescript" }),
+    ).toBe(4);
+  });
+
+  it("get_configuration without a workspace folder reads window scope only", async () => {
+    if (!ENABLED) return;
+    // Folder settings need a resource: the same section is empty unscoped.
+    expect(await configuration({ section: "mcpFixture" })).toEqual({});
+  });
+
+  it("get_configuration returns an empty object for an unknown section", async () => {
+    if (!ENABLED) return;
+    expect(await configuration({ section: "no.such.section" })).toEqual({});
+  });
+
+  it("get_configuration reports an unknown workspace folder", async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_configuration",
+      arguments: { section: "editor", workspaceFolder: "bogus" },
+    });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text as string).toContain("not found");
   });
 
   // ── Error cases ──────────────────────────────────────────────────────

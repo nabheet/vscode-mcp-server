@@ -1,7 +1,7 @@
 {
   "name": "vscode-ide-mcp",
   "displayName": "MCP Server for VS Code",
-  "description": "VS Code MCP server for AI agents (opencode, Claude, Cursor) — debug, edit, and control VS Code via Model Context Protocol. Debugger, terminal, LSP, file ops (52 tools).",
+  "description": "VS Code MCP server for AI agents (opencode, Claude, Cursor) — debug, edit, and control VS Code via Model Context Protocol. Debugger, terminal, LSP, file ops (53 tools).",
   "version": "0.3.62",
   "publisher": "nabheet",
   "license": "MIT",
