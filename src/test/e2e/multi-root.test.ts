@@ -763,6 +763,10 @@ describe("multi-root workspace (E2E)", () => {
 
   // ── delete_file with workspaceFolder ─────────────────────────────────
 
+  // These cases verify path/folder resolution, not trash. Pass useTrash:false
+  // so they do not depend on a trash backend: headless Linux CI has none, and
+  // `useTrash: true` (the tool default) fails there for any folder.
+
   it("delete_file with workspaceFolder deletes from correct folder", async () => {
     if (!ENABLED) return;
     const fname = "src/todelete-by-folder.ts";
@@ -774,7 +778,7 @@ describe("multi-root workspace (E2E)", () => {
 
     const res = await mcpRequest(port, "tools/call", {
       name: "delete_file",
-      arguments: { path: fname, workspaceFolder: "backend" },
+      arguments: { path: fname, workspaceFolder: "backend", useTrash: false },
     });
     expect(res.result.isError).toBe(false);
 
@@ -806,7 +810,7 @@ describe("multi-root workspace (E2E)", () => {
 
     const res = await mcpRequest(port, "tools/call", {
       name: "delete_file",
-      arguments: { path: fname },
+      arguments: { path: fname, useTrash: false },
     });
     expect(res.result.isError).toBe(false);
 
