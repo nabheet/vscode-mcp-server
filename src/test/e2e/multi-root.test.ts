@@ -624,35 +624,48 @@ describe("multi-root workspace (E2E)", () => {
   it("apply_workspace_edit leaves a dirty editor buffer unsaved", async () => {
     if (!ENABLED || !tmpDir) return;
     const target = path.join(tmpDir, "frontend/src/dirty.ts");
-    fs.writeFileSync(target, "one\n");
 
-    const opened = await mcpRequest(port, "tools/call", {
-      name: "open_file",
-      arguments: { path: target },
-    });
-    expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-    const typed = await mcpRequest(port, "tools/call", {
-      name: "execute_command",
-      arguments: { command: "type", args: [{ text: "unsaved line\n" }] },
-    });
-    expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+    // Set the scenario up from scratch. `type` can resolve before VS Code
+    // marks the document dirty, and no tool exposes `isDirty` yet, so the
+    // "buffer already had unsaved changes" precondition is retried rather
+    // than assumed — a tool that never honours it still fails every attempt.
+    const attempt = async () => {
+      await mcpRequest(port, "tools/call", { name: "close_all_editors", arguments: {} });
+      fs.writeFileSync(target, "one\n");
+      const opened = await mcpRequest(port, "tools/call", {
+        name: "open_file",
+        arguments: { path: target },
+      });
+      expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
+      const typed = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "type", args: [{ text: "unsaved line\n" }] },
+      });
+      expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+      await new Promise((r) => setTimeout(r, 250));
+      return mcpRequest(port, "tools/call", {
+        name: "apply_workspace_edit",
+        arguments: {
+          edits: [
+            {
+              path: target,
+              textEdits: [
+                {
+                  range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
+                  newText: "ONE",
+                },
+              ],
+            },
+          ],
+        },
+      });
+    };
 
-    const res = await mcpRequest(port, "tools/call", {
-      name: "apply_workspace_edit",
-      arguments: {
-        edits: [
-          {
-            path: target,
-            textEdits: [
-              {
-                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
-                newText: "ONE",
-              },
-            ],
-          },
-        ],
-      },
-    });
+    let res = await attempt();
+    for (let i = 0; i < 2 && !String(res.result.content[0].text).includes("Left unsaved"); i++) {
+      res = await attempt();
+    }
+
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     expect(res.result.content[0].text).toContain("Left unsaved");
     // The user's unsaved work must not be written behind their back.
