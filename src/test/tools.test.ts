@@ -2267,6 +2267,66 @@ describe("handler behavior", () => {
     expect(JSON.parse(res.content[0].text)).toBe("<redacted>");
   });
 
+  it("get_configuration redacts nested secrets in a section dump", async () => {
+    mockConfiguration({
+      "github.copilot": {
+        advanced: { authToken: "nested" },
+        env: { API_KEY: "x" },
+        plain: "visible",
+      },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "github.copilot" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      advanced: { authToken: "<redacted>" },
+      env: { API_KEY: "<redacted>" },
+      plain: "visible",
+    });
+  });
+
+  it("get_configuration redacts secrets inside arrays", async () => {
+    mockConfiguration({ some: { creds: [{ password: "a" }, { user: "b" }] } });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "some" });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      creds: [{ password: "<redacted>" }, { user: "b" }],
+    });
+  });
+
+  it("get_configuration redacts a secret read through a parent key (no section)", async () => {
+    const root = { "vscode-mcp-server": { authToken: "supersecret", port: 9876 } };
+    (vscode.workspace as unknown as { getConfiguration: unknown }).getConfiguration = vi.fn(() => ({
+      ...root,
+      get: (k: string, d?: unknown) => (Object.hasOwn(root, k) ? root[k as keyof typeof root] : d),
+      has: (k: string) => Object.hasOwn(root, k),
+    }));
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ key: "vscode-mcp-server" });
+
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.content[0].text)).toEqual({ authToken: "<redacted>", port: 9876 });
+  });
+
+  it("get_configuration leaves tokenColorCustomizations unredacted", async () => {
+    mockConfiguration({
+      editor: { tabSize: 4, tokenColorCustomizations: { textMateRules: [] } },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "editor" });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      tabSize: 4,
+      tokenColorCustomizations: { textMateRules: [] },
+    });
+  });
+
   it("get_configuration treats an empty section as absent", async () => {
     mockConfiguration({});
 

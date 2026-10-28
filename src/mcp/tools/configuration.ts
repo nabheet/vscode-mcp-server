@@ -8,12 +8,29 @@ const MAX_CONFIG_BYTES = 200 * 1024;
  * Settings can hold credentials (extension API keys, `vscode-mcp-server.authToken`).
  * This tool has no workspace boundary, so redact obvious secret-looking values
  * before they leave the extension host.
+ *
+ * `token` is anchored to end-of-key so `editor.tokenColorCustomizations` and
+ * `editor.semanticTokenColorCustomizations` are not redacted.
  */
-const SECRET_KEY = /token|secret|password|passwd|api[_-]?key|credential|private[_-]?key/i;
+const SECRET_KEY =
+  /(^|\.)(auth|bearer|access|refresh)?token$|secret|password|passwd|api[_-]?key|credential|private[_-]?key|authorization/i;
 
-function redact(name: string, value: unknown): unknown {
-  if (value === undefined || value === null) return value;
-  return SECRET_KEY.test(name) ? "<redacted>" : value;
+function redactDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v));
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SECRET_KEY.test(k) && v !== undefined && v !== null ? "<redacted>" : redactDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Redact a value named `name`, recursing into nested objects/arrays. */
+function redactValue(name: string, value: unknown): unknown {
+  if (SECRET_KEY.test(name) && value !== undefined && value !== null) return "<redacted>";
+  return redactDeep(value);
 }
 
 /** Resolve the `workspaceFolder` argument to the folder's URI. */
@@ -115,7 +132,7 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
               isError: true,
             };
           }
-          value = redact(key, config.get(key));
+          value = redactValue(key, config.get(key));
         } else {
           const entries: Record<string, unknown> = {};
           // WorkspaceConfiguration mixes `has`/`get`/`update`/`inspect` in with
@@ -123,7 +140,7 @@ export function registerConfigurationTools(server: ToolRegistrar): void {
           for (const name of Object.keys(config)) {
             if (typeof (config as unknown as Record<string, unknown>)[name] === "function")
               continue;
-            entries[name] = redact(name, config.get(name));
+            entries[name] = redactValue(name, config.get(name));
           }
           value = entries;
         }

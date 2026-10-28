@@ -1612,8 +1612,10 @@ describe("multi-root workspace (E2E)", () => {
   it("get_configuration applies a language override without a workspace folder", async () => {
     if (!ENABLED) return;
     // backend/.vscode/settings.json sets "[typescript]": { "editor.tabSize": 8 },
-    // but a languageId with no workspaceFolder is window scope: it must NOT
-    // borrow a folder, so it returns the default (4), not 8.
+    // but a languageId with no workspaceFolder is window scope and must not read
+    // that folder's override, so it returns the default (4), not 8. (It does not
+    // distinguish window scope from borrowing folders[0]; the unit tests pin the
+    // exact scope object `{ languageId }`.)
     expect(
       await configuration({ section: "editor", key: "tabSize", languageId: "typescript" }),
     ).toBe(4);
