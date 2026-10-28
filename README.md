@@ -5,7 +5,7 @@
 
 Let AI agents read, write, debug, and execute commands in VS Code — just like a
 human developer. This [MCP (Model Context Protocol)](https://modelcontextprotocol.io)
-server exposes 52 VS Code tools (debugger, terminal, LSP, file ops, commands)
+server exposes 53 VS Code tools (debugger, terminal, LSP, file ops, commands)
 over SSE, compatible with opencode, Claude, Cursor, and any MCP client.
 
 ```bash
@@ -116,6 +116,7 @@ VS Code Extension (onStartupFinished)
 | `create_file` | workspace | Create a new empty file |
 | `delete_file` | workspace | Delete a file or directory (recursive, use trash) |
 | `get_workspace_folders` | workspace | List workspace roots |
+| `get_configuration` | configuration | Read effective VS Code settings (section or key) |
 | `list_workspaces` | cluster | List windows (leader + workers): id, name, folders, role, state |
 | `add_workspace_folder` | workspace | Add a folder to the workspace (multi-root) |
 | `update_workspace_folder` | workspace | Rename/change a workspace folder's path (multi-root) |
@@ -568,7 +569,7 @@ This server supports **both** transports transparently — no configuration
 change needed. Just use `POST /mcp` as the endpoint and the server handles
 everything synchronously.
 
-### Example: tool list (52 tools)
+### Example: tool list (53 tools)
 
 When connected, `tools/list` returns schemas for all tools. Key categories:
 
@@ -579,6 +580,7 @@ When connected, `tools/list` returns schemas for all tools. Key categories:
   `delete_file`, `list_files`, `apply_workspace_edit`,
   `get_workspace_folders`, `add_workspace_folder`,
   `update_workspace_folder`, `remove_workspace_folder`
+- **Settings** — `get_configuration`
 - **Search** — `search_files`
 - **Debug** — `start_debugging`, `stop_debugging`, `step_over`, `step_into`,
   `step_out`, `continue`, `add_breakpoint`, `remove_breakpoint`,

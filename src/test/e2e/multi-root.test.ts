@@ -209,6 +209,20 @@ describe("multi-root workspace (E2E)", () => {
     fs.writeFileSync(path.join(folderA, "src", "index.ts"), "// frontend code\nconst a = 1;\n");
     fs.writeFileSync(path.join(folderB, "src", "index.ts"), "// backend code\nconst b = 2;\n");
     fs.writeFileSync(path.join(folderB, "src", "util.ts"), "// shared util in backend\n");
+    // Folder-scoped settings for get_configuration: a plain section plus a
+    // language override, so scoping can be proven against real VS Code.
+    fs.mkdirSync(path.join(folderB, ".vscode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(folderB, ".vscode", "settings.json"),
+      `${JSON.stringify(
+        {
+          mcpFixture: { value: 42 },
+          "[typescript]": { "editor.tabSize": 8 },
+        },
+        null,
+        2,
+      )}\n`,
+    );
 
     const workspaceFile = path.join(tmpDir, "test.code-workspace");
     // Deliberately JSONC (comments + trailing commas), not JSON.stringify'd —
@@ -1563,6 +1577,57 @@ describe("multi-root workspace (E2E)", () => {
     });
 
     expect(await openEditors()).toEqual([]);
+  // ── get_configuration ────────────────────────────────────────────────
+
+  /** Call get_configuration and parse its JSON payload. */
+  async function configuration(args: Record<string, unknown>) {
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_configuration",
+      arguments: args,
+    });
+    expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
+    return JSON.parse(res.result.content[0].text);
+  }
+
+  it("get_configuration reads folder-scoped settings", async () => {
+    if (!ENABLED) return;
+    expect(await configuration({ section: "mcpFixture", workspaceFolder: "backend" })).toEqual({
+      value: 42,
+    });
+  });
+
+  it("get_configuration applies language-specific overrides", async () => {
+    if (!ENABLED) return;
+    // backend/.vscode/settings.json sets "[typescript]": { "editor.tabSize": 8 }
+    expect(
+      await configuration({
+        section: "editor",
+        key: "tabSize",
+        workspaceFolder: "backend",
+        languageId: "typescript",
+      }),
+    ).toBe(8);
+  });
+
+  it("get_configuration without a workspace folder reads window scope only", async () => {
+    if (!ENABLED) return;
+    // Folder settings need a resource: the same section is empty unscoped.
+    expect(await configuration({ section: "mcpFixture" })).toEqual({});
+  });
+
+  it("get_configuration returns an empty object for an unknown section", async () => {
+    if (!ENABLED) return;
+    expect(await configuration({ section: "no.such.section" })).toEqual({});
+  });
+
+  it("get_configuration reports an unknown workspace folder", async () => {
+    if (!ENABLED) return;
+    const res = await mcpRequest(port, "tools/call", {
+      name: "get_configuration",
+      arguments: { section: "editor", workspaceFolder: "bogus" },
+    });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text as string).toContain("not found");
   });
 
   // ── Error cases ──────────────────────────────────────────────────────
