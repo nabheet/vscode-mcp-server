@@ -2755,6 +2755,28 @@ describe("handler behavior", () => {
     );
   });
 
+  it("get_diagnostics treats a Windows drive letter as a path, not a scheme", async () => {
+    const getDiagnostics = vi.fn().mockReturnValue([]);
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = getDiagnostics;
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    await h({ uri: "C:/ws/src/app.ts" });
+
+    expect(getDiagnostics).toHaveBeenCalledWith(
+      expect.objectContaining({ scheme: "file", fsPath: "C:/ws/src/app.ts" }),
+    );
+  });
+
+  it("get_diagnostics keeps a non-file scheme from a URI argument", async () => {
+    const getDiagnostics = vi.fn().mockReturnValue([]);
+    (vscode as unknown as { languages: MockLanguages }).languages.getDiagnostics = getDiagnostics;
+
+    const h = requireHandler(handlers, "get_diagnostics");
+    await h({ uri: "untitled:Untitled-1" });
+
+    expect(getDiagnostics).toHaveBeenCalledWith(expect.objectContaining({ scheme: "untitled" }));
+  });
+
   it("get_diagnostics prefers the active editor when no uri is given", async () => {
     (vscode.window as unknown as { activeTextEditor?: unknown }).activeTextEditor = {
       document: { uri: vscode.Uri.file("/ws/active.ts") },

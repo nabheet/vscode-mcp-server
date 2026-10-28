@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -223,6 +224,8 @@ describe("multi-root workspace (E2E)", () => {
         2,
       )}\n`,
     );
+    // Deliberate type error, so get_diagnostics has something real to report.
+    fs.writeFileSync(path.join(folderB, "src", "broken.ts"), 'const n: number = "nope";\n');
 
     const workspaceFile = path.join(tmpDir, "test.code-workspace");
     // Deliberately JSONC (comments + trailing commas), not JSON.stringify'd —
@@ -1220,27 +1223,40 @@ describe("multi-root workspace (E2E)", () => {
 
   // ── get_diagnostics ──────────────────────────────────────────────────
 
-  it("get_diagnostics accepts a file:// URI and a raw path alike", async () => {
+  /** Poll until the TypeScript server reports the planted error. */
+  async function waitForBrokenDiagnostics(uri: string, attempts = 30): Promise<string> {
+    let text = "";
+    for (let i = 0; i < attempts; i++) {
+      const res = await mcpRequest(port, "tools/call", {
+        name: "get_diagnostics",
+        arguments: { uri },
+      });
+      text = String(res.result.content[0].text);
+      if (text.includes("broken.ts:")) return text;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return text;
+  }
+
+  it("get_diagnostics returns a real diagnostic through both URI forms", async () => {
     if (!ENABLED || !tmpDir) return;
-    const abs = path.join(tmpDir, "backend/src/index.ts");
+    const abs = path.join(tmpDir, "backend/src/broken.ts");
     await mcpRequest(port, "tools/call", { name: "open_file", arguments: { path: abs } });
 
+    const rawText = await waitForBrokenDiagnostics(abs);
+    expect(rawText, "the language server never reported the planted type error").toContain(
+      "broken.ts:1:7",
+    );
+    expect(rawText).toContain("not assignable");
+
+    // Uri.file("file:///…") produced a broken double scheme and reported
+    // "No diagnostics" instead, so the two forms must agree.
     const asUri = await mcpRequest(port, "tools/call", {
       name: "get_diagnostics",
-      arguments: { uri: `file://${abs}` },
+      arguments: { uri: pathToFileURL(abs).href },
     });
-    const asPath = await mcpRequest(port, "tools/call", {
-      name: "get_diagnostics",
-      arguments: { uri: abs },
-    });
-
-    // A mangled URI (Uri.file("file:///…")) looks up a non-existent document,
-    // so the two forms would disagree.
-    for (const res of [asUri, asPath]) {
-      expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
-      expect(typeof res.result.content[0].text).toBe("string");
-    }
-    expect(asUri.result.content[0].text).toBe(asPath.result.content[0].text);
+    expect(asUri.result.isError).toBe(false);
+    expect(asUri.result.content[0].text).toBe(rawText);
   });
 
   it("get_diagnostics with no uri does not crash when no editor is active", async () => {
@@ -1252,12 +1268,12 @@ describe("multi-root workspace (E2E)", () => {
       arguments: {},
     });
 
-    // The no-argument overload returns [uri, diagnostics] tuples; mishandling
-    // them threw a TypeError. Whatever the workspace reports, this must be a
-    // normal result — "No diagnostics" when clean, otherwise path:line lines.
+    // The no-argument overload returns [uri, diagnostics] tuples. A headless
+    // E2E cannot hold diagnostics with every editor closed, so this is a
+    // smoke test for the crash; the tuple handling itself is covered by unit
+    // tests that fail against the previous implementation.
     expect(res.result.isError).toBe(false);
     expect(typeof res.result.content[0].text).toBe("string");
-    expect(res.result.content[0].text.length).toBeGreaterThan(0);
   });
 
   // ── open_file with workspaceFolder ───────────────────────────────────
