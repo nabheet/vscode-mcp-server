@@ -765,7 +765,8 @@ describe("multi-root workspace (E2E)", () => {
 
   // These cases verify path/folder resolution, not trash. Pass useTrash:false
   // so they do not depend on a trash backend: headless Linux CI has none, and
-  // `useTrash: true` (the tool default) fails there for any folder.
+  // `useTrash: true` (the tool default) fails at the delete step there for any
+  // folder that reaches it.
 
   it("delete_file with workspaceFolder deletes from correct folder", async () => {
     if (!ENABLED) return;
