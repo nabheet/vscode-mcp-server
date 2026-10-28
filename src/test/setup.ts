@@ -7,12 +7,14 @@ import { vi } from "vitest";
 const mockUri = {
   file: (path: string) => ({ fsPath: path, scheme: "file", path, toString: () => path }),
   /**
-   * Split a URI into scheme + path the way VS Code does: a scheme needs 2+
-   * characters before the colon (so a Windows drive letter is not a scheme),
-   * and the percent-encoded path is decoded.
+   * Split a URI into scheme + path the way VS Code's own URI parser does:
+   * any `[a-z][a-z0-9+.-]*:` prefix is a scheme — including a single letter,
+   * so `C:/x` parses as scheme "c". That is precisely why callers must choose
+   * between `Uri.parse` and `Uri.file` for a Windows path. Percent-encoded
+   * paths are decoded.
    */
   parse: (uri: string) => {
-    const match = /^([a-z][a-z0-9+.-]+):(.*)$/i.exec(uri);
+    const match = /^([a-z][a-z0-9+.-]*):(.*)$/i.exec(uri);
     if (!match) return { fsPath: uri, scheme: "file", path: uri, toString: () => uri };
     const scheme = match[1].toLowerCase();
     const rest = decodeURIComponent(match[2].replace(/^\/\//, ""));

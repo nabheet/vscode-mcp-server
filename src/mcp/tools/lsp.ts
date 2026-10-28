@@ -22,8 +22,9 @@ function activeEditor(): vscode.TextEditor | undefined {
 }
 
 /**
- * Accept either a `file:///abs/path` URI or a raw filesystem path. A bare
- * drive letter (`C:/x`) is a path, not a scheme, so a scheme needs 2+ chars.
+ * Accept either a `file:///abs/path` URI or a raw filesystem path. VS Code's
+ * own parser treats any `x:` prefix as a scheme, so `C:/x` would become scheme
+ * "c" — require 2+ characters before the colon to keep a drive letter a path.
  */
 function parseUriArg(value: string): vscode.Uri {
   return /^[a-z][a-z0-9+.-]+:/i.test(value) ? vscode.Uri.parse(value) : vscode.Uri.file(value);
