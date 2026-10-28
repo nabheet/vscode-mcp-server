@@ -577,6 +577,29 @@ describe("currentWindowState", () => {
     });
   });
 
+  it("picks the focused group's active tab, not any visible tab", () => {
+    setGroups([
+      // Visible but unfocused: not the window's active file.
+      {
+        isActive: false,
+        tabs: [{ input: new vscode.TabInputText(file("/ws/b.ts")), isActive: true }],
+      },
+      // Focused, and its active tab is a notebook — no activeTextEditor exists.
+      {
+        isActive: true,
+        tabs: [
+          { input: new vscode.TabInputText(file("/ws/a.ts")) },
+          { input: new vscode.TabInputNotebook(file("/ws/n.ipynb"), "jupyter"), isActive: true },
+        ],
+      },
+    ]);
+
+    expect(currentWindowState()).toEqual({
+      activeFile: "/ws/n.ipynb",
+      openEditors: ["/ws/b.ts", "/ws/a.ts", "/ws/n.ipynb"],
+    });
+  });
+
   it("has no activeFile when the active tab is not a file", () => {
     setGroups([
       {
