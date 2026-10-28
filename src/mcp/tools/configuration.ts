@@ -28,7 +28,8 @@ function isSecretName(name: string): boolean {
 
 /** Mask URL userinfo: `scheme://user:pass@host` → `scheme://<redacted>@host`. */
 function redactUrlUserinfo(value: string): string {
-  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/i, "$1<redacted>@");
+  // No `^` anchor: a credential can follow other text (e.g. "--proxy http://…").
+  return value.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1<redacted>@");
 }
 
 function redactDeep(value: unknown): unknown {

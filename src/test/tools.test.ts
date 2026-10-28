@@ -2367,6 +2367,19 @@ describe("handler behavior", () => {
     expect(JSON.parse(res.content[0].text)).toBe("http://<redacted>@proxy.local:8080");
   });
 
+  it("get_configuration masks URL userinfo embedded in a larger string", async () => {
+    mockConfiguration({
+      some: { cmd: "--proxy http://u:p@h and https://a:b@c/d" },
+    });
+
+    const h = requireHandler(handlers, "get_configuration");
+    const res = await h({ section: "some", key: "cmd" });
+
+    expect(JSON.parse(res.content[0].text)).toBe(
+      "--proxy http://<redacted>@h and https://<redacted>@c/d",
+    );
+  });
+
   it("get_configuration treats an empty section as absent", async () => {
     mockConfiguration({});
 
