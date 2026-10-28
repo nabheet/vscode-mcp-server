@@ -9,11 +9,13 @@ const MAX_CONFIG_BYTES = 200 * 1024;
  * This tool has no workspace boundary, so redact obvious secret-looking values
  * before they leave the extension host.
  *
- * `token` is anchored to end-of-key so `editor.tokenColorCustomizations` and
- * `editor.semanticTokenColorCustomizations` are not redacted.
+ * `token` is a plain end-of-key suffix: it catches `authToken`, `access_token`,
+ * `apiToken`, `id_token`, etc., while `editor.tokenColorCustomizations` and
+ * `editor.semanticTokenColorCustomizations` end in "Customizations" and are
+ * left alone.
  */
 const SECRET_KEY =
-  /(^|\.)(auth|bearer|access|refresh)?token$|secret|password|passwd|api[_-]?key|credential|private[_-]?key|authorization/i;
+  /token$|secret|password|passwd|api[_-]?key|credential|private[_-]?key|authorization/i;
 
 function redactDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((v) => redactDeep(v));

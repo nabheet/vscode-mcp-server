@@ -2270,8 +2270,8 @@ describe("handler behavior", () => {
   it("get_configuration redacts nested secrets in a section dump", async () => {
     mockConfiguration({
       "github.copilot": {
-        advanced: { authToken: "nested" },
-        env: { API_KEY: "x" },
+        advanced: { authToken: "nested", access_token: "underscore", apiToken: "camel" },
+        env: { API_KEY: "x", id_token: "oidc" },
         plain: "visible",
       },
     });
@@ -2281,8 +2281,8 @@ describe("handler behavior", () => {
 
     expect(res.isError).toBe(false);
     expect(JSON.parse(res.content[0].text)).toEqual({
-      advanced: { authToken: "<redacted>" },
-      env: { API_KEY: "<redacted>" },
+      advanced: { authToken: "<redacted>", access_token: "<redacted>", apiToken: "<redacted>" },
+      env: { API_KEY: "<redacted>", id_token: "<redacted>" },
       plain: "visible",
     });
   });
