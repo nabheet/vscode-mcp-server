@@ -558,6 +558,43 @@ describe("multi-root workspace (E2E)", () => {
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
   /**
+   * Type into the active editor until the buffer reports dirty.
+   *
+   * `type` needs a focused editor group; on a headless window it can resolve
+   * having done nothing, leaving `isDirty` false. Focus the group, type, then
+   * confirm through get_open_editors before the caller relies on the buffer
+   * being dirty.
+   */
+  async function typeUntilDirty(text: string, targetPath: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "workbench.action.focusActiveEditorGroup" },
+      });
+      const typed = await mcpRequest(port, "tools/call", {
+        name: "execute_command",
+        arguments: { command: "type", args: [{ text }] },
+      });
+      expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+
+      const deadline = Date.now() + 1500;
+      while (Date.now() < deadline) {
+        const res = await mcpRequest(port, "tools/call", {
+          name: "get_open_editors",
+          arguments: {},
+        });
+        const editors = JSON.parse(res.result.content[0].text) as {
+          path: string;
+          isDirty: boolean;
+        }[];
+        if (editors.some((e) => e.path === targetPath && e.isDirty)) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    throw new Error(`could not make ${targetPath} dirty`);
+  }
+
+  /**
    * Seed a file through VS Code's own filesystem instead of `fs`, so the state
    * the batch validates against is the state the test just wrote. A batch that
    * creates or deletes a path is checked against VS Code's file-system view,
@@ -708,12 +745,7 @@ describe("multi-root workspace (E2E)", () => {
         arguments: { path: target },
       });
       expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-      const typed = await mcpRequest(port, "tools/call", {
-        name: "execute_command",
-        arguments: { command: "type", args: [{ text: "unsaved line\n" }] },
-      });
-      expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
-      await new Promise((r) => setTimeout(r, 250));
+      await typeUntilDirty("unsaved line\n", target);
       return mcpRequest(port, "tools/call", {
         name: "apply_workspace_edit",
         arguments: {
@@ -1670,11 +1702,7 @@ describe("multi-root workspace (E2E)", () => {
       arguments: { path: target },
     });
     expect(opened.result.isError, `open_file: ${opened.result.content[0].text}`).toBe(false);
-    const typed = await mcpRequest(port, "tools/call", {
-      name: "execute_command",
-      arguments: { command: "type", args: [{ text: "unsaved\n" }] },
-    });
-    expect(typed.result.isError, `type: ${typed.result.content[0].text}`).toBe(false);
+    await typeUntilDirty("unsaved\n", target);
 
     const editors = await openEditorsUntil((list) =>
       list.some((e) => e.path === target && e.isDirty),
