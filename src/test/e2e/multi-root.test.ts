@@ -701,6 +701,17 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.content[0].text).toContain("Left unsaved");
     // The user's unsaved work must not be written behind their back.
     expect(fs.readFileSync(target, "utf-8")).toBe("one\n");
+
+    // Leave no dirty buffer behind: a later close/prompt would block the
+    // window and take unrelated editor tests down with it.
+    await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.files.revert" },
+    });
+    await mcpRequest(port, "tools/call", {
+      name: "execute_command",
+      arguments: { command: "workbench.action.closeAllEditors" },
+    });
   });
 
   it("apply_workspace_edit resolves relative paths against workspaceFolder", async () => {
