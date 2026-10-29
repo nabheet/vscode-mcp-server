@@ -9,7 +9,7 @@ interface McpResponse {
     content?: { type: string; text: string }[];
     isError?: boolean;
   };
-  error?: { message: string };
+  error?: { code: number; message: string };
 }
 
 function findFreePort(): Promise<number> {
@@ -154,6 +154,7 @@ describe("McpServer", () => {
     );
     expect(res.status).toBe(204);
     expect(res.headers["access-control-allow-origin"]).toBe(`http://127.0.0.1:${port}`);
+    expect(res.headers["access-control-allow-headers"]).toContain("MCP-Protocol-Version");
   });
 
   // ── tools/list ──────────────────────────────────────────────────────
@@ -213,6 +214,20 @@ describe("McpServer", () => {
     expect(res.status).toBe(200);
     expect((res.body as McpResponse).result.content[0].text).toBe("hello from tool");
     expect(handler).toHaveBeenCalledWith({ name: "World" });
+  });
+
+  it("returns JSON-RPC InvalidParams for unknown tool over HTTP 200", async () => {
+    server = new McpServer({ port, host: "127.0.0.1" });
+    await server.start();
+    const res = await post(`http://127.0.0.1:${port}/mcp`, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "missing" },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as McpResponse).error?.code).toBe(-32602);
+    expect((res.body as McpResponse).result).toBeUndefined();
   });
 
   it("returns 400 for schema validation error", async () => {

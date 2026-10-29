@@ -1,7 +1,6 @@
 import * as pkg from "../../package.json";
 
 import {
-  type CallToolResult,
   ErrorCode,
   type JsonRpcError,
   type JsonRpcRequest,
@@ -54,6 +53,28 @@ function validateAgainstSchema(
 }
 
 // ── Response Helpers ─────────────────────────────────────────────────
+
+// Legacy revisions supported by this initialization-based server. The
+// 2026-07-28 revision changes negotiation to per-request metadata and requires
+// server/discover, so it needs a separate implementation.
+const SUPPORTED_PROTOCOL_VERSIONS = [
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+] as const;
+const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
+const SUPPORTED_PROTOCOL_VERSION_SET: ReadonlySet<string> = new Set(SUPPORTED_PROTOCOL_VERSIONS);
+
+function negotiateProtocolVersion(params: unknown): string {
+  const requested =
+    typeof params === "object" && params !== null && "protocolVersion" in params
+      ? params.protocolVersion
+      : undefined;
+  return typeof requested === "string" && SUPPORTED_PROTOCOL_VERSION_SET.has(requested)
+    ? requested
+    : LATEST_PROTOCOL_VERSION;
+}
 
 function makeResult(id: number | string | null, result: unknown): JsonRpcResponse {
   return { jsonrpc: "2.0", id, result };
@@ -134,48 +155,55 @@ function handleListTools(tools: Map<string, ToolDefinition>): ListToolsResult {
 
 async function handleCallTool(
   tools: Map<string, ToolDefinition>,
+  id: JsonRpcRequest["id"],
   params: unknown,
-): Promise<CallToolResult> {
-  if (typeof params !== "object" || params === null) {
-    return {
-      content: [{ type: "text", text: 'Invalid params: expected object with "name"' }],
-      isError: true,
-    };
+): Promise<JsonRpcResponse> {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) {
+    return makeError(
+      id,
+      jrpcError(ErrorCode.InvalidParams, 'Invalid params: expected object with "name"'),
+    );
   }
 
   const callParams = params as ToolCallParams;
   if (typeof callParams.name !== "string" || callParams.name.length === 0) {
-    return {
-      content: [{ type: "text", text: 'Invalid params: "name" must be a non-empty string' }],
-      isError: true,
-    };
+    return makeError(
+      id,
+      jrpcError(ErrorCode.InvalidParams, 'Invalid params: "name" must be a non-empty string'),
+    );
   }
 
   const tool = tools.get(callParams.name);
   if (!tool) {
-    const names = Array.from(tools.keys()).join(", ");
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Tool not found: '${callParams.name}'. Available: ${names || "(none)"}`,
-        },
-      ],
-      isError: true,
-    };
+    return makeError(id, jrpcError(ErrorCode.InvalidParams, `Unknown tool: ${callParams.name}`));
+  }
+
+  if (
+    callParams.arguments !== undefined &&
+    (typeof callParams.arguments !== "object" ||
+      callParams.arguments === null ||
+      Array.isArray(callParams.arguments))
+  ) {
+    return makeError(
+      id,
+      jrpcError(ErrorCode.InvalidParams, 'Invalid params: "arguments" must be an object'),
+    );
   }
 
   const args = callParams.arguments ?? {};
   const schemaErr = validateAgainstSchema(args, tool.inputSchema);
   if (schemaErr) {
-    return { content: [{ type: "text", text: schemaErr }], isError: true };
+    return makeResult(id, { content: [{ type: "text", text: schemaErr }], isError: true });
   }
 
   try {
-    return await tool.handler(args);
+    return makeResult(id, await tool.handler(args));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: "text", text: `Tool error: ${msg}` }], isError: true };
+    return makeResult(id, {
+      content: [{ type: "text", text: `Tool error: ${msg}` }],
+      isError: true,
+    });
   }
 }
 
@@ -206,7 +234,7 @@ export async function handleRequest(
   switch (method) {
     case MCP_INITIALIZE:
       return makeResult(id, {
-        protocolVersion: "2024-11-05",
+        protocolVersion: negotiateProtocolVersion(req.params),
         capabilities: { tools: {} },
         serverInfo: {
           name: pkg.name,
@@ -221,7 +249,7 @@ export async function handleRequest(
     case MCP_TOOLS_LIST:
       return makeResult(id, handleListTools(tools));
     case MCP_TOOLS_CALL:
-      return makeResult(id, await handleCallTool(tools, req.params));
+      return handleCallTool(tools, id, req.params);
     default:
       return makeError(id, jrpcError(ErrorCode.MethodNotFound, `Method not found: '${method}'`));
   }
