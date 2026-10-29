@@ -361,10 +361,10 @@ jobs:
           extension="$(jq -r '.publisher + "." + .name' package.json)"
           show_json="$(mktemp)"
           show_err="$(mktemp)"
+          trap 'rm -f "$show_json" "$show_err"' EXIT
           if ! npx --yes @vscode/vsce show "$extension" --json \
             >"$show_json" 2>"$show_err"; then
             if grep -qiE "not found|404" "$show_err"; then
-              # Never published: nothing to compare against.
               echo "::notice::no published versions for ${extension} yet"
               echo '{"versions":[]}' >"$show_json"
             else
@@ -374,6 +374,11 @@ jobs:
               cat "$show_err"
               exit 1
             fi
+          elif ! jq -e 'has("versions")' "$show_json" >/dev/null 2>&1; then
+            # An id that was never published exits 0 and prints `undefined`
+            # rather than JSON, so this, not the exit code, is the real test.
+            echo "::notice::no published versions for ${extension} yet"
+            echo '{"versions":[]}' >"$show_json"
           fi
           remote="$(jq -r --arg line "${local%.*}" '[.versions[].version]
               | map(select((contains("-") | not) and (startswith($line + "."))))
@@ -405,7 +410,7 @@ jobs:
               echo "Published $VERSION"
               exit 0
             fi
-            if npx --yes @vscode/vsce show "$EXTENSION" --json 2>/dev/null \
+            if timeout 90 npx --yes @vscode/vsce show "$EXTENSION" --json 2>/dev/null \
               | jq -e --arg v "$VERSION" '.versions[] | select(.version == $v)' \
                 >/dev/null; then
               echo "Published $VERSION (marketplace already lists it)"
@@ -460,6 +465,7 @@ jobs:
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ secrets.GH_SYNC_PAT }}
+          GH_SYNC_PAT: ${{ secrets.GH_SYNC_PAT }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
