@@ -326,7 +326,10 @@ export class McpServer {
     const allowed = origin && this.isValidOrigin(origin) ? origin : fallback;
     res.setHeader("Access-Control-Allow-Origin", allowed);
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, MCP-Protocol-Version",
+    );
   }
 
   /** Verify bearer token using timing-safe comparison. */
@@ -745,7 +748,6 @@ export class McpServer {
           switch (response.error.code) {
             case -32700:
             case -32600:
-            case -32602:
               status = 400;
               break;
             case -32601:
