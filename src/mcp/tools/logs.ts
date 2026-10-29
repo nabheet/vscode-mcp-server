@@ -117,6 +117,18 @@ async function tailLogFile(filePath: string, maxLines: number, grep?: string): P
   return filtered.slice(-maxLines).join("\n");
 }
 
+/**
+ * Prefix that addresses the extension's own log directory. `list_logs` prints
+ * its entries with it, because that directory lives outside the VS Code logs
+ * root and a bare name would resolve to the wrong place.
+ */
+export const EXTENSION_LOG_PREFIX = "extension/";
+
+/** The extension's own log directory (`context.logUri`), when it is a local dir. */
+function extensionLogDir(context: vscode.ExtensionContext): string | undefined {
+  return context.logUri?.scheme === "file" ? context.logUri.fsPath : undefined;
+}
+
 export function registerLogsTools(server: ToolRegistrar, context: vscode.ExtensionContext): void {
   server.registerTool(
     defineTool(
@@ -157,9 +169,9 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
           }
         }
         // Extension's own JSON log
-        const logDir = context.logUri?.scheme === "file" ? context.logUri.fsPath : undefined;
+        const logDir = extensionLogDir(context);
         if (logDir && fs.existsSync(logDir)) {
-          out.push("\nExtension log files (context.logUri):");
+          out.push(`\nExtension log files (${EXTENSION_LOG_PREFIX}<name>):`);
           const files = fs
             .readdirSync(logDir)
             .filter((f) => f.startsWith("mcp.log"))
@@ -167,7 +179,7 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
           if (files.length === 0) out.push("  (none yet)");
           for (const f of files) {
             const st = fs.statSync(path.join(logDir, f));
-            out.push(`  ${f}  ${formatBytes(st.size)}`);
+            out.push(`  ${EXTENSION_LOG_PREFIX}${f}  ${formatBytes(st.size)}`);
           }
         }
         return { content: [{ type: "text", text: out.join("\n") }], isError: false };
@@ -180,7 +192,8 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
       "read_log",
       "Tail a VS Code log file (e.g. main.log, mcpGateway.log, sharedprocess.log).\n" +
         'Path is relative to the VS Code logs root, e.g. "2026-08-22-14:03/main.log" — use list_logs to see the newest session name. ' +
-        "Symlinks and paths escaping the logs root are rejected.",
+        `Prefix a name with "${EXTENSION_LOG_PREFIX}" to read this extension's own log (e.g. "${EXTENSION_LOG_PREFIX}mcp.log"). ` +
+        "Symlinks and paths escaping the selected log root are rejected.",
       {
         type: "object",
         properties: {
@@ -199,16 +212,31 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
       },
       async (args) => {
         const logsRoot = getLogsRoot(context);
-        if (!logsRoot) {
+        const fileArg = String(args.file);
+        const extDir = extensionLogDir(context);
+        const usesExtensionRoot = fileArg.startsWith(EXTENSION_LOG_PREFIX);
+        const root = usesExtensionRoot ? extDir : logsRoot;
+        if (!root) {
           return {
-            content: [{ type: "text", text: "VS Code logs root not found on this platform" }],
+            content: [
+              {
+                type: "text",
+                text: usesExtensionRoot
+                  ? "Extension log directory not available"
+                  : "VS Code logs root not found on this platform",
+              },
+            ],
             isError: true,
           };
         }
-        const fileArg = String(args.file);
-        const candidate = path.isAbsolute(fileArg) ? fileArg : path.resolve(logsRoot, fileArg);
-        // Boundary check — the resolved file must stay under the logs root.
-        if (!isPathInside(candidate, logsRoot)) {
+        const relativeArg = usesExtensionRoot
+          ? fileArg.slice(EXTENSION_LOG_PREFIX.length)
+          : fileArg;
+        const candidate = path.isAbsolute(relativeArg)
+          ? relativeArg
+          : path.resolve(root, relativeArg);
+        // Boundary check — the resolved file must stay under its log root.
+        if (!isPathInside(candidate, root)) {
           return {
             content: [{ type: "text", text: "Rejected: path escapes the VS Code logs root" }],
             isError: true,
@@ -222,7 +250,7 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
         }
         try {
           const real = await fs.promises.realpath(candidate);
-          const realRoot = await fs.promises.realpath(logsRoot);
+          const realRoot = await fs.promises.realpath(root);
           if (!isPathInside(real, realRoot)) {
             return {
               content: [{ type: "text", text: "Rejected: symlink escapes the VS Code logs root" }],
@@ -241,11 +269,14 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
         try {
           const text = await tailLogFile(candidate, maxLines, grep);
           const label = grep ? ` (grep: /${grep}/)` : "";
+          const shown = usesExtensionRoot
+            ? `${EXTENSION_LOG_PREFIX}${toPosixPath(path.relative(root, candidate))}`
+            : toPosixPath(path.relative(root, candidate));
           return {
             content: [
               {
                 type: "text",
-                text: `--- ${toPosixPath(path.relative(logsRoot, candidate))} — last ${maxLines} lines${label} ---\n${text}`,
+                text: `--- ${shown} — last ${maxLines} lines${label} ---\n${text}`,
               },
             ],
             isError: false,

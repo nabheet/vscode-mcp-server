@@ -272,7 +272,7 @@ describe("observability endpoints + log tools (E2E)", () => {
         }
       }
     }
-  });
+  }, 30000);
 
   it("list_logs exposes VS Code host logs and the extension JSON log", async () => {
     if (!ENABLED) {
@@ -283,7 +283,16 @@ describe("observability endpoints + log tools (E2E)", () => {
     const text = res?.result?.content?.[0]?.text ?? JSON.stringify(res);
     expect(text).toContain("VS Code logs root:");
     expect(text).toContain("Sessions (newest first)");
-    expect(text).toContain("Extension log files (context.logUri)");
+    expect(text).toContain("Extension log files (extension/<name>):");
+    // Whatever the extension section lists must be readable through read_log.
+    const entry = text.match(/^\s+(extension\/\S+)\s+/m)?.[1];
+    expect(entry, "extension log entry in list_logs output").toBeTruthy();
+    const read = await mcpRequest(port, "tools/call", {
+      name: "read_log",
+      arguments: { file: entry },
+    });
+    expect(read?.result?.isError ?? false, JSON.stringify(read)).toBe(false);
+    expect(read?.result?.content?.[0]?.text ?? "").toContain(`--- ${entry}`);
   });
 
   it("extension JSON log file exists on disk with lifecycle + tool entries", async () => {

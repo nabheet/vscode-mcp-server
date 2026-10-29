@@ -5,9 +5,7 @@ export function registerEditorsTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "get_open_editors",
-      // Untitled buffers have no path, so they are skipped until #131 adds
-      // them as flagged entries with their unsaved content.
-      "List the files open in VS Code editors, in tab-group order. Returns absolute paths with flags for the visible tab of each group, the active editor of the active group, unsaved changes, preview tabs (a preview tab is replaced by the next open in its group), and the tab-group index. The same file open in two groups appears twice. Untitled buffers and virtual documents (settings, extension pages) are skipped; a diff tab reports the file on disk. An empty list is a valid result, not an error.",
+      'List the files and unsaved buffers open in VS Code editors, in tab-group order. Returns absolute paths for files and `untitled:` URIs for never-saved buffers, with flags for the visible tab of each group, the active editor of the active group, unsaved changes, preview tabs (a preview tab is replaced by the next open in its group), and the tab-group index. The same file open in two groups appears twice. Virtual documents (settings, extension pages) are skipped; a diff tab reports the file on disk. An empty list is a valid result, not an error. Pass an entry\'s path (including an `untitled:` URI) to `read_file` with `source: "editor"` to read unsaved content.',
       {
         type: "object",
         properties: {
