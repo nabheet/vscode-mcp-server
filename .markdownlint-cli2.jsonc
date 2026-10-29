@@ -11,13 +11,14 @@
   },
   // `REVIEW_OUTPUT.md` is gitignored scratch written by review tooling. It is
   // never committed, but markdownlint globs the working tree, so a local run
-  // fails on a file CI never sees. Keep the two in agreement.
+  // fails on a file CI never sees. `**/` mirrors the .gitignore entry, which
+  // matches the name at any depth.
   "globs": [
     "**/*.md",
     "!node_modules/**",
     "!dist/**",
     "!.git/**",
     "!.vscode-test/**",
-    "!REVIEW_OUTPUT.md"
+    "!**/REVIEW_OUTPUT.md"
   ]
 }
