@@ -205,7 +205,8 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           pattern: { type: "string", description: 'Glob pattern (default: "**/*")' },
           path: {
             type: "string",
-            description: "Root directory relative to workspace (default: workspace root)",
+            description:
+              "Root directory (absolute, or relative to the workspace folder). Default: workspace folder root.",
           },
           workspaceFolder: {
             type: "string",
@@ -220,31 +221,20 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           return { content: [{ type: "text", text: "No workspace folder open" }], isError: true };
         }
 
-        // Resolve target folder
+        // Resolve the root the same way read/write tools do: absolute paths are
+        // taken as-is (and may target the window that owns them, via cluster
+        // routing), relative paths resolve against the selected folder.
         let rootUri: vscode.Uri;
-        if (args.workspaceFolder) {
-          const ref = String(args.workspaceFolder);
-          const folder = folders.find((f) => f.name === ref || pathsEqual(f.uri.fsPath, ref));
-          if (!folder) {
-            const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Workspace folder '${args.workspaceFolder}' not found. Available folders: ${names}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          rootUri = folder.uri;
-        } else {
-          rootUri = folders[0].uri;
-        }
-
-        // Apply sub-path if given
-        if (args.path) {
-          rootUri = vscode.Uri.file(path.join(rootUri.fsPath, String(args.path)));
+        try {
+          rootUri = resolvePath(
+            args.path ? String(args.path) : ".",
+            args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+          );
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: errorMessage(err) }],
+            isError: true,
+          };
         }
 
         const pattern = String(args.pattern || "**/*");
