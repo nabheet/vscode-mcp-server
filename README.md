@@ -627,8 +627,9 @@ Supports three transport modes:
 
 Full MCP protocol lifecycle implemented:
 
-1. **Client sends `initialize`** — server responds with protocol version
-   (`2024-11-05`), capabilities (`tools`), and server info
+1. **Client sends `initialize`** — server echoes a supported legacy protocol
+   version (`2025-11-25`, `2025-06-18`, `2025-03-26`, or `2024-11-05`), or
+   falls back to `2025-11-25`, with capabilities (`tools`) and server info
 2. **Client sends `notifications/initialized`** — acknowledges readiness (no response expected)
 3. **`tools/list`** — returns all tool definitions with JSON schemas
 4. **`tools/call`** — invokes a tool by name with arguments
