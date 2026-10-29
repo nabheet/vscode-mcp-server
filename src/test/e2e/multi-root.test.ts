@@ -10,6 +10,10 @@ import { createCanonicalTempDir, resolveCodeCli, stopVSCodeProcess } from "./pla
 
 const PROJECT_ROOT = process.cwd();
 
+function readText(file: string): string {
+  return fs.readFileSync(file, "utf-8").replaceAll("\r\n", "\n");
+}
+
 /** Tool output prints paths with forward slashes on every platform. */
 function posix(value: string): string {
   return value.replaceAll("\\", "/");
@@ -564,14 +568,12 @@ describe("multi-root workspace (E2E)", () => {
     // Disk is the source of truth: poll briefly (the edit lands on disk async).
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
-      const applied =
-        fs.readFileSync(first, "utf-8") === "alpha\nBETA\n" &&
-        fs.readFileSync(second, "utf-8") === "GAMMA\ndelta\n";
+      const applied = readText(first) === "alpha\nBETA\n" && readText(second) === "GAMMA\ndelta\n";
       if (applied) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    expect(fs.readFileSync(first, "utf-8")).toBe("alpha\nBETA\n");
-    expect(fs.readFileSync(second, "utf-8")).toBe("GAMMA\ndelta\n");
+    expect(readText(first)).toBe("alpha\nBETA\n");
+    expect(readText(second)).toBe("GAMMA\ndelta\n");
   });
 
   it("apply_workspace_edit creates and deletes in one atomic call", async () => {
@@ -604,7 +606,7 @@ describe("multi-root workspace (E2E)", () => {
       if (fs.existsSync(created) && !fs.existsSync(doomed)) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    expect(fs.readFileSync(created, "utf-8")).toBe("// created atomically\n");
+    expect(readText(created)).toBe("// created atomically\n");
     expect(fs.existsSync(doomed)).toBe(false);
   });
 
@@ -637,7 +639,7 @@ describe("multi-root workspace (E2E)", () => {
     });
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     expect(res.result.content[0].text).not.toContain("Left unsaved");
-    expect(fs.readFileSync(target, "utf-8")).toBe("ONE\ntwo\n");
+    expect(readText(target)).toBe("ONE\ntwo\n");
   });
 
   it("apply_workspace_edit resolves relative paths against workspaceFolder", async () => {
@@ -658,7 +660,7 @@ describe("multi-root workspace (E2E)", () => {
     });
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     expect(fs.existsSync(created)).toBe(true);
-    expect(fs.readFileSync(created, "utf-8")).toBe("// relative create\n");
+    expect(readText(created)).toBe("// relative create\n");
     expect(fs.existsSync(path.join(tmpDir, "frontend/src/rel-created.ts"))).toBe(false);
   });
 
@@ -696,7 +698,7 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError).toBe(true);
     const text: string = res.result.content[0].text;
     expect(text).toContain("does-not-exist.ts ===\n[error: file does not exist]");
-    expect(fs.readFileSync(untouched, "utf-8")).toBe("keep me\n");
+    expect(readText(untouched)).toBe("keep me\n");
   });
 
   // ── get_file_info ────────────────────────────────────────────────────
