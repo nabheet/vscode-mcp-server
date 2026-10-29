@@ -192,6 +192,7 @@ describe("observability endpoints + log tools (E2E)", () => {
         MCP_SERVER_MAX_RETRIES: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     };
     vsCodeProc = spawn(cliCmd, launchArgs, spawnOpts);
     if (vsCodeProc.stdout)
@@ -260,7 +261,7 @@ describe("observability endpoints + log tools (E2E)", () => {
   }, 180000);
 
   afterAll(async () => {
-    if (vsCodeProc) await stopVSCodeProcess(vsCodeProc);
+    if (vsCodeProc) await stopVSCodeProcess(vsCodeProc, true);
     if (tmpDir) {
       for (let attempt = 0; attempt < 5; attempt++) {
         try {

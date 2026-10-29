@@ -334,6 +334,9 @@ describe("multi-root workspace (E2E)", () => {
         MCP_SERVER_MAX_RETRIES: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
+      // Headless Linux spawns through xvfb-run, so the wrapper is our child
+      // and VS Code is its grandchild: stop the whole group.
+      detached: true,
     };
 
     vsCodeProc = spawn(cliCmd, launchArgs, spawnOpts);
@@ -365,7 +368,7 @@ describe("multi-root workspace (E2E)", () => {
   }, 180000);
 
   afterAll(async () => {
-    if (vsCodeProc) await stopVSCodeProcess(vsCodeProc);
+    if (vsCodeProc) await stopVSCodeProcess(vsCodeProc, true);
     if (tmpDir) {
       // Retry cleanup with backoff — VS Code may still hold file locks briefly
       let lastErr: unknown;

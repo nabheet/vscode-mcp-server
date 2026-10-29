@@ -53,13 +53,20 @@ interface FileMetrics {
  * document lookup and the save step must all agree, or a differently spelled
  * path can bypass one of them.
  */
+/** Comparison key for a path; an unreadable document must not fail the batch. */
+function normalizeForIdentity(value: string): string {
+  try {
+    return normalizePathForComparison(value);
+  } catch {
+    return path.normalize(value).toLowerCase();
+  }
+}
+
 function uriKey(uri: vscode.Uri): string {
   // Scheme stays in the key: a `git:` diff document for the same fsPath is a
   // different document and must never shadow the user's file buffer.
   const pathKey =
-    process.platform === "win32"
-      ? normalizePathForComparison(uri.fsPath)
-      : path.normalize(uri.fsPath);
+    process.platform === "win32" ? normalizeForIdentity(uri.fsPath) : path.normalize(uri.fsPath);
   const normalized = `${uri.scheme ?? "file"}:${pathKey.normalize("NFC")}`;
   return process.platform === "darwin" || process.platform === "win32"
     ? normalized.toLowerCase()

@@ -211,7 +211,7 @@ describe("resolvePath", () => {
     }
   });
 
-  it("collapses traversal so a symlink cannot redirect the returned path", () => {
+  it("rejects traversal that leaves the workspace through a symlink", () => {
     if (process.platform === "win32") return;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "path-traversal-"));
     const workspace = path.join(tempDir, "workspace");
@@ -223,10 +223,14 @@ describe("resolvePath", () => {
       { uri: { fsPath: workspace } },
     ];
     try {
-      // The raw string keeps `..` after the symlink; path.join would drop it.
-      const result = resolvePath(`${workspace}/link/../outside/secret.txt`);
-      expect(result.fsPath).not.toContain("..");
-      expect(result.fsPath.startsWith(`${workspace}${path.sep}`)).toBe(true);
+      // `..` applies to the link target, so this leaves the workspace.
+      expect(() => resolvePath(`${workspace}/link/../outside/secret.txt`)).toThrow(
+        /outside the workspace/i,
+      );
+      // Traversal that stays inside still works and never keeps `..`.
+      const inside = resolvePath(`${workspace}/link/../workspace/file.txt`);
+      expect(inside.fsPath).not.toContain("..");
+      expect(inside.fsPath.startsWith(`${workspace}${path.sep}`)).toBe(true);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

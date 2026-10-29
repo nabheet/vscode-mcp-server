@@ -58,8 +58,38 @@ function realpathWithMissingTail(
   }
 }
 
+/**
+ * Resolve symbolic links segment by segment, the way the OS does, so a `..`
+ * after a link applies to the link target rather than to the link's parent.
+ * Lexical normalization alone would turn `link/../file` into a different file
+ * instead of honouring the traversal.
+ */
+function resolveSymlinks(value: string, api: typeof path.posix | typeof path.win32): string {
+  const nativeApi = process.platform === "win32" ? path.win32 : path.posix;
+  if (api !== nativeApi || !api.isAbsolute(value)) return value;
+  const root = api.parse(value).root;
+  let current = root;
+  for (const segment of value.slice(root.length).split(/[\\/]+/)) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      current = api.dirname(current);
+      continue;
+    }
+    const candidate = api.join(current, segment);
+    let link: string | null = null;
+    try {
+      if (fs.lstatSync(candidate).isSymbolicLink()) link = fs.readlinkSync(candidate);
+    } catch {
+      // Missing paths stay lexical; the realpath walk handles the rest.
+    }
+    current = link === null ? candidate : api.resolve(api.dirname(candidate), link);
+  }
+  return current;
+}
+
 function normalizeWithApi(value: string, api: typeof path.posix | typeof path.win32): string {
-  let normalized = api.normalize(realpathWithMissingTail(value, api));
+  const resolved = resolveSymlinks(value, api);
+  let normalized = api.normalize(realpathWithMissingTail(resolved, api));
   if (api === path.win32) {
     const root = api.parse(normalized).root;
     if (normalized.length > root.length) normalized = normalized.replace(/[\\/]+$/, "");
@@ -173,11 +203,12 @@ export function resolvePath(
     }
   }
 
-  // Normalize before the boundary check so `..` segments cannot survive into
-  // the returned URI: a lexical `link/../file` passes a prefix check while the
-  // OS would follow `link` out of the workspace.
+  // Resolve links and `..` the way the OS does before the boundary check: a
+  // lexical `link/../file` passes a prefix check while the OS follows `link`
+  // out of the workspace, and normalizing it lexically would silently retarget
+  // the call at a different file.
   const resolvedApi = pathApi(resolved, process.platform === "win32" && !posixMockWorkspace);
-  resolved = resolvedApi.normalize(resolved);
+  resolved = resolvedApi.normalize(resolveSymlinks(resolved, resolvedApi));
 
   // Enforce workspace boundary: reject paths outside all open workspace folders.
   // When `allowOutsideWorkspace` is set, only ABSOLUTE inputs may leave the
