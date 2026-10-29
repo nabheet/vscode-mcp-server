@@ -36,6 +36,11 @@ jobs:
 
       - run: npm run lint
 
+      # Keeps the release guard's "devDependency bumps are non-shipping"
+      # classification honest: shipped source may not import a devDependency,
+      # and tests must stay out of the compiled output.
+      - run: npm run check:shipped-imports
+
       - run: npm test
 
       - run: npm run compile
