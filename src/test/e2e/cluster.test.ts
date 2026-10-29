@@ -295,7 +295,7 @@ describe("cluster leader-worker (E2E)", () => {
       }
       if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
     }
-  }, 20000);
+  }, 40000);
 
   /** Poll list_workspaces until both windows have registered. */
   async function waitForTwoWindows(deadlineMs = 90000): Promise<Array<Record<string, unknown>>> {

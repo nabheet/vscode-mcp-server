@@ -2,7 +2,7 @@
   "name": "vscode-ide-mcp",
   "displayName": "MCP Server for VS Code",
   "description": "VS Code MCP server for AI agents (opencode, Claude, Cursor) — debug, edit, and control VS Code via Model Context Protocol. Debugger, terminal, LSP, file ops (54 tools).",
-  "version": "0.3.70",
+  "version": "0.3.77",
   "publisher": "nabheet",
   "license": "MIT",
   "repository": {
@@ -92,16 +92,17 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check . && markdownlint-cli2",
     "lint:fix": "biome check --write . && markdownlint-cli2 --fix",
-    "check": "npm run typecheck && npm run lint",
+    "check": "npm run typecheck && npm run lint && npm run check:shipped-imports",
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.mts",
-    "test:e2e:watch": "vitest --config vitest.e2e.config.mts"
+    "test:e2e:watch": "vitest --config vitest.e2e.config.mts",
+    "check:shipped-imports": "node scripts/check-shipped-imports.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.3",
-    "@types/node": "^26.6.5",
+    "@types/node": "^24.19.2",
     "@types/vscode": "^1.140.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.0.0",

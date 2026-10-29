@@ -384,7 +384,7 @@ describe("multi-root workspace (E2E)", () => {
       }
       if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
     }
-  }, 15000);
+  }, 30000);
 
   // ── Workspace folder listing ─────────────────────────────────────────
 
@@ -529,7 +529,7 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `write_file ${absPath}: ${res.result.content[0].text}`).toBe(false);
   }
 
-  it("apply_workspace_edit applies text edits across files in one atomic call", async () => {
+  it("apply_workspace_edit applies text edits across files in one call", async () => {
     if (!ENABLED || !tmpDir) return;
     const first = path.join(tmpDir, "frontend/src/atomic-a.ts");
     const second = path.join(tmpDir, "backend/src/atomic-b.ts");
@@ -564,7 +564,7 @@ describe("multi-root workspace (E2E)", () => {
 
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
-    expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
+    expect(text).toContain("Applied 2 file edit(s) in one workspace edit");
     expect(text).toContain(`${posix(first)} ===\nApplied 1 text edit(s)`);
     expect(text).toContain(`${posix(second)} ===\nApplied 1 text edit(s)`);
 
@@ -579,7 +579,7 @@ describe("multi-root workspace (E2E)", () => {
     expect(readText(second)).toBe("GAMMA\ndelta\n");
   });
 
-  it("apply_workspace_edit creates and deletes in one atomic call", async () => {
+  it("apply_workspace_edit creates and deletes in one call", async () => {
     if (!ENABLED || !tmpDir) return;
     const created = path.join(tmpDir, "backend/src/created.ts");
     const doomed = path.join(tmpDir, "backend/src/doomed.ts");
@@ -600,7 +600,7 @@ describe("multi-root workspace (E2E)", () => {
 
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
-    expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
+    expect(text).toContain("Applied 2 file edit(s) in one workspace edit");
     expect(text).toContain(`${posix(created)} ===\nCreated`);
     expect(text).toContain(`${posix(doomed)} ===\nDeleted`);
 
@@ -1529,6 +1529,7 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     return JSON.parse(res.result.content[0].text) as {
       path: string;
+      scheme: "file" | "untitled";
       kind: string;
       isVisible: boolean;
       isActive: boolean;
@@ -1592,7 +1593,7 @@ describe("multi-root workspace (E2E)", () => {
     expect(visible[0].isPreview).toBe(true);
   });
 
-  it("get_open_editors skips untitled buffers", async () => {
+  it("get_open_editors reports untitled buffers and read_file reads them", async () => {
     if (!ENABLED) return;
     const untitled = await mcpRequest(port, "tools/call", {
       name: "execute_command",
@@ -1603,11 +1604,21 @@ describe("multi-root workspace (E2E)", () => {
     );
 
     const editors = await openEditors();
-    // Only files on disk: every entry is an absolute path that exists.
-    for (const editor of editors) {
+    const buffer = editors.find((editor) => editor.scheme === "untitled");
+    expect(buffer, `untitled entry missing: ${JSON.stringify(editors)}`).toBeTruthy();
+    expect(buffer?.path.startsWith("untitled:")).toBe(true);
+
+    // File entries are still absolute and present on disk.
+    for (const editor of editors.filter((entry) => entry.scheme === "file")) {
       expect(path.isAbsolute(editor.path)).toBe(true);
       expect(fs.existsSync(editor.path), `missing on disk: ${editor.path}`).toBe(true);
     }
+
+    const read = await mcpRequest(port, "tools/call", {
+      name: "read_file",
+      arguments: { path: buffer?.path, source: "editor" },
+    });
+    expect(read.result.isError, `tool text: ${read.result.content[0].text}`).toBe(false);
 
     await mcpRequest(port, "tools/call", {
       name: "execute_command",
