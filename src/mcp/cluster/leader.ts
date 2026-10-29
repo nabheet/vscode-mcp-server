@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import type * as http from "node:http";
 import { isIP } from "node:net";
 import type { Metrics } from "../../utils/metrics";
+import { normalizePathForComparison, pathsEqual } from "../../utils/path";
 import type { ServerLog } from "../../utils/serverLog";
 import type { JsonRpcResponse, ToolDefinition } from "../../utils/types";
 import type { ToolExecutor } from "../executor";
@@ -389,10 +390,11 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
    */
   private resolveWorkspaceRef(ref: string): "local" | string | null {
     if (ref === this.opts.workspaceId || ref === this.opts.instanceId) return "local";
-    if (this.opts.workspacePaths.some((p) => p === ref || basename(p) === ref)) return "local";
+    if (this.opts.workspacePaths.some((p) => samePath(p, ref) || basenameMatches(p, ref)))
+      return "local";
     for (const w of this.workers.values()) {
       if (w.id === ref || w.displayName === ref || w.instanceId === ref) return w.id;
-      if (w.workspacePaths.some((p) => p === ref || basename(p) === ref)) return w.id;
+      if (w.workspacePaths.some((p) => samePath(p, ref) || basenameMatches(p, ref))) return w.id;
     }
     return null;
   }
@@ -413,7 +415,7 @@ export class LeaderCoordinator implements McpRouter, MemberChannel {
     if (candidates.length === 0) return null;
 
     const all = [
-      { id: "local", path: "" },
+      ...this.opts.workspacePaths.map((p) => ({ id: "local", path: p })),
       ...Array.from(this.workers.values()).flatMap((w) =>
         w.workspacePaths.map((p) => ({ id: w.id, path: p })),
       ),
@@ -829,10 +831,30 @@ function collectPathCandidates(args: Record<string, unknown>): string[] {
 }
 
 function normalize(p: string): string {
-  return p.replace(/[\\/]+$/, "");
+  if (!p) return "";
+  try {
+    return normalizePathForComparison(p).replaceAll("\\", "/").replace(/\/+$/, "");
+  } catch {
+    const normalized = p.replaceAll("\\", "/").replace(/\/+$/, "");
+    return /^[a-z]:[\\/]/i.test(p) || p.startsWith("\\\\") ? normalized.toLowerCase() : normalized;
+  }
+}
+
+function samePath(a: string, b: string): boolean {
+  try {
+    return pathsEqual(a, b);
+  } catch {
+    return normalize(a) === normalize(b);
+  }
 }
 
 function basename(p: string): string {
-  const parts = p.split(/[\\/]/);
+  const parts = normalize(p).split("/");
   return parts[parts.length - 1] || p;
+}
+
+function basenameMatches(pathValue: string, ref: string): boolean {
+  const base = basename(pathValue);
+  const windowsPath = /^[a-z]:[\\/]/i.test(pathValue) || pathValue.startsWith("\\\\");
+  return windowsPath ? base === ref.toLowerCase() : base === ref;
 }

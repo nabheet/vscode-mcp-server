@@ -1,14 +1,19 @@
 import { type ChildProcess, execSync, type SpawnOptions, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createCanonicalTempDir, resolveCodeCli, stopVSCodeProcess } from "./platform";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 const PROJECT_ROOT = process.cwd();
+
+/** Tool output prints paths with forward slashes on every platform. */
+function posix(value: string): string {
+  return value.replaceAll("\\", "/");
+}
 
 let ENABLED = true;
 
@@ -122,62 +127,6 @@ function hideVSCodeWindows(_proc: ChildProcess, delayMs = 1500) {
   }, delayMs);
 }
 
-/**
- * Resolve the VS Code CLI binary via `@vscode/test-electron` (downloads
- * VS Code to a cache, works on all platforms, no local install required).
- *
- * On headless Linux, xvfb-run is auto-detected and wrapped around the command.
- */
-async function resolveCodeCli(): Promise<{
-  cmd: string;
-  args: string[];
-}> {
-  const { downloadAndUnzipVSCode } = await import("@vscode/test-electron");
-
-  const vscodePath = await downloadAndUnzipVSCode("stable");
-  if (process.platform === "darwin") {
-    // Spawn the app binary directly. The `bin/code` wrapper (returned by
-    // resolveCliPathFromVSCodeExecutablePath) launches the app detached via
-    // LaunchServices: under vitest the app can die before writing logs and
-    // leaves orphaned processes. The binary stays attached as our child.
-    const appRoot = vscodePath.endsWith(".app")
-      ? vscodePath
-      : vscodePath.replace(/\/Contents\/MacOS\/.+$/, "");
-    const binary = path.join(appRoot, "Contents", "MacOS", "Code");
-    if (fs.existsSync(binary)) return { cmd: binary, args: [] };
-    throw new Error(`VS Code binary not found under ${appRoot}`);
-  }
-  const { resolveCliPathFromVSCodeExecutablePath } = await import("@vscode/test-electron");
-  const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
-
-  if (!fs.existsSync(cliPath)) {
-    throw new Error(`VS Code CLI not found at resolved path: ${cliPath}`);
-  }
-
-  return wrapForDisplay(cliPath, []);
-}
-
-/**
- * On headless Linux, wrap the command with xvfb-run.
- */
-function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: string[] } {
-  const isLinux = process.platform === "linux";
-  const hasDisplay = !!process.env.DISPLAY;
-
-  if (isLinux && !hasDisplay) {
-    try {
-      execSync("which xvfb-run", { stdio: "pipe" });
-      return { cmd: "xvfb-run", args: ["--auto-servernum", cmd, ...extraArgs] };
-    } catch {
-      console.warn(
-        "Headless Linux detected but xvfb-run not found. Install xvfb: apt-get install xvfb",
-      );
-    }
-  }
-
-  return { cmd, args: extraArgs };
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────
 
 describe("multi-root workspace (E2E)", () => {
@@ -194,15 +143,13 @@ describe("multi-root workspace (E2E)", () => {
     // Verify extension is compiled
     const extMain = path.join(PROJECT_ROOT, "out", "extension.js");
     if (!fs.existsSync(extMain)) {
-      console.warn("⚠  Skipping E2E tests: extension not compiled (run `npm run compile` first)");
-      ENABLED = false;
-      return;
+      throw new Error("E2E setup failed: extension is not compiled (run `npm run compile` first)");
     }
 
     port = await findFreePort();
 
     // Create temp workspace with two named folders
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mre-"));
+    tmpDir = createCanonicalTempDir("mre-");
     const folderA = path.join(tmpDir, "frontend");
     const folderB = path.join(tmpDir, "backend");
     fs.mkdirSync(path.join(folderA, "src"), { recursive: true });
@@ -269,23 +216,22 @@ describe("multi-root workspace (E2E)", () => {
             { "name": "Slow Compound", "configurations": ["Slow Compound 1", "Slow Compound 2", "Slow Compound 3", "Slow Compound 4"], "stopAll": true },
           ],
         },
-        /* Tasks for the Slow Launch / Slow Compound preLaunchTasks. Shell
-           tasks, non-background (isBackground defaults to false) — VS Code
-           waits for each to finish before its debug adapter starts, delaying
-           session establishment. */
+        /* Process tasks hold debugger startup until their timer completes. */
         "tasks": {
           "version": "2.0.0",
           "tasks": [
             {
               "label": "Sleep 33s",
-              "type": "shell",
-              "command": "sleep 33",
+              "type": "process",
+              "command": "node",
+              "args": ["-e", "setTimeout(() => {}, 33000)"],
               "presentation": { "reveal": "silent", "panel": "shared" },
             },
             {
               "label": "Sleep 10s",
-              "type": "shell",
-              "command": "sleep 10",
+              "type": "process",
+              "command": "node",
+              "args": ["-e", "setTimeout(() => {}, 10000)"],
               "presentation": { "reveal": "silent", "panel": "shared" },
             },
           ],
@@ -356,9 +302,7 @@ describe("multi-root workspace (E2E)", () => {
       cliCmd = resolved.cmd;
       cliArgs = resolved.args;
     } catch (err) {
-      console.warn("⚠  Skipping E2E tests:", (err as Error).message);
-      ENABLED = false;
-      return;
+      throw new Error("E2E setup failed while resolving VS Code", { cause: err });
     }
 
     const launchArgs: string[] = [
@@ -417,21 +361,7 @@ describe("multi-root workspace (E2E)", () => {
   }, 180000);
 
   afterAll(async () => {
-    if (vsCodeProc && !vsCodeProc.killed) {
-      vsCodeProc.kill("SIGTERM");
-      // Wait for graceful exit, then force kill
-      const exited = new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          if (vsCodeProc && !vsCodeProc.killed) vsCodeProc.kill("SIGKILL");
-          resolve();
-        }, 5000);
-        vsCodeProc?.on("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-      await exited;
-    }
+    if (vsCodeProc) await stopVSCodeProcess(vsCodeProc);
     if (tmpDir) {
       // Retry cleanup with backoff — VS Code may still hold file locks briefly
       let lastErr: unknown;
@@ -548,8 +478,12 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
     expect(text).toContain("=== ");
-    expect(text).toContain(`${tmpDir}/frontend/src/index.ts ===\n// frontend code`);
-    expect(text).toContain(`${tmpDir}/backend/src/index.ts ===\n// backend code`);
+    expect(text).toContain(
+      `${tmpDir.replaceAll("\\", "/")}/frontend/src/index.ts ===\n// frontend code`,
+    );
+    expect(text).toContain(
+      `${tmpDir.replaceAll("\\", "/")}/backend/src/index.ts ===\n// backend code`,
+    );
   });
 
   it("read_files reports missing files inline without aborting the batch", async () => {
@@ -624,8 +558,8 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
     expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
-    expect(text).toContain(`${first} ===\nApplied 1 text edit(s)`);
-    expect(text).toContain(`${second} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain(`${posix(first)} ===\nApplied 1 text edit(s)`);
+    expect(text).toContain(`${posix(second)} ===\nApplied 1 text edit(s)`);
 
     // Disk is the source of truth: poll briefly (the edit lands on disk async).
     const deadline = Date.now() + 5000;
@@ -662,8 +596,8 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
     const text: string = res.result.content[0].text;
     expect(text).toContain("Applied 2 file edit(s) in a single workspace edit");
-    expect(text).toContain(`${created} ===\nCreated`);
-    expect(text).toContain(`${doomed} ===\nDeleted`);
+    expect(text).toContain(`${posix(created)} ===\nCreated`);
+    expect(text).toContain(`${posix(doomed)} ===\nDeleted`);
 
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
@@ -782,7 +716,7 @@ describe("multi-root workspace (E2E)", () => {
     expect(res.result.isError, `tool text: ${res.result.content[0].text}`).toBe(false);
 
     const text: string = res.result.content[0].text;
-    expect(text).toContain(`=== ${target} ===`);
+    expect(text).toContain(`=== ${posix(target)} ===`);
     const info = infoBody(text);
     expect(info).toMatchObject({ exists: true, isDirectory: false });
     expect(info.size as number).toBeGreaterThan(0);
@@ -840,7 +774,7 @@ describe("multi-root workspace (E2E)", () => {
     });
     expect(res.result.isError).toBe(false);
     expect(res.result.content[0].text as string).toContain(
-      `=== ${tmpDir}/backend/src/index.ts ===`,
+      `=== ${path.join(tmpDir, "backend", "src", "index.ts").replaceAll("\\", "/")} ===`,
     );
   });
 
@@ -1512,6 +1446,11 @@ describe("multi-root workspace (E2E)", () => {
     });
     expect(stop.result.isError).toBe(false);
     expect(stop.result.content[0].text as string).toContain("stopped");
+    const stopSecond = await mcpRequest(port, "tools/call", {
+      name: "stop_debugging",
+      arguments: {},
+    });
+    expect(stopSecond.result.isError).toBe(false);
   });
 
   it("start_debugging survives a launch slower than the generic 30s tool timeout (per-tool budget)", async () => {

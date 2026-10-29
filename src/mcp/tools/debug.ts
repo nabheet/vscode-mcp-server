@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { parseJsonc } from "../../utils/jsonc";
-import { resolvePath } from "../../utils/path";
+import { pathsEqual, resolvePath, toPosixPath } from "../../utils/path";
 import { withLaunchBudget, withTimeout } from "../../utils/timeout";
 import { defineTool, type ToolRegistrar } from "./index";
 
@@ -247,7 +247,7 @@ export function registerDebugTools(server: ToolRegistrar): void {
         let targetFolders: vscode.WorkspaceFolder[];
         if (args.folder) {
           const ref = String(args.folder);
-          const found = folders?.find((f) => f.name === ref || f.uri.fsPath === ref);
+          const found = folders?.find((f) => f.name === ref || pathsEqual(f.uri.fsPath, ref));
           if (!found) {
             const names = folders?.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
             return {
@@ -552,7 +552,9 @@ export function registerDebugTools(server: ToolRegistrar): void {
           const bp = new vscode.SourceBreakpoint(loc, true, cond, hitCond);
           vscode.debug.addBreakpoints([bp]);
           return {
-            content: [{ type: "text", text: `Breakpoint added at ${uri.fsPath}:${args.line}` }],
+            content: [
+              { type: "text", text: `Breakpoint added at ${toPosixPath(uri.fsPath)}:${args.line}` },
+            ],
             isError: false,
           };
         } catch (err) {
@@ -601,19 +603,30 @@ export function registerDebugTools(server: ToolRegistrar): void {
           const toRemove = vscode.debug.breakpoints.filter((bp) => {
             if (bp instanceof vscode.SourceBreakpoint) {
               const loc = bp.location;
-              return loc.uri.toString() === uri.toString() && loc.range.start.line === line;
+              return (
+                loc.uri.scheme === uri.scheme &&
+                pathsEqual(loc.uri.fsPath, uri.fsPath) &&
+                loc.range.start.line === line
+              );
             }
             return false;
           });
           if (toRemove.length === 0) {
             return {
-              content: [{ type: "text", text: `No breakpoint at ${uri.fsPath}:${args.line}` }],
+              content: [
+                { type: "text", text: `No breakpoint at ${toPosixPath(uri.fsPath)}:${args.line}` },
+              ],
               isError: true,
             };
           }
           vscode.debug.removeBreakpoints(toRemove);
           return {
-            content: [{ type: "text", text: `Breakpoint removed at ${uri.fsPath}:${args.line}` }],
+            content: [
+              {
+                type: "text",
+                text: `Breakpoint removed at ${toPosixPath(uri.fsPath)}:${args.line}`,
+              },
+            ],
             isError: false,
           };
         } catch (err) {
@@ -645,7 +658,7 @@ export function registerDebugTools(server: ToolRegistrar): void {
           return { content: [{ type: "text", text: "No breakpoints" }], isError: false };
         const lines = bps.map((bp) => {
           if (bp instanceof vscode.SourceBreakpoint) {
-            return `${bp.location.uri.fsPath}:${bp.location.range.start.line + 1}${bp.condition ? ` (condition: ${bp.condition})` : ""}${bp.logMessage ? ` (log: ${bp.logMessage})` : ""}`;
+            return `${toPosixPath(bp.location.uri.fsPath)}:${bp.location.range.start.line + 1}${bp.condition ? ` (condition: ${bp.condition})` : ""}${bp.logMessage ? ` (log: ${bp.logMessage})` : ""}`;
           }
           return `${bp.constructor.name}`;
         });

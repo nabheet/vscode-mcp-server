@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { pathsEqual } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";
 
 /** A section dump can serialize to megabytes (`"*"`); keep the round trip sane. */
@@ -58,7 +59,7 @@ function folderUri(ref: string): vscode.Uri {
   if (!folders || folders.length === 0) {
     throw new Error(`Workspace folder '${ref}' specified but no workspace folders are open`);
   }
-  const folder = folders.find((f) => f.name === ref || f.uri.fsPath === ref);
+  const folder = folders.find((f) => f.name === ref || pathsEqual(f.uri.fsPath, ref));
   if (!folder) {
     const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
     throw new Error(`Workspace folder '${ref}' not found. Available folders: ${names}`);

@@ -1,5 +1,106 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
+
+function isWindowsPath(value: string): boolean {
+  return (
+    /^[a-z]:[\\/]/i.test(value) ||
+    value.startsWith("\\\\") ||
+    (process.platform === "win32" && value.startsWith("//"))
+  );
+}
+
+function pathApi(value: string, preferWindows = false): typeof path.posix | typeof path.win32 {
+  if (isWindowsPath(value)) return path.win32;
+  if (value.startsWith("/") && !preferWindows) return path.posix;
+  return process.platform === "win32" ? path.win32 : path.posix;
+}
+
+function realpathWithMissingTail(
+  value: string,
+  api: typeof path.posix | typeof path.win32,
+): string {
+  const nativeApi = process.platform === "win32" ? path.win32 : path.posix;
+  if (api !== nativeApi || !api.isAbsolute(value)) return value;
+  const tail: string[] = [];
+  const followedLinks = new Set<string>();
+  let ancestor = api.normalize(value);
+  while (true) {
+    try {
+      const realAncestor = fs.realpathSync.native(ancestor);
+      return api.join(realAncestor, ...tail.reverse());
+    } catch (realpathError) {
+      const realpathCode = (realpathError as NodeJS.ErrnoException).code;
+      if (!["ENOENT", "ENOTDIR", "ELOOP"].includes(realpathCode ?? "")) {
+        throw realpathError;
+      }
+      let isSymbolicLink = false;
+      try {
+        isSymbolicLink = fs.lstatSync(ancestor).isSymbolicLink();
+      } catch (lstatError) {
+        const lstatCode = (lstatError as NodeJS.ErrnoException).code;
+        if (!["ENOENT", "ENOTDIR"].includes(lstatCode ?? "")) throw lstatError;
+      }
+      if (isSymbolicLink) {
+        if (followedLinks.has(ancestor)) throw new Error(`Circular symbolic link: ${ancestor}`);
+        followedLinks.add(ancestor);
+        const target = fs.readlinkSync(ancestor);
+        ancestor = api.normalize(
+          api.isAbsolute(target) ? target : api.resolve(api.dirname(ancestor), target),
+        );
+        continue;
+      }
+      const parent = api.dirname(ancestor);
+      if (parent === ancestor) return value;
+      tail.push(api.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
+function normalizeWithApi(value: string, api: typeof path.posix | typeof path.win32): string {
+  let normalized = api.normalize(realpathWithMissingTail(value, api));
+  if (api === path.win32) {
+    const root = api.parse(normalized).root;
+    if (normalized.length > root.length) normalized = normalized.replace(/[\\/]+$/, "");
+    return normalized.toLowerCase();
+  }
+  return normalized;
+}
+
+/** Convert a native filesystem path to a stable, cross-platform display path. */
+export function toPosixPath(value: string): string {
+  return value.replaceAll("\\", "/");
+}
+
+/** Normalize path spelling for equality and workspace-boundary comparisons. */
+export function normalizePathForComparison(value: string): string {
+  return normalizeWithApi(value, pathApi(value));
+}
+
+/** Compare filesystem paths, accounting for Windows case and short names. */
+export function pathsEqual(a: string, b: string): boolean {
+  return normalizePathForComparison(a) === normalizePathForComparison(b);
+}
+
+/** Return true when child equals parent or is located below it. */
+export function isPathInside(child: string, parent: string): boolean {
+  const posixRooted = (value: string) => value.startsWith("/") && !value.startsWith("//");
+  const windows =
+    isWindowsPath(child) ||
+    isWindowsPath(parent) ||
+    (process.platform === "win32" && !posixRooted(child) && !posixRooted(parent));
+  const api = windows ? path.win32 : path.posix;
+  const driveRooted = windows && api.isAbsolute(child) && !isWindowsPath(child);
+  const comparisonChild = driveRooted ? api.resolve(api.parse(parent).root, child) : child;
+  const normalizedChild = normalizeWithApi(comparisonChild, api);
+  const normalizedParent = normalizeWithApi(parent, api);
+  const relative = api.relative(normalizedParent, normalizedChild);
+  return (
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${api.sep}`) && !api.isAbsolute(relative))
+  );
+}
 
 /**
  * Resolve a file path argument against a specific workspace folder or the first one.
@@ -26,17 +127,31 @@ export function resolvePath(
   allowOutsideWorkspace = false,
 ): vscode.Uri {
   let resolved: string;
-  const inputWasAbsolute = path.isAbsolute(input);
+  const folders = vscode.workspace.workspaceFolders;
+  const posixMockWorkspace =
+    process.platform === "win32" &&
+    folders?.length &&
+    folders.every(
+      (folder) => folder.uri.fsPath.startsWith("/") && !isWindowsPath(folder.uri.fsPath),
+    );
+  const windowsWorkspace =
+    process.platform === "win32" && folders?.some((folder) => isWindowsPath(folder.uri.fsPath));
+  if (windowsWorkspace && /^[/\\](?![/\\])/.test(input) && !isWindowsPath(input)) {
+    throw new Error("Root-relative Windows paths are ambiguous; use a drive-qualified path");
+  }
+  const api = pathApi(input, process.platform === "win32" && !posixMockWorkspace);
+  if (process.platform === "win32" && /^[a-z]:(?![\\/])/i.test(input)) {
+    throw new Error("Drive-relative paths are not supported");
+  }
+  const inputWasAbsolute = api.isAbsolute(input);
 
   if (inputWasAbsolute) {
     resolved = input;
   } else {
-    const folders = vscode.workspace.workspaceFolders;
     if (folders && folders.length > 0) {
       if (folderName) {
         const folder = folders.find(
-          (f) =>
-            f.name === folderName || path.normalize(f.uri.fsPath) === path.normalize(folderName),
+          (f) => f.name === folderName || pathsEqual(f.uri.fsPath, folderName),
         );
         if (!folder) {
           const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
@@ -44,9 +159,9 @@ export function resolvePath(
             `Workspace folder '${folderName}' not found. Available folders: ${names || "(none)"}`,
           );
         }
-        resolved = path.join(folder.uri.fsPath, input);
+        resolved = pathApi(folder.uri.fsPath).join(folder.uri.fsPath, input);
       } else {
-        resolved = path.join(folders[0].uri.fsPath, input);
+        resolved = pathApi(folders[0].uri.fsPath).join(folders[0].uri.fsPath, input);
       }
     } else {
       if (folderName) {
@@ -54,19 +169,22 @@ export function resolvePath(
           `Workspace folder '${folderName}' specified but no workspace folders are open`,
         );
       }
-      resolved = path.resolve(input);
+      resolved = api.resolve(input);
     }
   }
+
+  // Normalize before the boundary check so `..` segments cannot survive into
+  // the returned URI: a lexical `link/../file` passes a prefix check while the
+  // OS would follow `link` out of the workspace.
+  const resolvedApi = pathApi(resolved, process.platform === "win32" && !posixMockWorkspace);
+  resolved = resolvedApi.normalize(resolved);
 
   // Enforce workspace boundary: reject paths outside all open workspace folders.
   // When `allowOutsideWorkspace` is set, only ABSOLUTE inputs may leave the
   // workspace — relative inputs still resolve against (and must stay inside) it.
-  const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length > 0 && (!allowOutsideWorkspace || !inputWasAbsolute)) {
-    const normalized = path.normalize(resolved);
     const inWorkspace = folders.some((f) => {
-      const wsPath = path.normalize(f.uri.fsPath);
-      return normalized === wsPath || normalized.startsWith(wsPath + path.sep);
+      return isPathInside(resolved, f.uri.fsPath);
     });
     if (!inWorkspace) {
       throw new Error(

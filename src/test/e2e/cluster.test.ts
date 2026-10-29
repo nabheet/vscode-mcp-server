@@ -1,9 +1,14 @@
 import { type ChildProcess, execSync, type SpawnOptions, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  createCanonicalTempDir,
+  freezeWindow,
+  resolveCodeCli,
+  stopVSCodeProcess,
+} from "./platform";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -29,7 +34,7 @@ function findFreePort(): Promise<number> {
 
 /**
  * True when the MCP endpoint is unreachable OR accepts connections but
- * never answers (a SIGSTOPped leader). A plain mcpRequest would hang
+ * never answers (a suspended leader). A plain mcpRequest would hang
  * forever on the frozen server, so this probe enforces its own socket
  * timeout and treats a timeout as "down".
  */
@@ -153,72 +158,6 @@ function hideVSCodeWindows(_procs: ChildProcess[], delayMs = 1500) {
   }, delayMs);
 }
 
-/**
- * Resolve the VS Code CLI binary via `@vscode/test-electron` (downloads
- * VS Code to a cache, works on all platforms, no local install required).
- *
- * On headless Linux, xvfb-run is auto-detected and wrapped around the command.
- */
-async function resolveCodeCli(): Promise<{
-  cmd: string;
-  args: string[];
-}> {
-  const { downloadAndUnzipVSCode } = await import("@vscode/test-electron");
-
-  const vscodePath = await downloadAndUnzipVSCode("stable");
-  if (process.platform === "darwin") {
-    // Spawn the app binary directly. The `bin/code` wrapper (returned by
-    // resolveCliPathFromVSCodeExecutablePath) launches the app detached via
-    // LaunchServices: under vitest the app can die before writing logs and
-    // leaves orphaned processes. The binary stays attached as our child.
-    const appRoot = vscodePath.endsWith(".app")
-      ? vscodePath
-      : vscodePath.replace(/\/Contents\/MacOS\/.+$/, "");
-    const binary = path.join(appRoot, "Contents", "MacOS", "Code");
-    if (fs.existsSync(binary)) return { cmd: binary, args: [] };
-    throw new Error(`VS Code binary not found under ${appRoot}`);
-  }
-  if (process.platform === "linux") {
-    // downloadAndUnzipVSCode returns the root Electron binary itself
-    // (<dir>/code). Spawn it directly — NOT the `bin/code` Node CLI wrapper
-    // that resolveCliPathFromVSCodeExecutablePath returns: that wrapper
-    // spawns the real binary and exits, so the PID we hold would be a dead
-    // script whose process group vanishes and whose child (the real app)
-    // gets reparented away from it, breaking the self-heal test's group
-    // freeze. The binary stays attached as our child.
-    return wrapForDisplay(vscodePath, []);
-  }
-  const { resolveCliPathFromVSCodeExecutablePath } = await import("@vscode/test-electron");
-  const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
-
-  if (!fs.existsSync(cliPath)) {
-    throw new Error(`VS Code CLI not found at resolved path: ${cliPath}`);
-  }
-
-  return wrapForDisplay(cliPath, []);
-}
-
-/**
- * On headless Linux, wrap the command with xvfb-run.
- */
-function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: string[] } {
-  const isLinux = process.platform === "linux";
-  const hasDisplay = !!process.env.DISPLAY;
-
-  if (isLinux && !hasDisplay) {
-    try {
-      execSync("which xvfb-run", { stdio: "pipe" });
-      return { cmd: "xvfb-run", args: ["--auto-servernum", cmd, ...extraArgs] };
-    } catch {
-      console.warn(
-        "Headless Linux detected but xvfb-run not found. Install xvfb: apt-get install xvfb",
-      );
-    }
-  }
-
-  return { cmd, args: extraArgs };
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────
 
 /**
@@ -246,13 +185,11 @@ describe("cluster leader-worker (E2E)", () => {
     // Verify extension is compiled
     const extMain = path.join(PROJECT_ROOT, "out", "extension.js");
     if (!fs.existsSync(extMain)) {
-      console.warn("⚠  Skipping E2E tests: extension not compiled (run `npm run compile` first)");
-      ENABLED = false;
-      return;
+      throw new Error("E2E setup failed: extension is not compiled (run `npm run compile` first)");
     }
 
     port = await findFreePort();
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cl-"));
+    tmpDir = createCanonicalTempDir("cl-");
 
     // Two single-root workspaces with distinct, greppable content
     const folderA = path.join(tmpDir, "alpha");
@@ -270,9 +207,7 @@ describe("cluster leader-worker (E2E)", () => {
       cliCmd = resolved.cmd;
       cliArgs = resolved.args;
     } catch (err) {
-      console.warn("⚠  Skipping E2E tests:", (err as Error).message);
-      ENABLED = false;
-      return;
+      throw new Error("E2E setup failed while resolving VS Code", { cause: err });
     }
 
     // Two distinct user-data dirs = two distinct windows. BOTH windows share
@@ -316,11 +251,8 @@ describe("cluster leader-worker (E2E)", () => {
           MCP_SERVER_MAX_RETRIES: "1",
         },
         stdio: ["ignore", "pipe", "pipe"],
-        // Each window becomes a process-group leader (its PID is its PGID)
-        // so the self-heal test can SIGSTOP/SIGCONT the entire window —
-        // main, renderer, and extension host — via kill(-pid). Without
-        // this, the children share vitest's process group and a group-wide
-        // stop would freeze the test runner itself.
+        // Detached POSIX process group lets the self-heal test freeze one
+        // window without suspending Vitest. Windows freezes the descendant tree.
         detached: true,
       };
 
@@ -346,21 +278,7 @@ describe("cluster leader-worker (E2E)", () => {
 
   afterAll(async () => {
     for (const proc of procs) {
-      if (!proc.killed) {
-        proc.kill("SIGTERM");
-        // Wait for graceful exit, then force kill
-        const exited = new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-            resolve();
-          }, 5000);
-          proc.on("exit", () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-        await exited;
-      }
+      await stopVSCodeProcess(proc, true);
     }
     if (tmpDir) {
       // Retry cleanup with backoff — VS Code may still hold file locks briefly
@@ -575,8 +493,8 @@ describe("cluster leader-worker (E2E)", () => {
     const leaderProc = procs[leaderFolder?.endsWith("alpha") ? 0 : 1];
     expect(leaderProc.pid, "leader process should be trackable").toBeTruthy();
 
-    // Freeze (SIGSTOP — NOT kill) the leader window's ENTIRE process group
-    // (main + renderer + extension host). The frozen processes keep the TCP
+    // Suspend (do not kill) the leader window's process tree
+    // (main + renderer + extension host). Suspended processes keep the TCP
     // port bound but never answer, so the survivor's /health probe times
     // out: "occupied but silent" → it must NOT promote and must NOT advance
     // to a higher port — it retries the SAME port and FATALs ("Could not
@@ -586,16 +504,17 @@ describe("cluster leader-worker (E2E)", () => {
     // and the survivor would simply promote — and VS Code would
     // auto-restart the killed extension host, racing it.
     //
-    // The whole group is frozen (not just the extension host) because the
+    // The whole process tree is frozen (not just the extension host) because the
     // extension host is an Electron "NodeService" utility process whose PID
     // is not reliably discoverable on every platform (lsof is not guaranteed
     // on Linux runners). Freezing the group also keeps VS Code's main
     // process watchdog from restarting the frozen extension host. Each
-    // window is spawned with `detached: true`, so kill(-pid) targets the
-    // whole group.
-    process.kill(-leaderProc.pid, "SIGSTOP");
-
+    // POSIX uses the detached group; Windows enumerates descendants.
+    let frozen = false;
+    let thawError: unknown;
     try {
+      freezeWindow(leaderProc, true);
+      frozen = true;
       // Frozen leader accepts TCP but never answers: MCP must be down.
       await expectServerDown(port);
 
@@ -615,20 +534,23 @@ describe("cluster leader-worker (E2E)", () => {
         await new Promise((r) => setTimeout(r, 5000));
         if (!(await probePortDown(port))) {
           throw new Error(
-            "MCP server became reachable during the freeze; SIGSTOP did not isolate the leader window",
+            "MCP server became reachable during the freeze; leader process tree was not isolated",
           );
         }
       }
     } finally {
-      // Thaw the leader so its port (and cluster membership) come back.
+      // Resume the leader so its port (and cluster membership) come back.
       // The group may already be gone if VS Code exited — that is caught
       // by the hold assertion above, not silently ignored here.
-      try {
-        process.kill(-leaderProc.pid, "SIGCONT");
-      } catch {
-        // Already exited; nothing to resume.
+      if (frozen) {
+        try {
+          freezeWindow(leaderProc, false);
+        } catch (err) {
+          if (leaderProc.exitCode === null && leaderProc.signalCode === null) thawError = err;
+        }
       }
     }
+    if (thawError !== undefined) throw thawError;
 
     // Self-heal must happen WITHOUT any reload: the retry re-runs
     // startCluster and the survivor re-joins the original leader. Which
