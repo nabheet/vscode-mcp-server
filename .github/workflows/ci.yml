@@ -223,7 +223,7 @@ jobs:
   # auto-publish) and manual dispatch. Uses a PAT (VSCE_PAT), not OIDC.
   #
   # RELEASE RULE (enforced by the "changes" step below): publish UNLESS every
-  # path changed by this push is non-shipping.
+  # path changed since the last release (newest v* tag) is non-shipping.
   #   * NON-shipping (never cuts a release): package-lock.json, .github/**,
   #     and package.json when its only diffs are version and/or the INERT
   #     devDependencies (the allowlist in the step below: @types/*, vitest,
@@ -236,10 +236,15 @@ jobs:
   # This is what stops a dependabot devDependency merge (which only moves
   # package.json devDependencies + package-lock.json) from cutting a release.
   #
+  # Because the baseline is the last release, a shipping change whose publish
+  # failed stays "unreleased" and is retried by the next run, including on a
+  # later non-shipping push. The tag also survives force-pushes, where
+  # `github.event.before` can be unreachable.
+  #
   # The `if:` below is kept as belt-and-braces: it still drops the version
   # sync-back squash merge (message "chore: bump version to vX.Y.Z (#N)") at the
   # job level, before a runner starts. workflow_dispatch always runs (head_commit
-  # is null) and has no `before` commit, so the step below short-circuits it.
+  # is null) and short-circuits the step below.
   publish:
     if: >-
       github.event_name != 'pull_request' &&
@@ -257,17 +262,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # The "changes" step below diffs github.event.before..github.sha.
-          # actions/checkout is SHALLOW by default and omits the before commit,
-          # so `git diff` would fail (or, worse, the guard would look correct and
-          # never fire). Full history makes the diff always valid.
+          # The "changes" step below diffs the last release tag (or, with no
+          # tag yet, github.event.before) against github.sha. actions/checkout
+          # is SHALLOW by default and omits those commits, so `git diff` would
+          # fail (or, worse, the guard would look correct and never fire).
+          # Tags matter too: `git describe` needs them and shallow clones drop
+          # them. Full history makes the diff always valid.
           fetch-depth: 0
 
-      # Implements the RELEASE RULE documented on the job above. Lists the paths
-      # this push changed and writes changed=true|false to $GITHUB_OUTPUT; every
-      # later step is gated on that, so a non-shipping push produces no build,
-      # no publish, no tag, no Release, and no version-sync PR.
-      - name: Determine whether the push changed shipping files
+      # Implements the RELEASE RULE documented on the job above. Writes
+      # changed=true|false to $GITHUB_OUTPUT; every later step is gated on it,
+      # so a non-shipping push produces no build, no publish, no tag, no
+      # Release, and no version-sync PR.
+      #
+      # The baseline is the last RELEASE (newest v* tag), not this push's
+      # `before`. A per-push baseline loses a release when a shipping push's
+      # publish fails: the next non-shipping push diffs only itself and skips,
+      # and the unshipped change waits for the next shipping push. Diffing
+      # from the last released commit means any unreleased shipping change is
+      # re-detected on every later run, so the publish retries.
+      - name: Determine whether there are unreleased shipping changes
         id: changes
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -281,31 +295,40 @@ jobs:
             echo "$2"
           }
 
-          # Manual runs carry no `before`: a human explicitly asked to release.
+          # Manual runs: a human explicitly asked to release.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             emit true "workflow_dispatch: publishing"
             exit 0
           fi
 
-          # Empty or all-zero `before` (new branch): nothing to diff.
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            emit true "no usable before commit: publishing"
-            exit 0
+          # Newest release tag marks the last commit that shipped. It also
+          # survives force-pushes and rewrite of `before`.
+          BASE="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          if [ -n "$BASE" ]; then
+            echo "Baseline: last release tag ${BASE}"
+          else
+            # No release tag yet (first release): fall back to this push.
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              emit true "no release tag and no usable before commit: publishing"
+              exit 0
+            fi
+            BASE="$BEFORE"
+            echo "Baseline: no release tag yet, using before commit ${BASE}"
           fi
 
-          # Shallow-checkout trap. If the before commit is not present, fail
+          # Shallow-checkout trap. If the baseline commit is not present, fail
           # loudly instead of skipping (or falsely publishing) a release.
-          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            echo "::error::before commit ${BEFORE} is not in this checkout; actions/checkout needs fetch-depth: 0"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "::error::baseline commit ${BASE} is not in this checkout; actions/checkout needs fetch-depth: 0 with tags"
             exit 1
           fi
 
-          # Squash merges make before..sha exactly the merged PR's diff.
+          # Squash merges make tag..sha exactly the unreleased diff.
           # --no-renames: with rename detection on, `--name-only` reports only
           # the NEW path of a rename, so a rename INTO a non-shipping path would
           # hide the shipping source (e.g. `git mv src/a.ts .github/a.ts`).
-          changed_paths="$(git diff --no-renames --name-only "$BEFORE" "$SHA")"
-          echo "Paths changed by ${BEFORE}..${SHA}:"
+          changed_paths="$(git diff --no-renames --name-only "$BASE" "$SHA")"
+          echo "Paths changed by ${BASE}..${SHA}:"
           printf '%s\n' "$changed_paths"
 
           # package.json ships when any field other than version and an INERT
