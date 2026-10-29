@@ -9,5 +9,16 @@
     // MD041: first line must be top-level heading — ENFORCED
     // MD060: table column style — ENFORCED
   },
-  "globs": ["**/*.md", "!node_modules/**", "!dist/**", "!.git/**", "!.vscode-test/**"]
+  // `REVIEW_OUTPUT.md` is gitignored scratch written by review tooling. It is
+  // never committed, but markdownlint globs the working tree, so a local run
+  // fails on a file CI never sees. `**/` mirrors the .gitignore entry, which
+  // matches the name at any depth.
+  "globs": [
+    "**/*.md",
+    "!node_modules/**",
+    "!dist/**",
+    "!.git/**",
+    "!.vscode-test/**",
+    "!**/REVIEW_OUTPUT.md"
+  ]
 }
