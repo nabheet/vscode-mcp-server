@@ -344,13 +344,81 @@ jobs:
         timeout-minutes: 1
         run: npx @vscode/vsce verify-pat nabheet
 
+      - name: Resolve the version to publish
+        id: target
+        if: steps.changes.outputs.changed == 'true'
+        timeout-minutes: 2
+        run: |
+          # package.json can lag the marketplace while the version-sync PR is
+          # still open. `vsce publish patch` bumps from package.json, so a
+          # publish that lands first re-attempts a version that already exists
+          # and fails. Publish one patch above whichever side is higher,
+          # comparing only the local major.minor line so the 0.9.x pre-release
+          # builds never drag the stable line upwards.
+          local="$(jq -r .version package.json)"
+          # Extension id from package.json, so the workflow does not repeat the
+          # publisher name.
+          extension="$(jq -r '.publisher + "." + .name' package.json)"
+          show_json="$(mktemp)"
+          show_err="$(mktemp)"
+          trap 'rm -f "$show_json" "$show_err"' EXIT
+          if ! npx --yes @vscode/vsce show "$extension" --json \
+            >"$show_json" 2>"$show_err"; then
+            if grep -qiE "not found|404" "$show_err"; then
+              echo "::notice::no published versions for ${extension} yet"
+              echo '{"versions":[]}' >"$show_json"
+            else
+              # Guessing here would re-create the stale-version failure this
+              # step exists to prevent, so stop and say why.
+              echo "::error::could not read published versions for ${extension}"
+              cat "$show_err"
+              exit 1
+            fi
+          elif [ "$(tr -d '[:space:]' <"$show_json")" != "undefined" ] \
+            && ! jq -e 'has("versions")' "$show_json" >/dev/null 2>&1; then
+            echo "::error::unexpected output from vsce show for ${extension}:"
+            cat "$show_json"
+            exit 1
+          elif ! jq -e 'has("versions")' "$show_json" >/dev/null 2>&1; then
+            # An id that was never published exits 0 and prints `undefined`
+            # rather than JSON, so this, not the exit code, is the real test.
+            echo "::notice::no published versions for ${extension} yet"
+            echo '{"versions":[]}' >"$show_json"
+          fi
+          remote="$(jq -r --arg line "${local%.*}" '[.versions[].version]
+              | map(select((contains("-") | not) and (startswith($line + "."))))
+              | sort_by(split(".") | map(tonumber))
+              | last // empty' "$show_json")"
+          target="$(jq -rn --arg l "$local" --arg r "${remote:-$local}" '
+            def v: split(".") | map(tonumber);
+            ($l | v) as $L | ($r | v) as $R
+            | (if $L >= $R then $L else $R end) as $hi
+            | ($hi[0:2] + [$hi[2] + 1]) | join(".")')"
+          echo "package.json=${local} marketplace=${remote:-unknown} target=${target}"
+          jq --arg v "$target" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          echo "version=${target}" >> "$GITHUB_OUTPUT"
+
       - name: Publish stable (with retry)
         if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 5
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
+          EXTENSION="$(jq -r '.publisher + "." + .name' package.json)"
+          # A failed client call does not prove the marketplace rejected the
+          # upload, so after a failure check whether this exact version is
+          # there; that is a success, not something to retry.
           for i in $(seq 1 3); do
-            if npx @vscode/vsce publish patch --no-git-tag-version; then
-              echo "Published successfully"
+            if npx @vscode/vsce publish "$VERSION" \
+              --no-git-tag-version --no-update-package-json; then
+              echo "Published $VERSION"
+              exit 0
+            fi
+            if timeout 90 npx --yes @vscode/vsce show "$EXTENSION" --json 2>/dev/null \
+              | jq -e --arg v "$VERSION" '.versions[] | select(.version == $v)' \
+                >/dev/null; then
+              echo "Published $VERSION (marketplace already lists it)"
               exit 0
             fi
             echo "Publish failed, retrying ($i/3)..."
@@ -362,7 +430,9 @@ jobs:
       - name: Get published version
         id: published
         if: steps.changes.outputs.changed == 'true'
-        run: echo "v=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: echo "v=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Create tag
         if: steps.changes.outputs.changed == 'true'
@@ -400,13 +470,32 @@ jobs:
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ secrets.GH_SYNC_PAT }}
+          GH_SYNC_PAT: ${{ secrets.GH_SYNC_PAT }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           BRANCH="ci/bump-v${{ steps.published.outputs.v }}"
+
+          # An older sync PR cannot merge while main has moved on: branch
+          # protection wants an up-to-date branch, and the queued squash merge
+          # does not update it. Close them so only the current version is
+          # proposed.
+          for n in $(gh pr list --state open --limit 100 --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("ci/bump-v")) | .number'); do
+            gh pr close "$n" --delete-branch \
+              --comment "Superseded by v${{ steps.published.outputs.v }}."
+          done
+
           git add package.json
           git commit -m "chore: bump version to v${{ steps.published.outputs.v }}"
-          git push origin "HEAD:$BRANCH"
+          # Authenticate the push with the PAT, not the GITHUB_TOKEN that
+          # checkout persisted: a bot-authored push leaves the sync PR's CI run
+          # waiting for maintainer approval, so auto-merge never fires. The
+          # persisted credential is a URL-scoped header, which git prefers over
+          # `-c`, so drop it first. The token goes in a header, not the URL.
+          git config --unset-all "http.https://github.com/.extraheader" || true
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_SYNC_PAT" | base64 | tr -d '\n')" \
+            push origin "HEAD:$BRANCH"
           PR_URL="$(gh pr create \
             --base main \
             --head "$BRANCH" \
