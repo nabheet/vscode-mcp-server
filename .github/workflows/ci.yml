@@ -374,6 +374,11 @@ jobs:
               cat "$show_err"
               exit 1
             fi
+          elif [ "$(tr -d '[:space:]' <"$show_json")" != "undefined" ] \
+            && ! jq -e 'has("versions")' "$show_json" >/dev/null 2>&1; then
+            echo "::error::unexpected output from vsce show for ${extension}:"
+            cat "$show_json"
+            exit 1
           elif ! jq -e 'has("versions")' "$show_json" >/dev/null 2>&1; then
             # An id that was never published exits 0 and prints `undefined`
             # rather than JSON, so this, not the exit code, is the real test.
@@ -486,7 +491,9 @@ jobs:
           # Authenticate the push with the PAT, not the GITHUB_TOKEN that
           # checkout persisted: a bot-authored push leaves the sync PR's CI run
           # waiting for maintainer approval, so auto-merge never fires. The
-          # header keeps the token out of the remote URL.
+          # persisted credential is a URL-scoped header, which git prefers over
+          # `-c`, so drop it first. The token goes in a header, not the URL.
+          git config --unset-all "http.https://github.com/.extraheader" || true
           git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_SYNC_PAT" | base64 | tr -d '\n')" \
             push origin "HEAD:$BRANCH"
           PR_URL="$(gh pr create \
