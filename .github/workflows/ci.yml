@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -252,7 +253,7 @@ jobs:
   # is null) and short-circuits the step below.
   publish:
     if: >-
-      github.event_name != 'pull_request' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       !startsWith(github.event.head_commit.message, 'chore: bump version to v')
     runs-on: ubuntu-latest
     concurrency:
