@@ -1989,6 +1989,79 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("Started debugging");
   });
 
+  // ── list_files ─────────────────────────────────────────────────────────
+
+  function mockListFiles(uris: vscode.Uri[]): void {
+    (vscode.workspace as unknown as MockWorkspace).findFiles = vi.fn().mockResolvedValue(uris);
+  }
+
+  it("list_files honors an absolute path inside the workspace", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    mockListFiles([vscode.Uri.file("/ws/src/a.ts")]);
+
+    const h = requireHandler(handlers, "list_files");
+    const res = await h({ path: "/ws/src" });
+
+    expect(res.isError).toBe(false);
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: "/ws/src" }) }),
+      "**/node_modules/**",
+      1000,
+    );
+    expect(res.content[0].text).toContain("/ws/src/a.ts");
+  });
+
+  it("list_files resolves a relative path against workspaceFolder", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "fe", uri: vscode.Uri.file("/ws/fe") },
+      { name: "be", uri: vscode.Uri.file("/ws/be") },
+    ];
+    mockListFiles([vscode.Uri.file("/ws/be/src/b.ts")]);
+
+    const h = requireHandler(handlers, "list_files");
+    const res = await h({ path: "src", workspaceFolder: "be" });
+
+    expect(res.isError).toBe(false);
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: "/ws/be/src" }) }),
+      "**/node_modules/**",
+      1000,
+    );
+  });
+
+  it("list_files rejects a path outside the workspace instead of returning nothing", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    mockListFiles([]);
+
+    const h = requireHandler(handlers, "list_files");
+    const res = await h({ path: "/elsewhere" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("outside the workspace");
+    expect(vscode.workspace.findFiles).not.toHaveBeenCalled();
+  });
+
+  it("list_files defaults to the first workspace folder", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    mockListFiles([vscode.Uri.file("/ws/a.ts")]);
+
+    const h = requireHandler(handlers, "list_files");
+    const res = await h({});
+
+    expect(res.isError).toBe(false);
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: "/ws" }) }),
+      "**/node_modules/**",
+      1000,
+    );
+  });
+
   // ── Search ────────────────────────────────────────────────────────────
 
   function mockSearchFiles(contents: Record<string, string>, uris: { fsPath: string }[]) {
@@ -2184,7 +2257,56 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("/ws/be/src/app.ts:1:7: const x = 1;");
   });
 
-  // ── get_open_editors ────────────────────────────────────────────────────
+  it("search_files scopes to an absolute path inside the workspace", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "fe", uri: vscode.Uri.file("/ws/fe") },
+      { name: "be", uri: vscode.Uri.file("/ws/be") },
+    ];
+    mockSearchFiles({ "/ws/be/src/app.ts": "needle\n" }, [{ fsPath: "/ws/be/src/app.ts" }]);
+
+    const h = requireHandler(handlers, "search_files");
+    const res = await h({ query: "needle", path: "/ws/be/src" });
+
+    expect(vscode.workspace.findFiles).toHaveBeenCalledTimes(1);
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: "/ws/be/src" }) }),
+      "**/node_modules/**",
+      2000,
+    );
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("/ws/be/src/app.ts:1:1: needle");
+  });
+
+  it("search_files resolves a relative path against workspaceFolder", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "fe", uri: vscode.Uri.file("/ws/fe") },
+      { name: "be", uri: vscode.Uri.file("/ws/be") },
+    ];
+    mockSearchFiles({ "/ws/be/src/app.ts": "needle\n" }, [{ fsPath: "/ws/be/src/app.ts" }]);
+
+    const h = requireHandler(handlers, "search_files");
+    await h({ query: "needle", path: "src", workspaceFolder: "be" });
+
+    expect(vscode.workspace.findFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ fsPath: "/ws/be/src" }) }),
+      "**/node_modules/**",
+      2000,
+    );
+  });
+
+  it("search_files rejects a path outside the workspace", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "fe", uri: vscode.Uri.file("/ws/fe") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).findFiles = vi.fn().mockResolvedValue([]);
+
+    const h = requireHandler(handlers, "search_files");
+    const res = await h({ query: "needle", path: "/elsewhere/src" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("outside the workspace");
+    expect(vscode.workspace.findFiles).not.toHaveBeenCalled();
+  });
 
   type MockTab = {
     label?: string;

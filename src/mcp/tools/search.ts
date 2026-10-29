@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { normalizePathForComparison, pathsEqual, toPosixPath } from "../../utils/path";
+import { normalizePathForComparison, pathsEqual, resolvePath, toPosixPath } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";
 
 const MAX_FILE_BYTES = 512 * 1024; // skip files larger than 512 KB
@@ -40,6 +40,11 @@ export function registerSearchTools(server: ToolRegistrar): void {
             description:
               "Optional workspace folder name (for multi-root workspaces). Searches this folder only.",
           },
+          path: {
+            type: "string",
+            description:
+              "Optional directory to search (absolute, or relative to the workspace folder). Overrides workspaceFolder; must be inside the workspace.",
+          },
         },
         required: ["query"],
       },
@@ -49,10 +54,25 @@ export function registerSearchTools(server: ToolRegistrar): void {
           return { content: [{ type: "text", text: "No workspace folder open" }], isError: true };
         }
 
-        // Resolve search roots. With no workspaceFolder, search the WHOLE
+        // Resolve search roots. An explicit `path` scopes the search to that
+        // directory; otherwise, with no workspaceFolder, search the WHOLE
         // workspace (every folder) — grep semantics. With one, scope to it.
         let roots: vscode.Uri[];
-        if (args.workspaceFolder) {
+        if (args.path) {
+          try {
+            roots = [
+              resolvePath(
+                String(args.path),
+                args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+              ),
+            ];
+          } catch (err) {
+            return {
+              content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+              isError: true,
+            };
+          }
+        } else if (args.workspaceFolder) {
           const ref = String(args.workspaceFolder);
           const folder = folders.find((f) => f.name === ref || pathsEqual(f.uri.fsPath, ref));
           if (!folder) {

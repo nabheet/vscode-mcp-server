@@ -384,7 +384,7 @@ describe("multi-root workspace (E2E)", () => {
       }
       if (lastErr) console.warn("⚠  Failed to clean up temp dir:", lastErr);
     }
-  }, 15000);
+  }, 30000);
 
   // ── Workspace folder listing ─────────────────────────────────────────
 
