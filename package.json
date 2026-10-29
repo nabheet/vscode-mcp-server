@@ -2,7 +2,7 @@
   "name": "vscode-ide-mcp",
   "displayName": "MCP Server for VS Code",
   "description": "VS Code MCP server for AI agents (opencode, Claude, Cursor) — debug, edit, and control VS Code via Model Context Protocol. Debugger, terminal, LSP, file ops (54 tools).",
-  "version": "0.3.70",
+  "version": "0.3.71",
   "publisher": "nabheet",
   "license": "MIT",
   "repository": {
@@ -81,7 +81,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Bind address. Empty = 127.0.0.1 (loopback only, the default — a dev container needs no more, VS Code's port forwarding reaches it). Set 0.0.0.0 only when bypassing port forwarding (appPort / compose ports:); a non-loopback bind then requires vscode-mcp-server.authToken. A specific address is bound alongside 127.0.0.1 so sibling windows can still find the leader. A value that is neither an IP address nor a hostname is refused at startup."
+          "description": "Bind address. Empty = 127.0.0.1 (loopback only, the default \u2014 a dev container needs no more, VS Code's port forwarding reaches it). Set 0.0.0.0 only when bypassing port forwarding (appPort / compose ports:); a non-loopback bind then requires vscode-mcp-server.authToken. A specific address is bound alongside 127.0.0.1 so sibling windows can still find the leader. A value that is neither an IP address nor a hostname is refused at startup."
         }
       }
     }
@@ -92,12 +92,13 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check . && markdownlint-cli2",
     "lint:fix": "biome check --write . && markdownlint-cli2 --fix",
-    "check": "npm run typecheck && npm run lint",
+    "check": "npm run typecheck && npm run lint && npm run check:shipped-imports",
     "watch": "tsc -watch -p ./",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.mts",
-    "test:e2e:watch": "vitest --config vitest.e2e.config.mts"
+    "test:e2e:watch": "vitest --config vitest.e2e.config.mts",
+    "check:shipped-imports": "node scripts/check-shipped-imports.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.3",
