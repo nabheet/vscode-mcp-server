@@ -616,6 +616,7 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("No paths");
   });
 
+  // ── apply_workspace_edit (validated batch) ───────────────────────────
   // ── read_file / read_files: editor buffers (#131) ────────────────────
 
   type MockDocument = {
@@ -729,8 +730,6 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("=== /ws/b.ts ===\ndisk content");
   });
 
-  // ── apply_workspace_edit (atomic batch) ──────────────────────────────
-
   /**
    * Route fs.stat/fs.readFile/openTextDocument over an in-memory file map
    * (missing ⇒ ENOENT). `docs` simulates live editor buffers: they default to
@@ -810,16 +809,18 @@ describe("handler behavior", () => {
     expect(res.isError, res.content[0].text).toBe(false);
     expect(vscode.workspace.applyEdit).toHaveBeenCalledTimes(1);
     const ops = appliedOps();
-    expect(ops.map((o) => o.kind)).toEqual(["replace", "createFile", "insert", "deleteFile"]);
-    expect(ops[0].uri.fsPath).toBe("/ws/frontend/a.ts");
-    expect(ops[0].newText).toBe("LINE2");
-    expect(ops[1].uri.fsPath).toBe("/ws/backend/new.ts");
-    expect(ops[2].newText).toBe("hello\n");
-    expect(ops[3].uri.fsPath).toBe("/ws/backend/old.ts");
-    expect(ops[1].options).toEqual({ ignoreIfExists: false, overwrite: false });
-    expect(ops[3].options).toEqual({ ignoreIfNotExists: false, recursive: false });
+    // Deletes are queued first: a trash failure must not leave the create and
+    // the text edit applied beside a delete that never happened.
+    expect(ops.map((o) => o.kind)).toEqual(["deleteFile", "replace", "createFile", "insert"]);
+    expect(ops[0].uri.fsPath).toBe("/ws/backend/old.ts");
+    expect(ops[0].options).toEqual({ ignoreIfNotExists: false, recursive: false });
+    expect(ops[1].uri.fsPath).toBe("/ws/frontend/a.ts");
+    expect(ops[1].newText).toBe("LINE2");
+    expect(ops[2].uri.fsPath).toBe("/ws/backend/new.ts");
+    expect(ops[2].options).toEqual({ ignoreIfExists: false, overwrite: false });
+    expect(ops[3].newText).toBe("hello\n");
     const text: string = res.content[0].text;
-    expect(text).toContain("Applied 3 file edit(s) in a single workspace edit");
+    expect(text).toContain("Applied 3 file edit(s) in one workspace edit");
     expect(text).toContain("=== /ws/frontend/a.ts ===\nApplied 1 text edit(s)");
     expect(text).toContain("=== /ws/backend/new.ts ===\nCreated (6 bytes)");
     expect(text).toContain("=== /ws/backend/old.ts ===\nDeleted");
@@ -989,6 +990,8 @@ describe("handler behavior", () => {
 
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("delete /ws/frontend/keep.ts: exists");
+    // The most likely cause on a headless/container host is the OS trash.
+    expect(res.content[0].text).toContain("files.enableTrash");
   });
 
   it("apply_workspace_edit names a path whose text edits were refused", async () => {

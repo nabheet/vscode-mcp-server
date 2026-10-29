@@ -442,14 +442,14 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "apply_workspace_edit",
-      "Apply multiple edits across files in one VS Code WorkspaceEdit call. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion, and each path may appear once per batch. All entries are validated first; if any entry is invalid nothing is applied and per-file errors are reported inline. On success the whole batch is applied as a single undo step, and edited buffers are saved to disk unless the file already had unsaved changes.",
+      "Apply multiple edits across files in one VS Code WorkspaceEdit call. Each entry is either a list of text edits at ranges, a file creation (with optional content), or a file deletion, and each path may appear once per batch. All entries are validated before anything is applied; if any entry is invalid nothing is applied and per-file errors are reported inline. Deletions are queued before creations and edits, so a failure in a later operation cannot leave a create or edit applied next to a delete that failed. On success the batch is one undo step, and edited buffers are saved unless the file already had unsaved changes. On failure a partial apply is possible: VS Code applies a WorkspaceEdit operation by operation and has no rollback.",
       {
         type: "object",
         properties: {
           edits: {
             type: "array",
             description:
-              "Batch of file edits applied atomically. Each entry must set exactly one of `textEdits`, `create: true`, or `delete: true`.",
+              "Batch of file edits. Validation is all-or-nothing; the apply itself is one undo step on success and may partially apply on failure. Each entry must set exactly one of `textEdits`, `create: true`, or `delete: true`.",
             items: {
               type: "object",
               properties: {
@@ -501,7 +501,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
                 },
                 create: {
                   type: "boolean",
-                  description: "Create the file (fails atomically if it already exists)",
+                  description: "Create the file (rejected if it already exists)",
                 },
                 content: {
                   type: "string",
@@ -510,7 +510,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
                 },
                 delete: {
                   type: "boolean",
-                  description: "Delete the file (fails atomically if missing)",
+                  description: "Delete the file (rejected if missing)",
                 },
               },
               required: ["path"],
@@ -643,8 +643,9 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           planned.push({ kind: "textEdits", uri, label, textEdits: parsed });
         }
 
-        // Atomicity: never apply a partial batch. Any per-file problem aborts
-        // the whole call; read_files-style inline errors explain each failure.
+        // Validation is all-or-nothing: any per-file problem aborts the whole
+        // call; read_files-style inline errors explain each failure. The apply
+        // itself is not atomic (see the ordering below).
         if (problems.length > 0) {
           return {
             content: [{ type: "text", text: problems.join("\n\n") }],
@@ -652,8 +653,22 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           };
         }
 
+        // Order operations defensively. VS Code applies a WorkspaceEdit step by
+        // step with no rollback, and a delete can fail for reasons unrelated to
+        // the batch (on a headless or container host it goes through the OS
+        // trash, controlled by `files.enableTrash`). Queueing every delete first
+        // means such a failure cannot leave a create or text edit applied
+        // alongside a delete that never happened.
+        const ordered = [
+          ...planned.filter((p) => p.kind === "delete"),
+          ...planned.filter((p) => p.kind !== "delete"),
+        ];
+        const hasDelete = ordered.some((p) => p.kind === "delete");
+        const trashHint = hasDelete
+          ? "A delete in this batch goes through the OS trash unless `files.enableTrash` is off; on a headless or container host with no trash backend that can fail. "
+          : "";
         const edit = new vscode.WorkspaceEdit();
-        for (const p of planned) {
+        for (const p of ordered) {
           if (p.kind === "delete") {
             edit.deleteFile(p.uri, { ignoreIfNotExists: false, recursive: false });
           } else if (p.kind === "create") {
@@ -683,7 +698,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             content: [
               {
                 type: "text",
-                text: `Failed to apply workspace edit: ${errorMessage(err)}. Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
+                text: `Failed to apply workspace edit: ${errorMessage(err)}. ${trashHint}Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
               },
             ],
             isError: true,
@@ -691,7 +706,9 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         }
         if (!applied) {
           // VS Code resolves `false` without saying which entry it rejected, so
-          // re-read the state it validated against and name each path.
+          // re-read the state it validated against and name each path. A delete
+          // is the most likely step to fail on a headless/container host: it is
+          // routed through the OS trash unless that is disabled.
           const observed: string[] = [];
           for (const p of planned) {
             const stat = await statPath(p.uri);
@@ -711,7 +728,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             content: [
               {
                 type: "text",
-                text: `Failed to apply workspace edit: VS Code rejected the batch. State now:\n${observed.join("\n")}\nCheck the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
+                text: `Failed to apply workspace edit: VS Code rejected the batch. State now:\n${observed.join("\n")}\n${trashHint}Check the paths in this batch before retrying — a rejected batch is not guaranteed to be a clean rollback.`,
               },
             ],
             isError: true,
@@ -764,7 +781,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           content: [
             {
               type: "text",
-              text: `Applied ${planned.length} file edit(s) in a single workspace edit\n\n${summary.join("\n\n")}${notes}`,
+              text: `Applied ${planned.length} file edit(s) in one workspace edit (one undo step)\n\n${summary.join("\n\n")}${notes}`,
             },
           ],
           isError: false,
