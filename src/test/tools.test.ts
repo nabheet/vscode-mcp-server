@@ -616,6 +616,119 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("No paths");
   });
 
+  // ── read_file / read_files: editor buffers (#131) ────────────────────
+
+  type MockDocument = {
+    uri: ReturnType<typeof vscode.Uri.file>;
+    isDirty?: boolean;
+    getText: () => string;
+  };
+
+  function mockDocuments(docs: MockDocument[]): void {
+    (vscode.workspace as unknown as { textDocuments: MockDocument[] }).textDocuments = docs;
+  }
+
+  function dirtyDoc(fsPath: string, text: string): MockDocument {
+    return { uri: vscode.Uri.file(fsPath), isDirty: true, getText: () => text };
+  }
+
+  it("read_file prefers unsaved editor content when source is auto", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("on disk"));
+    mockDocuments([dirtyDoc("/ws/a.ts", "unsaved edit")]);
+
+    const h = requireHandler(handlers, "read_file");
+    const res = await h({ path: "a.ts" });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("unsaved edit");
+    expect(res.content[0].text).toContain("read from the open editor");
+    expect(vscode.workspace.fs.readFile).not.toHaveBeenCalled();
+  });
+
+  it("read_file source=disk ignores the open editor", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("on disk"));
+    mockDocuments([dirtyDoc("/ws/a.ts", "unsaved edit")]);
+
+    const h = requireHandler(handlers, "read_file");
+    const res = await h({ path: "a.ts", source: "disk" });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toBe("on disk");
+  });
+
+  it("read_file reads an untitled buffer by URI", async () => {
+    mockDocuments([
+      {
+        uri: vscode.Uri.parse("untitled:Untitled-1"),
+        isDirty: true,
+        getText: () => "draft notes",
+      },
+    ]);
+
+    const h = requireHandler(handlers, "read_file");
+    const res = await h({ path: "untitled:Untitled-1", source: "editor" });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain("draft notes");
+  });
+
+  it("read_file rejects source=disk for an untitled buffer", async () => {
+    const h = requireHandler(handlers, "read_file");
+    const res = await h({ path: "untitled:Untitled-1", source: "disk" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("exist only in the editor");
+  });
+
+  it("read_file errors when source=editor has no matching document", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    mockDocuments([]);
+
+    const h = requireHandler(handlers, "read_file");
+    const res = await h({ path: "a.ts", source: "editor" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("No open editor");
+  });
+
+  it("read_files reads untitled buffers alongside files", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "root", uri: vscode.Uri.file("/ws") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("disk content"));
+    mockDocuments([
+      {
+        uri: vscode.Uri.parse("untitled:Untitled-1"),
+        isDirty: true,
+        getText: () => "buffer content",
+      },
+    ]);
+
+    const h = requireHandler(handlers, "read_files");
+    const res = await h({ paths: ["untitled:Untitled-1", "b.ts"] });
+
+    expect(res.isError).toBe(false);
+    expect(res.content[0].text).toContain(
+      "=== untitled:Untitled-1 ===\n--- read from the open editor",
+    );
+    expect(res.content[0].text).toContain("buffer content");
+    expect(res.content[0].text).toContain("=== /ws/b.ts ===\ndisk content");
+  });
+
   // ── apply_workspace_edit (atomic batch) ──────────────────────────────
 
   /**
@@ -2113,6 +2226,7 @@ describe("handler behavior", () => {
     expect(JSON.parse(res.content[0].text)).toEqual([
       {
         path: "/ws/a.ts",
+        scheme: "file",
         kind: "text",
         isVisible: true,
         isActive: true,
@@ -2122,6 +2236,7 @@ describe("handler behavior", () => {
       },
       {
         path: "/ws/b.ts",
+        scheme: "file",
         kind: "text",
         isVisible: false,
         isActive: false,
@@ -2131,6 +2246,7 @@ describe("handler behavior", () => {
       },
       {
         path: "/ws/c.ts",
+        scheme: "file",
         kind: "text",
         isVisible: true,
         isActive: false,
@@ -2169,7 +2285,7 @@ describe("handler behavior", () => {
     ]);
   });
 
-  it("get_open_editors skips untitled buffers and virtual documents", async () => {
+  it("get_open_editors reports untitled buffers by URI and skips virtual documents", async () => {
     mockTabGroups([
       {
         isActive: true,
@@ -2193,7 +2309,10 @@ describe("handler behavior", () => {
     const res = await h({});
 
     const editors = JSON.parse(res.content[0].text);
-    expect(editors.map((e: { path: string }) => e.path)).toEqual(["/ws/real.ts"]);
+    expect(editors.map((e: { path: string; scheme: string }) => [e.path, e.scheme])).toEqual([
+      ["untitled:Untitled-1", "untitled"],
+      ["/ws/real.ts", "file"],
+    ]);
   });
 
   it("get_open_editors reports the on-disk side of a diff tab", async () => {
@@ -2219,6 +2338,7 @@ describe("handler behavior", () => {
     expect(JSON.parse(res.content[0].text)).toEqual([
       {
         path: "/ws/a.ts",
+        scheme: "file",
         kind: "diff",
         isVisible: true,
         isActive: true,

@@ -194,6 +194,73 @@ async function checkRangesAgainstFile(
   return undefined;
 }
 
+/** Where `read_file`/`read_files` take their bytes from. */
+type ReadSource = "disk" | "editor" | "auto";
+
+const UNTITLED_URI_RE = /^untitled:/i;
+
+function openDocumentFor(uri: vscode.Uri): vscode.TextDocument | undefined {
+  const documents = vscode.workspace.textDocuments ?? [];
+  return documents.find(
+    (doc) =>
+      doc.uri.scheme === uri.scheme &&
+      (doc.uri.toString() === uri.toString() || doc.uri.path === uri.path),
+  );
+}
+
+function sourceArg(value: unknown): ReadSource {
+  const raw = typeof value === "string" ? value.toLowerCase() : "auto";
+  if (raw === "disk" || raw === "editor" || raw === "auto") return raw;
+  throw new Error(`Unknown source '${String(value)}'. Use "disk", "editor" or "auto".`);
+}
+
+/**
+ * Read one path the way `read_file` promises: `disk` reads the file,
+ * `editor` reads the open document (unsaved buffer included), `auto` prefers
+ * the open document and falls back to disk. `untitled:` URIs only exist in an
+ * editor, so `disk` is an error for them.
+ */
+async function readPathText(
+  input: string,
+  folderName: string | undefined,
+  source: ReadSource,
+): Promise<{ text: string; label: string; fromEditor: boolean; dirty: boolean }> {
+  if (UNTITLED_URI_RE.test(input)) {
+    if (source === "disk") {
+      throw new Error('Untitled buffers exist only in the editor; use source "editor" or "auto"');
+    }
+    const uri = vscode.Uri.parse(input);
+    const doc = openDocumentFor(uri);
+    if (!doc) throw new Error(`No open editor for ${input}`);
+    return { text: doc.getText(), label: input, fromEditor: true, dirty: doc.isDirty === true };
+  }
+
+  const uri = resolvePath(input, folderName);
+  if (source !== "disk") {
+    const doc = openDocumentFor(uri);
+    if (doc) {
+      return {
+        text: doc.getText(),
+        label: toPosixPath(uri.fsPath),
+        fromEditor: true,
+        dirty: doc.isDirty === true,
+      };
+    }
+    if (source === "editor") {
+      throw new Error(`No open editor for ${toPosixPath(uri.fsPath)}`);
+    }
+  }
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  return {
+    text: Buffer.from(bytes).toString("utf-8"),
+    label: toPosixPath(uri.fsPath),
+    fromEditor: false,
+    dirty: false,
+  };
+}
+
+const EDITOR_SOURCE_NOTICE = "--- read from the open editor (unsaved changes) ---\n";
+
 export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
@@ -274,39 +341,47 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "read_file",
-      "Read the contents of a file.",
+      'Read the contents of a file, or of an open editor buffer that is not saved yet. `source: "disk"` reads the file, `"editor"` reads the open document (including unsaved changes), `"auto"` (default) prefers the open document and falls back to disk. An `untitled:` URI from get_open_editors is readable with `"editor"` or `"auto"`. When unsaved editor content is returned, a one-line notice precedes it.',
       {
         type: "object",
         properties: {
           path: {
             type: "string",
-            description: "File path (absolute or relative to workspace root)",
+            description:
+              "File path (absolute or relative to workspace root), or an untitled: URI from get_open_editors",
           },
           workspaceFolder: {
             type: "string",
             description:
               "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
           },
+          source: {
+            type: "string",
+            enum: ["disk", "editor", "auto"],
+            description:
+              'Where to read from: "disk" (file on disk), "editor" (open document, unsaved changes included), "auto" (default: editor when the document is open, else disk).',
+          },
         },
         required: ["path"],
       },
       async (args) => {
-        const uri = resolvePath(
-          String(args.path),
-          args.workspaceFolder ? String(args.workspaceFolder) : undefined,
-        );
+        let source: ReadSource;
         try {
-          const bytes = await vscode.workspace.fs.readFile(uri);
-          const text = Buffer.from(bytes).toString("utf-8");
-          return { content: [{ type: "text", text }], isError: false };
+          source = sourceArg(args.source);
+        } catch (err) {
+          return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
+        }
+        try {
+          const result = await readPathText(
+            String(args.path),
+            args.workspaceFolder ? String(args.workspaceFolder) : undefined,
+            source,
+          );
+          const notice = result.fromEditor && result.dirty ? EDITOR_SOURCE_NOTICE : "";
+          return { content: [{ type: "text", text: `${notice}${result.text}` }], isError: false };
         } catch (err) {
           return {
-            content: [
-              {
-                type: "text",
-                text: `Failed to read file: ${err instanceof Error ? err.message : String(err)}`,
-              },
-            ],
+            content: [{ type: "text", text: `Failed to read file: ${errorMessage(err)}` }],
             isError: true,
           };
         }
@@ -317,7 +392,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
   server.registerTool(
     defineTool(
       "read_files",
-      'Read the contents of multiple files in one call. Each result is prefixed with a "=== <path> ===" marker. Missing/unreadable files are reported inline without aborting the batch.',
+      'Read the contents of multiple files in one call, including `untitled:` buffers. Each result is prefixed with a "=== <path> ===" marker. Missing/unreadable files are reported inline without aborting the batch. When unsaved editor content is returned, a one-line notice precedes it.',
       {
         type: "object",
         properties: {
@@ -325,14 +400,22 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             type: "array",
             items: {
               type: "string",
-              description: "File path (absolute or relative to workspace root)",
+              description:
+                "File path (absolute or relative to workspace root), or an untitled: URI from get_open_editors",
             },
-            description: "File paths to read (absolute or relative to workspace root)",
+            description:
+              "File paths to read (absolute or relative to workspace root), or untitled: URIs",
           },
           workspaceFolder: {
             type: "string",
             description:
               "Optional workspace folder name (for multi-root workspaces). Resolves relative paths against this folder.",
+          },
+          source: {
+            type: "string",
+            enum: ["disk", "editor", "auto"],
+            description:
+              'Where to read from: "disk" (file on disk), "editor" (open document, unsaved changes included), "auto" (default: editor when the document is open, else disk).',
           },
         },
         required: ["paths"],
@@ -342,20 +425,23 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         if (paths.length === 0) {
           return { content: [{ type: "text", text: "No paths provided" }], isError: true };
         }
+        let source: ReadSource;
+        try {
+          source = sourceArg(args.source);
+        } catch (err) {
+          return { content: [{ type: "text", text: errorMessage(err) }], isError: true };
+        }
         const folderName = args.workspaceFolder ? String(args.workspaceFolder) : undefined;
         const parts: string[] = [];
         let failures = 0;
         for (const p of paths) {
           try {
-            const uri = resolvePath(p, folderName);
-            const bytes = await vscode.workspace.fs.readFile(uri);
-            const text = Buffer.from(bytes).toString("utf-8");
-            parts.push(`=== ${toPosixPath(uri.fsPath)} ===\n${text}`);
+            const result = await readPathText(p, folderName, source);
+            const notice = result.fromEditor && result.dirty ? EDITOR_SOURCE_NOTICE : "";
+            parts.push(`=== ${result.label} ===\n${notice}${result.text}`);
           } catch (err) {
             failures++;
-            parts.push(
-              `=== ${p} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`,
-            );
+            parts.push(`=== ${p} ===\n[error: ${errorMessage(err)}]`);
           }
         }
         return { content: [{ type: "text", text: parts.join("\n\n") }], isError: failures > 0 };
