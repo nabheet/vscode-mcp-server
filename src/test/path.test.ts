@@ -21,7 +21,8 @@ describe("resolvePath", () => {
 
   it("returns absolute path as-is", () => {
     const result = resolvePath("/foo/bar/baz.ts");
-    expect(result.fsPath).toBe("/foo/bar/baz.ts");
+    // With no workspace the host platform decides the separator.
+    expect(toPosixPath(result.fsPath)).toBe("/foo/bar/baz.ts");
   });
 
   it("resolves relative path against workspace root", () => {
