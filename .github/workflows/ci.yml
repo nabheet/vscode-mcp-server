@@ -344,13 +344,46 @@ jobs:
         timeout-minutes: 1
         run: npx @vscode/vsce verify-pat nabheet
 
+      - name: Resolve the version to publish
+        id: target
+        if: steps.changes.outputs.changed == 'true'
+        timeout-minutes: 2
+        run: |
+          # package.json can lag the marketplace while the version-sync PR is
+          # still open. `vsce publish patch` bumps from package.json, so a
+          # publish that lands first re-attempts a version that already exists
+          # and fails. Publish one patch above whichever side is higher,
+          # comparing only the local major.minor line so the 0.9.x pre-release
+          # builds never drag the stable line upwards.
+          local="$(jq -r .version package.json)"
+          # Extension id from package.json, so the workflow does not repeat the
+          # publisher name.
+          extension="$(jq -r '.publisher + "." + .name' package.json)"
+          remote="$(npx --yes @vscode/vsce show "$extension" --json 2>/dev/null \
+            | jq -r --arg line "${local%.*}" '[.versions[].version]
+              | map(select((contains("-") | not) and (startswith($line + "."))))
+              | sort_by(split(".") | map(tonumber))
+              | last // empty' 2>/dev/null)" || true
+          target="$(jq -rn --arg l "$local" --arg r "${remote:-$local}" '
+            def v: split(".") | map(tonumber);
+            ($l | v) as $L | ($r | v) as $R
+            | (if $L >= $R then $L else $R end) as $hi
+            | ($hi[0:2] + [$hi[2] + 1]) | join(".")')"
+          echo "package.json=${local} marketplace=${remote:-unknown} target=${target}"
+          jq --arg v "$target" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          echo "version=${target}" >> "$GITHUB_OUTPUT"
+
       - name: Publish stable (with retry)
         if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 5
         run: |
+          # Retries cover registry flakiness only: the version is fixed above,
+          # so a retry cannot collide with the version it just published.
           for i in $(seq 1 3); do
-            if npx @vscode/vsce publish patch --no-git-tag-version; then
-              echo "Published successfully"
+            if npx @vscode/vsce publish "${{ steps.target.outputs.version }}" \
+              --no-git-tag-version --no-update-package-json; then
+              echo "Published ${{ steps.target.outputs.version }}"
               exit 0
             fi
             echo "Publish failed, retrying ($i/3)..."
@@ -362,7 +395,9 @@ jobs:
       - name: Get published version
         id: published
         if: steps.changes.outputs.changed == 'true'
-        run: echo "v=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: echo "v=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Create tag
         if: steps.changes.outputs.changed == 'true'
@@ -404,6 +439,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           BRANCH="ci/bump-v${{ steps.published.outputs.v }}"
+
+          # An older sync PR can never merge once main moves: branch protection
+          # requires an up-to-date branch and the queued squash merge does not
+          # update it. Close them so only the current version is proposed.
+          for n in $(gh pr list --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("ci/bump-v")) | .number'); do
+            gh pr close "$n" --delete-branch \
+              --comment "Superseded by v${{ steps.published.outputs.v }}."
+          done
+
           git add package.json
           git commit -m "chore: bump version to v${{ steps.published.outputs.v }}"
           git push origin "HEAD:$BRANCH"
