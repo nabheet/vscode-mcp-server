@@ -600,11 +600,32 @@ describe("currentWindowState", () => {
     });
   });
 
-  it("has no activeFile when the active tab is not a file", () => {
+  it("reports an untitled buffer by URI as the active entry", () => {
     setGroups([
       {
         isActive: true,
-        tabs: [{ input: new vscode.TabInputText(file("", "untitled")), isActive: true }],
+        tabs: [
+          {
+            input: new vscode.TabInputText({ fsPath: "", scheme: "untitled", path: "Untitled-1" }),
+            isActive: true,
+          },
+        ],
+      },
+    ]);
+
+    expect(currentWindowState()).toEqual({
+      activeFile: "untitled:Untitled-1",
+      openEditors: ["untitled:Untitled-1"],
+    });
+  });
+
+  it("has no activeFile when the active tab is a virtual document", () => {
+    setGroups([
+      {
+        isActive: true,
+        tabs: [
+          { input: new vscode.TabInputText(file("settings", "vscode-settings")), isActive: true },
+        ],
       },
     ]);
 

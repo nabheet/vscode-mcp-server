@@ -272,7 +272,7 @@ describe("observability endpoints + log tools (E2E)", () => {
         }
       }
     }
-  });
+  }, 30000);
 
   it("list_logs exposes VS Code host logs and the extension JSON log", async () => {
     if (!ENABLED) {

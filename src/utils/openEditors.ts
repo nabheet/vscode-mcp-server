@@ -3,10 +3,16 @@ import * as vscode from "vscode";
 /** How a tab presents its file. */
 export type OpenEditorKind = "text" | "diff" | "notebook" | "custom";
 
-/** One file open in an editor tab. */
+/** One editor tab that holds editable text. */
 export interface OpenEditor {
-  /** Absolute path of the file the tab shows. */
+  /**
+   * The file's absolute path for `file:` editors, or the `untitled:` URI for
+   * unsaved buffers (which have no path on disk). The same string can be
+   * passed to `read_file` to read the unsaved content.
+   */
   path: string;
+  /** `file` for editors backed by disk, `untitled` for never-saved buffers. */
+  scheme: "file" | "untitled";
   kind: OpenEditorKind;
   /** The tab is the rendered tab of its group (only one tab per group renders). */
   isVisible: boolean;
@@ -42,11 +48,17 @@ function tabUri(tab: vscode.Tab): { uri: vscode.Uri; kind: OpenEditorKind } | un
   return undefined;
 }
 
+/** Readable reference for an editor URI: a path on disk, or an untitled URI. */
+export function editorReference(uri: vscode.Uri): string {
+  return uri.scheme === "untitled" ? `untitled:${uri.path || uri.fsPath}` : uri.fsPath;
+}
+
 /**
- * Every editor tab that shows a file on disk, in tab-group order.
+ * Every editor tab that holds editable text, in tab-group order.
  *
- * Untitled buffers and virtual documents (settings, extension pages) have no
- * `file:` path and are skipped — this list is for files an agent can read.
+ * `untitled:` buffers are included (they carry unsaved work an agent may need
+ * to read) and are reported by URI. Virtual documents (settings pages,
+ * extension webviews) are skipped: they have no readable text document.
  */
 export function collectOpenEditors(): OpenEditor[] {
   const groups = vscode.window.tabGroups?.all ?? [];
@@ -54,10 +66,12 @@ export function collectOpenEditors(): OpenEditor[] {
   groups.forEach((group, groupIndex) => {
     for (const tab of group.tabs ?? []) {
       const resolved = tabUri(tab);
-      if (resolved?.uri.scheme !== "file") continue;
+      const scheme = resolved?.uri.scheme;
+      if (!resolved || (scheme !== "file" && scheme !== "untitled")) continue;
       const visible = tab.isActive === true;
       editors.push({
-        path: resolved.uri.fsPath,
+        path: editorReference(resolved.uri),
+        scheme,
         kind: resolved.kind,
         isVisible: visible,
         isActive: visible && group.isActive === true,

@@ -57,6 +57,25 @@ export function createCanonicalTempDir(prefix: string): string {
     : dir;
 }
 
+function isProcessGroupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the group exists but we may not signal it.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForProcessGroupExit(pgid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessGroupAlive(pgid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return true;
+}
+
 async function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (proc.exitCode !== null || proc.signalCode !== null) return true;
   return new Promise<boolean>((resolve) => {
@@ -77,6 +96,7 @@ export async function stopVSCodeProcess(
   proc: ChildProcess,
   processGroup = false,
   timeoutMs = 5000,
+  groupGraceMs = 5000,
 ): Promise<void> {
   if (!proc.pid) return;
   const alreadyExited = proc.exitCode !== null || proc.signalCode !== null;
@@ -114,12 +134,25 @@ export async function stopVSCodeProcess(
     }
   }
 
-  // Group leaders can leave reparented helpers behind; reap them silently.
+  // Group leaders can leave reparented helpers behind. Give them a bounded
+  // window to finish draining on their own first: SIGKILLing an extension
+  // host that is still shutting down produces ptyHost/extension-host crash
+  // reports in the logs, even though the suite itself passed.
   if (processGroup) {
-    try {
-      process.kill(-proc.pid, "SIGKILL");
-    } catch {
-      // The process group has exited.
+    if (!(await waitForProcessGroupExit(proc.pid, groupGraceMs))) {
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        // The process group may have exited.
+      }
+      if (!(await waitForProcessGroupExit(proc.pid, 2000))) {
+        try {
+          process.kill(-proc.pid, "SIGKILL");
+        } catch {
+          // The process group may have exited.
+        }
+        await waitForProcessGroupExit(proc.pid, 1000);
+      }
     }
   }
 }
