@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type * as vscode from "vscode";
+import { isPathInside, toPosixPath } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";
 
 /** Platform default VS Code logs directory (non-Insiders + Insiders). */
@@ -206,10 +207,8 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
         }
         const fileArg = String(args.file);
         const candidate = path.isAbsolute(fileArg) ? fileArg : path.resolve(logsRoot, fileArg);
-        const resolved = logsRoot + path.sep;
-
         // Boundary check — the resolved file must stay under the logs root.
-        if (candidate !== logsRoot && !candidate.startsWith(resolved)) {
+        if (!isPathInside(candidate, logsRoot)) {
           return {
             content: [{ type: "text", text: "Rejected: path escapes the VS Code logs root" }],
             isError: true,
@@ -224,7 +223,7 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
         try {
           const real = await fs.promises.realpath(candidate);
           const realRoot = await fs.promises.realpath(logsRoot);
-          if (real !== realRoot && !real.startsWith(realRoot + path.sep)) {
+          if (!isPathInside(real, realRoot)) {
             return {
               content: [{ type: "text", text: "Rejected: symlink escapes the VS Code logs root" }],
               isError: true,
@@ -246,7 +245,7 @@ export function registerLogsTools(server: ToolRegistrar, context: vscode.Extensi
             content: [
               {
                 type: "text",
-                text: `--- ${candidate.replace(logsRoot + path.sep, "")} — last ${maxLines} lines${label} ---\n${text}`,
+                text: `--- ${toPosixPath(path.relative(logsRoot, candidate))} — last ${maxLines} lines${label} ---\n${text}`,
               },
             ],
             isError: false,

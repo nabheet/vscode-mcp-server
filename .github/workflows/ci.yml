@@ -120,6 +120,36 @@ jobs:
         run: npm run test:e2e
         timeout-minutes: 10
 
+  test-e2e-windows:
+    runs-on: windows-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run compile
+
+      - run: npm test
+
+      - name: Cache VS Code
+        uses: actions/cache@v6
+        with:
+          path: .vscode-test
+          key: ${{ runner.os }}-vscode-test-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vscode-test-
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+        timeout-minutes: 15
+
   # Per-PR pre-release: every PR push publishes a unique pre-release version
   # to the Marketplace pre-release channel. Marketplace only accepts plain
   # major.minor.patch (no semver pre-release tags), so PR builds use a
@@ -128,7 +158,7 @@ jobs:
   # non-dependabot PRs. --skip-duplicate makes re-runs safe.
   publish-pre-release:
     runs-on: ubuntu-latest
-    needs: [build, test-e2e, test-e2e-macos]
+    needs: [build, test-e2e, test-e2e-macos, test-e2e-windows]
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&

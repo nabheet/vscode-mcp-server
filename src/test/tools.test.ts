@@ -550,6 +550,18 @@ describe("handler behavior", () => {
     expect(res.content[0].text).toContain("=== /ws/frontend/b.ts ===\nconst b = 2;");
   });
 
+  it("read_files formats Windows paths with forward slashes", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "frontend", uri: vscode.Uri.file("C:\\ws\\frontend") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("windows file"));
+    const h = requireHandler(handlers, "read_files");
+    const res = await h({ paths: ["src\\index.ts"] });
+    expect(res.content[0].text).toContain("=== C:/ws/frontend/src/index.ts ===\nwindows file");
+  });
+
   it("read_files reports per-file errors inline without aborting the batch", async () => {
     (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
       { name: "frontend", uri: vscode.Uri.file("/ws/frontend") },
@@ -698,6 +710,36 @@ describe("handler behavior", () => {
     expect(text).toContain("=== /ws/frontend/a.ts ===\nApplied 1 text edit(s)");
     expect(text).toContain("=== /ws/backend/new.ts ===\nCreated (6 bytes)");
     expect(text).toContain("=== /ws/backend/old.ts ===\nDeleted");
+  });
+
+  it("apply_workspace_edit prints Windows paths with forward slashes", async () => {
+    const ws = vscode.workspace as unknown as MockWorkspace;
+    ws.workspaceFolders = [{ name: "ws", uri: vscode.Uri.file("C:\\ws") }];
+    mockWorkspaceFiles({ "C:\\ws\\a.ts": "line1\n", "C:\\ws\\gone.ts": "bye\n" });
+
+    const h = requireHandler(handlers, "apply_workspace_edit");
+    const res = await h({
+      edits: [
+        {
+          path: "C:\\ws\\a.ts",
+          textEdits: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+              newText: "LINE1",
+            },
+          ],
+        },
+        { path: "C:\\ws\\new.ts", create: true, content: "x\n" },
+        { path: "C:\\ws\\gone.ts", delete: true },
+      ],
+    });
+
+    expect(res.isError, res.content[0].text).toBe(false);
+    const text: string = res.content[0].text;
+    expect(text).toContain("=== C:/ws/a.ts ===\nApplied 1 text edit(s)");
+    expect(text).toContain("=== C:/ws/new.ts ===\nCreated (2 bytes)");
+    expect(text).toContain("=== C:/ws/gone.ts ===\nDeleted");
+    expect(text).not.toContain("C:\\ws");
   });
 
   it("apply_workspace_edit reports per-file errors inline and applies nothing", async () => {
@@ -1421,6 +1463,41 @@ describe("handler behavior", () => {
     expect((vscode.debug as unknown as MockDebug).breakpoints.length).toBe(1);
   });
 
+  it("formats Windows breakpoint paths with forward slashes", async () => {
+    const add = requireHandler(handlers, "add_breakpoint");
+    const added = await add({ path: "C:\\ws\\src\\main.ts", line: 4 });
+    expect(added.content[0].text).toBe("Breakpoint added at C:/ws/src/main.ts:4");
+
+    const list = requireHandler(handlers, "list_breakpoints");
+    const listed = await list({});
+    expect(listed.content[0].text).toContain("C:/ws/src/main.ts:4");
+
+    const remove = requireHandler(handlers, "remove_breakpoint");
+    const removed = await remove({ path: "c:/WS/src/main.ts", line: 4 });
+    expect(removed.content[0].text).toBe("Breakpoint removed at c:/WS/src/main.ts:4");
+  });
+
+  it("remove_breakpoint preserves breakpoints with a different URI scheme", async () => {
+    const breakpoint = new vscode.SourceBreakpoint(
+      {
+        uri: {
+          fsPath: "C:\\ws\\src\\main.ts",
+          scheme: "untitled",
+          toString: () => "untitled:C:/ws/src/main.ts",
+        },
+        range: { start: { line: 3, character: 0 } },
+      } as unknown as vscode.Location,
+      true,
+    );
+    (vscode as unknown as { debug: MockDebug }).debug.breakpoints = [breakpoint];
+
+    const remove = requireHandler(handlers, "remove_breakpoint");
+    const result = await remove({ path: "C:\\ws\\src\\main.ts", line: 4 });
+
+    expect(result.isError).toBe(true);
+    expect((vscode as unknown as { debug: MockDebug }).debug.breakpoints).toContain(breakpoint);
+  });
+
   it("remove_breakpoint removes a breakpoint outside the workspace", async () => {
     (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
       { name: "root", uri: { fsPath: "/workspace" } },
@@ -1838,6 +1915,21 @@ describe("handler behavior", () => {
       "**/node_modules/**",
       2000,
     );
+  });
+
+  it("search_files formats Windows paths with forward slashes", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "frontend", uri: vscode.Uri.file("C:\\ws\\frontend") },
+    ];
+    (vscode.workspace as unknown as MockWorkspace).findFiles = vi
+      .fn()
+      .mockResolvedValue([vscode.Uri.file("C:\\ws\\frontend\\src\\main.ts")]);
+    (vscode.workspace as unknown as MockWorkspace).fs.readFile = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("find this"));
+    const h = requireHandler(handlers, "search_files");
+    const res = await h({ query: "find this" });
+    expect(res.content[0].text).toContain("C:/ws/frontend/src/main.ts:1:1: find this");
   });
 
   it("search_files returns (no matches) when nothing matches", async () => {
@@ -2536,6 +2628,27 @@ describe("handler behavior", () => {
         modified: "2026-01-02T03:04:05.000Z",
       }),
     );
+  });
+
+  it("get_file_info prints Windows paths with forward slashes", async () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: vscode.Uri.file("C:\\ws\\backend") },
+    ];
+    mockStat({
+      "C:\\ws\\backend\\src\\index.ts": {
+        type: vscode.FileType.File,
+        size: 7,
+        mtime: Date.UTC(2026, 0, 2, 3, 4, 5),
+      },
+    });
+
+    const h = requireHandler(handlers, "get_file_info");
+    const res = await h({ paths: ["C:\\ws\\backend\\src\\index.ts"] });
+
+    expect(res.isError).toBe(false);
+    const body = res.content[0].text as string;
+    expect(body).toContain("=== C:/ws/backend/src/index.ts ===");
+    expect(body).not.toContain("C:\\ws");
   });
 
   it("get_file_info reports a directory as isDirectory", async () => {
