@@ -359,11 +359,26 @@ jobs:
           # Extension id from package.json, so the workflow does not repeat the
           # publisher name.
           extension="$(jq -r '.publisher + "." + .name' package.json)"
-          remote="$(npx --yes @vscode/vsce show "$extension" --json 2>/dev/null \
-            | jq -r --arg line "${local%.*}" '[.versions[].version]
+          show_json="$(mktemp)"
+          show_err="$(mktemp)"
+          if ! npx --yes @vscode/vsce show "$extension" --json \
+            >"$show_json" 2>"$show_err"; then
+            if grep -qiE "not found|404" "$show_err"; then
+              # Never published: nothing to compare against.
+              echo "::notice::no published versions for ${extension} yet"
+              echo '{"versions":[]}' >"$show_json"
+            else
+              # Guessing here would re-create the stale-version failure this
+              # step exists to prevent, so stop and say why.
+              echo "::error::could not read published versions for ${extension}"
+              cat "$show_err"
+              exit 1
+            fi
+          fi
+          remote="$(jq -r --arg line "${local%.*}" '[.versions[].version]
               | map(select((contains("-") | not) and (startswith($line + "."))))
               | sort_by(split(".") | map(tonumber))
-              | last // empty' 2>/dev/null)" || true
+              | last // empty' "$show_json")"
           target="$(jq -rn --arg l "$local" --arg r "${remote:-$local}" '
             def v: split(".") | map(tonumber);
             ($l | v) as $L | ($r | v) as $R
@@ -377,13 +392,23 @@ jobs:
       - name: Publish stable (with retry)
         if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 5
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
-          # Retries cover registry flakiness only: the version is fixed above,
-          # so a retry cannot collide with the version it just published.
+          EXTENSION="$(jq -r '.publisher + "." + .name' package.json)"
+          # A failed client call does not prove the marketplace rejected the
+          # upload, so after a failure check whether this exact version is
+          # there; that is a success, not something to retry.
           for i in $(seq 1 3); do
-            if npx @vscode/vsce publish "${{ steps.target.outputs.version }}" \
+            if npx @vscode/vsce publish "$VERSION" \
               --no-git-tag-version --no-update-package-json; then
-              echo "Published ${{ steps.target.outputs.version }}"
+              echo "Published $VERSION"
+              exit 0
+            fi
+            if npx --yes @vscode/vsce show "$EXTENSION" --json 2>/dev/null \
+              | jq -e --arg v "$VERSION" '.versions[] | select(.version == $v)' \
+                >/dev/null; then
+              echo "Published $VERSION (marketplace already lists it)"
               exit 0
             fi
             echo "Publish failed, retrying ($i/3)..."
@@ -440,10 +465,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           BRANCH="ci/bump-v${{ steps.published.outputs.v }}"
 
-          # An older sync PR can never merge once main moves: branch protection
-          # requires an up-to-date branch and the queued squash merge does not
-          # update it. Close them so only the current version is proposed.
-          for n in $(gh pr list --state open --json number,headRefName \
+          # An older sync PR cannot merge while main has moved on: branch
+          # protection wants an up-to-date branch, and the queued squash merge
+          # does not update it. Close them so only the current version is
+          # proposed.
+          for n in $(gh pr list --state open --limit 100 --json number,headRefName \
             --jq '.[] | select(.headRefName | startswith("ci/bump-v")) | .number'); do
             gh pr close "$n" --delete-branch \
               --comment "Superseded by v${{ steps.published.outputs.v }}."
@@ -451,7 +477,12 @@ jobs:
 
           git add package.json
           git commit -m "chore: bump version to v${{ steps.published.outputs.v }}"
-          git push origin "HEAD:$BRANCH"
+          # Authenticate the push with the PAT, not the GITHUB_TOKEN that
+          # checkout persisted: a bot-authored push leaves the sync PR's CI run
+          # waiting for maintainer approval, so auto-merge never fires. The
+          # header keeps the token out of the remote URL.
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_SYNC_PAT" | base64 | tr -d '\n')" \
+            push origin "HEAD:$BRANCH"
           PR_URL="$(gh pr create \
             --base main \
             --head "$BRANCH" \
