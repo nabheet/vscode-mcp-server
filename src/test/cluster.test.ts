@@ -505,6 +505,75 @@ describe("leader-worker cluster", () => {
   });
 });
 
+describe("Windows workspace routing", () => {
+  it("matches case and slash variants for workspace refs and path inference", async () => {
+    const port = await findFreePort();
+    const leaderExec = new ToolExecutor();
+    leaderExec.registerTool(makeTool("echo", (args) => `leader: ${args.msg ?? ""}`));
+    const workerExec = new ToolExecutor();
+    workerExec.registerTool(makeTool("echo", (args) => `worker: ${args.msg ?? ""}`));
+    const leaderPaths = ["C:\\mnt\\leader"];
+    const leader = new LeaderCoordinator({
+      port,
+      host: "127.0.0.1",
+      executor: leaderExec,
+      workspaceId: "windows-leader",
+      workspacePaths: leaderPaths,
+      displayName: "Leader",
+    });
+    await leader.start();
+    const worker = new WorkerCoordinator({
+      transport: new HttpMemberTransport({ baseUrl: `http://127.0.0.1:${port}` }),
+      executor: workerExec,
+      workspaceId: "windows-worker",
+      workspacePaths: ["C:\\mnt\\Worker\\"],
+      displayName: "Worker",
+    });
+    await worker.start();
+
+    try {
+      const byWorkspace = await post(`http://127.0.0.1:${port}/mcp`, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "echo", arguments: { msg: "ref" }, workspace: "c:/MNT/WORKER" },
+      });
+      expect(byWorkspace.body.result.content[0].text).toBe("worker: ref");
+
+      const byBasename = await post(`http://127.0.0.1:${port}/mcp`, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "echo", arguments: { msg: "basename" }, workspace: "WORKER" },
+      });
+      expect(byBasename.body.result.content[0].text).toBe("worker: basename");
+
+      const byPath = await post(`http://127.0.0.1:${port}/mcp`, {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "echo", arguments: { path: "C:/MNT/WORKER/src/main.ts", msg: "path" } },
+      });
+      expect(byPath.body.result.content[0].text).toBe("worker: path");
+
+      leaderPaths.push("C:\\mnt\\Worker");
+      const samePath = await post(`http://127.0.0.1:${port}/mcp`, {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "echo",
+          arguments: { path: "C:/MNT/WORKER/src/main.ts", msg: "tie" },
+        },
+      });
+      expect(samePath.body.result.content[0].text).toBe("leader: tie");
+    } finally {
+      await worker.stop(500).catch(() => {});
+      await leader.stop(500).catch(() => {});
+    }
+  });
+});
+
 // ── HTTP member channel cluster (issue #94) ─────────────────────────
 // A worker joined over the SSE/POST member channel behaves like a native
 // member: REGISTER/WELCOME, CALL/RESULT, PING/PONG, UPDATE, failover.

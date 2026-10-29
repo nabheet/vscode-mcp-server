@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { resolvePath } from "../../utils/path";
+import { normalizePathForComparison, pathsEqual, resolvePath, toPosixPath } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";
 
 /** Upper bound for a single created-file payload in `apply_workspace_edit`. */
@@ -53,10 +53,21 @@ interface FileMetrics {
  * document lookup and the save step must all agree, or a differently spelled
  * path can bypass one of them.
  */
+/** Comparison key for a path; an unreadable document must not fail the batch. */
+function normalizeForIdentity(value: string): string {
+  try {
+    return normalizePathForComparison(value);
+  } catch {
+    return path.normalize(value).toLowerCase();
+  }
+}
+
 function uriKey(uri: vscode.Uri): string {
   // Scheme stays in the key: a `git:` diff document for the same fsPath is a
   // different document and must never shadow the user's file buffer.
-  const normalized = `${uri.scheme ?? "file"}:${path.normalize(uri.fsPath).normalize("NFC")}`;
+  const pathKey =
+    process.platform === "win32" ? normalizeForIdentity(uri.fsPath) : path.normalize(uri.fsPath);
+  const normalized = `${uri.scheme ?? "file"}:${pathKey.normalize("NFC")}`;
   return process.platform === "darwin" || process.platform === "win32"
     ? normalized.toLowerCase()
     : normalized;
@@ -213,7 +224,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         let rootUri: vscode.Uri;
         if (args.workspaceFolder) {
           const ref = String(args.workspaceFolder);
-          const folder = folders.find((f) => f.name === ref || f.uri.fsPath === ref);
+          const folder = folders.find((f) => f.name === ref || pathsEqual(f.uri.fsPath, ref));
           if (!folder) {
             const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
             return {
@@ -339,7 +350,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             const uri = resolvePath(p, folderName);
             const bytes = await vscode.workspace.fs.readFile(uri);
             const text = Buffer.from(bytes).toString("utf-8");
-            parts.push(`=== ${uri.fsPath} ===\n${text}`);
+            parts.push(`=== ${toPosixPath(uri.fsPath)} ===\n${text}`);
           } catch (err) {
             failures++;
             parts.push(
@@ -663,12 +674,12 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
         }
 
         const summary = planned.map((p) => {
-          if (p.kind === "delete") return `=== ${p.uri.fsPath} ===\nDeleted`;
+          if (p.kind === "delete") return `=== ${toPosixPath(p.uri.fsPath)} ===\nDeleted`;
           if (p.kind === "create") {
             const bytes = Buffer.byteLength(p.content ?? "", "utf-8");
-            return `=== ${p.uri.fsPath} ===\nCreated (${bytes} bytes)`;
+            return `=== ${toPosixPath(p.uri.fsPath)} ===\nCreated (${bytes} bytes)`;
           }
-          return `=== ${p.uri.fsPath} ===\nApplied ${p.textEdits?.length ?? 0} text edit(s)`;
+          return `=== ${toPosixPath(p.uri.fsPath)} ===\nApplied ${p.textEdits?.length ?? 0} text edit(s)`;
         });
         const notes = leftDirty.length
           ? `\n\nLeft unsaved (document already had unsaved changes):\n${leftDirty.join("\n")}`
@@ -731,7 +742,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           try {
             const stat = await vscode.workspace.fs.stat(uri);
             parts.push(
-              `=== ${uri.fsPath} ===\n${JSON.stringify({
+              `=== ${toPosixPath(uri.fsPath)} ===\n${JSON.stringify({
                 exists: true,
                 isDirectory: (stat.type & vscode.FileType.Directory) !== 0,
                 size: stat.size,
@@ -748,7 +759,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
               code === "FileNotADirectory"
             ) {
               parts.push(
-                `=== ${uri.fsPath} ===\n${JSON.stringify({
+                `=== ${toPosixPath(uri.fsPath)} ===\n${JSON.stringify({
                   exists: false,
                   isDirectory: false,
                   size: null,
@@ -758,7 +769,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             } else {
               failures++;
               parts.push(
-                `=== ${uri.fsPath} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`,
+                `=== ${toPosixPath(uri.fsPath)} ===\n[error: ${err instanceof Error ? err.message : String(err)}]`,
               );
             }
           }
@@ -996,7 +1007,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             isError: true,
           };
         }
-        if (folders.some((f) => f.uri.fsPath === resolved)) {
+        if (folders.some((f) => pathsEqual(f.uri.fsPath, resolved))) {
           return {
             content: [{ type: "text", text: `Path already open: ${resolved}` }],
             isError: true,
@@ -1051,7 +1062,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           return { content: [{ type: "text", text: "No workspace folders open" }], isError: true };
         }
         const idx = folders.findIndex(
-          (f) => f.name === String(args.name) || f.uri.fsPath === String(args.name),
+          (f) => f.name === String(args.name) || pathsEqual(f.uri.fsPath, String(args.name)),
         );
         if (idx === -1) {
           return {
@@ -1082,7 +1093,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
             isError: true,
           };
         }
-        if (others.some((f) => f.uri.fsPath === resolved)) {
+        if (others.some((f) => pathsEqual(f.uri.fsPath, resolved))) {
           return {
             content: [{ type: "text", text: `Path already open: ${resolved}` }],
             isError: true,
@@ -1133,7 +1144,7 @@ export function registerWorkspaceTools(server: ToolRegistrar): void {
           return { content: [{ type: "text", text: "No workspace folders open" }], isError: true };
         }
         const idx = folders.findIndex(
-          (f) => f.name === String(args.name) || f.uri.fsPath === String(args.name),
+          (f) => f.name === String(args.name) || pathsEqual(f.uri.fsPath, String(args.name)),
         );
         if (idx === -1) {
           return {

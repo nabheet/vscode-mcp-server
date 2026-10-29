@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { normalizePathForComparison, pathsEqual, toPosixPath } from "../../utils/path";
 import { defineTool, type ToolRegistrar } from "./index";
 
 const MAX_FILE_BYTES = 512 * 1024; // skip files larger than 512 KB
@@ -53,7 +54,7 @@ export function registerSearchTools(server: ToolRegistrar): void {
         let roots: vscode.Uri[];
         if (args.workspaceFolder) {
           const ref = String(args.workspaceFolder);
-          const folder = folders.find((f) => f.name === ref || f.uri.fsPath === ref);
+          const folder = folders.find((f) => f.name === ref || pathsEqual(f.uri.fsPath, ref));
           if (!folder) {
             const names = folders.map((f) => `${f.name} (${f.uri.fsPath})`).join(", ");
             return {
@@ -105,8 +106,9 @@ export function registerSearchTools(server: ToolRegistrar): void {
               MAX_SCAN_FILES,
             );
             for (const f of found) {
-              if (seen.has(f.fsPath)) continue; // folder roots may overlap
-              seen.add(f.fsPath);
+              const key = normalizePathForComparison(f.fsPath);
+              if (seen.has(key)) continue; // folder roots may overlap
+              seen.add(key);
               files.push(f);
             }
           }
@@ -144,11 +146,13 @@ export function registerSearchTools(server: ToolRegistrar): void {
               const from = Math.max(0, i - contextLines);
               const to = Math.min(lines.length - 1, i + contextLines);
               for (let c = from; c <= to; c++) {
-                results.push(`${c === i ? ">" : " "} ${uri.fsPath}:${c + 1}: ${lines[c]}`);
+                results.push(
+                  `${c === i ? ">" : " "} ${toPosixPath(uri.fsPath)}:${c + 1}: ${lines[c]}`,
+                );
               }
               results.push("--");
             } else {
-              results.push(`${uri.fsPath}:${i + 1}:${m.index + 1}: ${lines[i]}`);
+              results.push(`${toPosixPath(uri.fsPath)}:${i + 1}:${m.index + 1}: ${lines[i]}`);
             }
             matchCount++;
           }

@@ -1,5 +1,9 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import * as vscode from "vscode";
+import { isPathInside, pathsEqual, toPosixPath } from "../utils/path";
 
 /** Mutable view of the vscode.workspace API that tests patch with mocks. */
 type MockWorkspace = {
@@ -17,7 +21,8 @@ describe("resolvePath", () => {
 
   it("returns absolute path as-is", () => {
     const result = resolvePath("/foo/bar/baz.ts");
-    expect(result.fsPath).toBe("/foo/bar/baz.ts");
+    // With no workspace the host platform decides the separator.
+    expect(toPosixPath(result.fsPath)).toBe("/foo/bar/baz.ts");
   });
 
   it("resolves relative path against workspace root", () => {
@@ -40,10 +45,10 @@ describe("resolvePath", () => {
   it("falls back to path.resolve when no workspace", () => {
     // Without workspace folders, uses path.resolve which prepends cwd
     const result = resolvePath("some/file.ts");
-    // Should be an absolute path starting with /
+    // Must remain absolute on both POSIX and Windows.
     expect(result.fsPath).toBeTruthy();
-    expect(result.fsPath).toMatch(/^\//);
-    expect(result.fsPath).toContain("some/file.ts");
+    expect(path.isAbsolute(result.fsPath)).toBe(true);
+    expect(toPosixPath(result.fsPath)).toContain("some/file.ts");
   });
 
   it("handles dot-relative paths", () => {
@@ -170,5 +175,96 @@ describe("resolvePath", () => {
       { name: "frontend", uri: { fsPath: "/workspace/frontend" } },
     ];
     expect(() => resolvePath("src/main.ts", " frontend")).toThrow(/not found/i);
+  });
+
+  it("compares Windows paths without case or slash sensitivity", () => {
+    expect(pathsEqual("C:\\Work\\Runner\\Project", "c:/work/runner/project/")).toBe(true);
+  });
+
+  it("does not apply Windows case folding to POSIX double-slash paths", () => {
+    if (process.platform === "win32") return;
+    expect(pathsEqual("//server/Folder", "//server/folder")).toBe(false);
+  });
+
+  it("enforces Windows workspace boundaries by path segment", () => {
+    expect(isPathInside("c:\\work\\project\\src\\main.ts", "C:\\Work\\Project")).toBe(true);
+    expect(isPathInside("C:\\Work\\ProjectSibling\\file.ts", "C:\\Work\\Project")).toBe(false);
+  });
+
+  it("checks Windows root-relative paths against the workspace drive", () => {
+    expect(isPathInside("/work/project/src/main.ts", "C:\\Work\\Project")).toBe(true);
+    expect(isPathInside("/work/project-sibling/file.ts", "C:\\Work\\Project")).toBe(false);
+  });
+
+  it("rejects a workspace path that follows a symlink outside the root", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "path-boundary-"));
+    const workspace = path.join(tempDir, "workspace");
+    const outside = path.join(tempDir, "outside");
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(outside);
+    const link = path.join(workspace, "linked");
+    fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+    try {
+      expect(isPathInside(path.join(link, "file.txt"), workspace)).toBe(false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects traversal that leaves the workspace through a symlink", () => {
+    if (process.platform === "win32") return;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "path-traversal-"));
+    const workspace = path.join(tempDir, "workspace");
+    const outside = path.join(tempDir, "outside");
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(workspace, "link"), "dir");
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { uri: { fsPath: workspace } },
+    ];
+    try {
+      // `..` applies to the link target, so this leaves the workspace.
+      expect(() => resolvePath(`${workspace}/link/../outside/secret.txt`)).toThrow(
+        /outside the workspace/i,
+      );
+      // Traversal that stays inside still works and never keeps `..`.
+      const inside = resolvePath(`${workspace}/link/../workspace/file.txt`);
+      expect(inside.fsPath).not.toContain("..");
+      expect(inside.fsPath.startsWith(`${workspace}${path.sep}`)).toBe(true);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a path through a dangling symlink outside the workspace", () => {
+    if (process.platform === "win32") return;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "path-dangling-"));
+    const workspace = path.join(tempDir, "workspace");
+    const outside = path.join(tempDir, "outside", "missing");
+    fs.mkdirSync(workspace);
+    fs.symlinkSync(outside, path.join(workspace, "linked"), "dir");
+    try {
+      expect(isPathInside(path.join(workspace, "linked", "new-file.txt"), workspace)).toBe(false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("matches a Windows workspace folder path case-insensitively", () => {
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "backend", uri: { fsPath: "C:\\Work\\Backend" } },
+    ];
+    const result = resolvePath("src\\main.ts", "c:\\work\\backend");
+    expect(result.fsPath).toBe("C:\\Work\\Backend\\src\\main.ts");
+  });
+
+  it("rejects root-relative and drive-relative Windows inputs", () => {
+    if (process.platform !== "win32") return;
+    (vscode.workspace as unknown as MockWorkspace).workspaceFolders = [
+      { name: "workspace", uri: { fsPath: "C:\\Work\\Project" } },
+    ];
+    expect(() => resolvePath("/Work/Project/src/main.ts")).toThrow(/drive-qualified/i);
+    expect(() => resolvePath("C:\\outside\\file.ts")).toThrow(/outside the workspace/i);
+    expect(() => resolvePath("C:relative\\file.ts")).toThrow(/Drive-relative/i);
   });
 });

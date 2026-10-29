@@ -1,5 +1,7 @@
 import { defineConfig } from "vitest/config";
 
+process.env.RUN_E2E = "1";
+
 export default defineConfig({
   test: {
     globals: true,

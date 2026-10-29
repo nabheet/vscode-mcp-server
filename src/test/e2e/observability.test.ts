@@ -1,9 +1,9 @@
 import { type ChildProcess, execSync, type SpawnOptions, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createCanonicalTempDir, resolveCodeCli, stopVSCodeProcess } from "./platform";
 
 // ── Helpers (mirror multi-root.test.ts) ─────────────────────────────────
 
@@ -130,42 +130,6 @@ function hideVSCodeWindows(_proc: ChildProcess, delayMs = 1500) {
   }, delayMs);
 }
 
-async function resolveCodeCli(): Promise<{ cmd: string; args: string[] }> {
-  const { downloadAndUnzipVSCode } = await import("@vscode/test-electron");
-  const vscodePath = await downloadAndUnzipVSCode("stable");
-  if (process.platform === "darwin") {
-    // Spawn the app binary directly. The `bin/code` wrapper (returned by
-    // resolveCliPathFromVSCodeExecutablePath) launches the app detached via
-    // LaunchServices: under vitest the app can die before writing logs and
-    // leaves orphaned processes. The binary stays attached as our child and
-    // is killed cleanly in afterAll.
-    const appRoot = vscodePath.endsWith(".app")
-      ? vscodePath
-      : vscodePath.replace(/\/Contents\/MacOS\/.+$/, "");
-    const binary = path.join(appRoot, "Contents", "MacOS", "Code");
-    if (fs.existsSync(binary)) return { cmd: binary, args: [] };
-    throw new Error(`VS Code binary not found under ${appRoot}`);
-  }
-  const { resolveCliPathFromVSCodeExecutablePath } = await import("@vscode/test-electron");
-  const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodePath);
-  if (!fs.existsSync(cliPath)) throw new Error(`VS Code CLI not found: ${cliPath}`);
-  return wrapForDisplay(cliPath, []);
-}
-
-function wrapForDisplay(cmd: string, extraArgs: string[]): { cmd: string; args: string[] } {
-  const isLinux = process.platform === "linux";
-  const hasDisplay = !!process.env.DISPLAY;
-  if (isLinux && !hasDisplay) {
-    try {
-      execSync("which xvfb-run", { stdio: "pipe" });
-      return { cmd: "xvfb-run", args: ["--auto-servernum", cmd, ...extraArgs] };
-    } catch {
-      /* fall through */
-    }
-  }
-  return { cmd, args: extraArgs };
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 describe("observability endpoints + log tools (E2E)", () => {
@@ -180,13 +144,11 @@ describe("observability endpoints + log tools (E2E)", () => {
     }
     const extMain = path.join(PROJECT_ROOT, "out", "extension.js");
     if (!fs.existsSync(extMain)) {
-      console.warn("⚠  Skipping E2E: extension not compiled (run `npm run compile` first)");
-      ENABLED = false;
-      return;
+      throw new Error("E2E setup failed: extension is not compiled (run `npm run compile` first)");
     }
 
     port = await findFreePort();
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-"));
+    tmpDir = createCanonicalTempDir("obs-");
     const folder = path.join(tmpDir, "ws");
     fs.mkdirSync(path.join(folder, "src"), { recursive: true });
     fs.writeFileSync(path.join(folder, "src", "index.ts"), "// obs e2e\nconst x = 1;\n");
@@ -208,9 +170,7 @@ describe("observability endpoints + log tools (E2E)", () => {
       cliCmd = resolved.cmd;
       cliArgs = resolved.args;
     } catch (err) {
-      console.warn("⚠  Skipping E2E:", (err as Error).message);
-      ENABLED = false;
-      return;
+      throw new Error("E2E setup failed while resolving VS Code", { cause: err });
     }
 
     const launchArgs: string[] = [
@@ -232,6 +192,7 @@ describe("observability endpoints + log tools (E2E)", () => {
         MCP_SERVER_MAX_RETRIES: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     };
     vsCodeProc = spawn(cliCmd, launchArgs, spawnOpts);
     if (vsCodeProc.stdout)
@@ -300,12 +261,15 @@ describe("observability endpoints + log tools (E2E)", () => {
   }, 180000);
 
   afterAll(async () => {
-    if (vsCodeProc && !vsCodeProc.killed) vsCodeProc.kill("SIGTERM");
+    if (vsCodeProc) await stopVSCodeProcess(vsCodeProc, true);
     if (tmpDir) {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {
-        /* ignore */
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          break;
+        } catch {
+          if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 500));
+        }
       }
     }
   });
