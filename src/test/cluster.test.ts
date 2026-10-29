@@ -467,6 +467,7 @@ describe("leader-worker cluster", () => {
 
   it("returns an InvalidParams error for an unknown workspace reference", async () => {
     const res = await toolCall("echo", { msg: "hi" }, { workspace: "nope" });
+    expect(res.status).toBe(200);
     expect(res.body.error.code).toBe(-32602);
     expect(res.body.error.message).toMatch(/not found/i);
   });
@@ -1198,11 +1199,12 @@ describe("wire-level instance identity", () => {
       id: 1,
       method: "initialize",
       params: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: "2025-11-25",
         capabilities: {},
         clientInfo: { name: "test", version: "0.0.0" },
       },
     });
+    expect(res.body.result.protocolVersion).toBe("2025-11-25");
     expect(res.body.result.serverInfo.name).toBeTruthy();
     expect(res.body.result.serverInfo.instanceId).toBe(LEADER_INSTANCE);
     expect(res.body.result.serverInfo.instanceName).toBe("Leader Instance");

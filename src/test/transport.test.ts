@@ -122,15 +122,47 @@ describe("handleRequest", () => {
   // ── MCP lifecycle: initialize ────────────────────────────────────────
 
   it("responds to initialize with protocol version and capabilities", async () => {
-    const res = await handleRequest('{"jsonrpc":"2.0","id":1,"method":"initialize"}', tools);
+    const res = await handleRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}',
+      tools,
+    );
     expect(res.id).toBe(1);
     expect(res.result).toBeDefined();
     const r = res.result as InitializeResult;
-    expect(r.protocolVersion).toBe("2024-11-05");
+    expect(r.protocolVersion).toBe("2025-11-25");
     expect(r.capabilities).toEqual({ tools: {} });
     expect(r.serverInfo).toBeDefined();
     expect(r.serverInfo.name).toBe("vscode-ide-mcp");
     expect(r.serverInfo.version).toBeDefined();
+  });
+
+  it.each(["2024-11-05", "2025-03-26", "2025-06-18"])(
+    "echoes supported legacy protocol version %s",
+    async (protocolVersion) => {
+      const res = await handleRequest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion },
+        }),
+        tools,
+      );
+      expect((res.result as InitializeResult).protocolVersion).toBe(protocolVersion);
+    },
+  );
+
+  it("selects the latest supported version for an unknown protocol version", async () => {
+    const res = await handleRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1900-01-01"}}',
+      tools,
+    );
+    expect((res.result as InitializeResult).protocolVersion).toBe("2025-11-25");
+  });
+
+  it("selects the latest supported version when protocolVersion is omitted", async () => {
+    const res = await handleRequest('{"jsonrpc":"2.0","id":1,"method":"initialize"}', tools);
+    expect((res.result as InitializeResult).protocolVersion).toBe("2025-11-25");
   });
 
   it("initialize preserves request id", async () => {
@@ -169,39 +201,49 @@ describe("handleRequest", () => {
 
   // ── tools/call — params validation ─────────────────────────────────
 
-  it("requires object params", async () => {
+  it("returns InvalidParams for non-object params", async () => {
     const res = await handleRequest(
       '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"bogus"}',
       tools,
     );
-    expect((res.result as ToolResult).isError).toBe(true);
-    expect((res.result as ToolResult).content[0].text).toMatch(/invalid params/i);
+    expect(res.error?.code).toBe(-32602);
+    expect(res.error?.message).toMatch(/invalid params/i);
+    expect(res.result).toBeUndefined();
   });
 
-  it("requires name in params", async () => {
+  it("returns InvalidParams when name is missing", async () => {
     const res = await handleRequest(
       '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}',
       tools,
     );
-    expect((res.result as ToolResult).isError).toBe(true);
-    expect((res.result as ToolResult).content[0].text).toMatch(/"name".*non-empty/i);
+    expect(res.error?.code).toBe(-32602);
+    expect(res.error?.message).toMatch(/"name".*non-empty/i);
   });
 
-  it("requires non-empty name", async () => {
+  it("returns InvalidParams for empty name", async () => {
     const res = await handleRequest(
       '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":""}}',
       tools,
     );
-    expect((res.result as ToolResult).isError).toBe(true);
+    expect(res.error?.code).toBe(-32602);
   });
 
-  it("returns error for unknown tool name", async () => {
+  it("returns InvalidParams for unknown tool name", async () => {
     const res = await handleRequest(
       '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope"}}',
       tools,
     );
-    expect((res.result as ToolResult).isError).toBe(true);
-    expect((res.result as ToolResult).content[0].text).toMatch(/tool not found.*nope/i);
+    expect(res.error?.code).toBe(-32602);
+    expect(res.error?.message).toMatch(/unknown tool.*nope/i);
+  });
+
+  it("returns InvalidParams when arguments are not an object", async () => {
+    const res = await handleRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"noop","arguments":[]}}',
+      tools,
+    );
+    expect(res.error?.code).toBe(-32602);
+    expect(res.error?.message).toMatch(/arguments.*object/i);
   });
 
   // ── tools/call — schema validation ──────────────────────────────────
@@ -426,9 +468,7 @@ describe("handleRequest", () => {
     expect((res.result as ToolResult).isError).toBeFalsy();
   });
 
-  it("handles null arguments gracefully", async () => {
-    const handler = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
-    const localTools = setupTools([makeTool("noop", { type: "object", properties: {} }, handler)]);
+  it("rejects null arguments as malformed params", async () => {
     const res = await handleRequest(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -436,10 +476,9 @@ describe("handleRequest", () => {
         method: "tools/call",
         params: { name: "noop", arguments: null },
       }),
-      localTools,
+      tools,
     );
-    // Should default null args to {} and succeed
-    expect((res.result as ToolResult).isError).toBeFalsy();
+    expect(res.error?.code).toBe(-32602);
   });
 
   // ── Array Type Validation ───────────────────────────────────────────
