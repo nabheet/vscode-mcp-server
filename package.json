@@ -105,9 +105,14 @@
     "@types/node": "^24.19.2",
     "@types/vscode": "^1.140.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^4.0.0",
+    "@vscode/vsce": "^4.1.0",
     "markdownlint-cli2": "^0.24.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
+  },
+  "overrides": {
+    "katex": "^0.19.1",
+    "re2js": "2.8.7",
+    "minimatch": "^11.0.1"
   }
 }
