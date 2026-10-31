@@ -19,6 +19,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+# Default GITHUB_TOKEN scope for every job. Jobs that genuinely need more —
+# publish-pre-release and publish — declare their own block, which replaces
+# (does not merge with) this one. Read-only by default keeps a future job from
+# silently inheriting write access, and satisfies CodeQL
+# actions/missing-workflow-permissions.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
