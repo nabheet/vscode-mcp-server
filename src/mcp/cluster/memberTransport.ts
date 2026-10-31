@@ -32,6 +32,20 @@ import {
 } from "./constants";
 import type { IpcMessage } from "./protocol";
 
+/**
+ * Strip trailing slashes from a base URL.
+ *
+ * Scanned character by character instead of `replace(/\/+$/, "")`: an
+ * anchored `+` quantifier backtracks quadratically on a long run of slashes
+ * that is not at the end (CodeQL `js/polynomial-redos`), and the input is
+ * user-supplied (`vscodeIdeMcp.cluster.baseUrl`).
+ */
+export function normalizeBaseUrl(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 0x2f /* "/" */) end--;
+  return url.slice(0, end);
+}
+
 export interface MemberTransport {
   readonly kind: "http";
   /** Set by the coordinator before connect(): a message arrived. */
@@ -88,7 +102,7 @@ export class HttpMemberTransport implements MemberTransport {
   private inflight = new Set<Promise<void>>();
 
   constructor(opts: HttpMemberTransportOptions) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = normalizeBaseUrl(opts.baseUrl);
     this.sessionId = opts.sessionId ?? randomUUID();
     this.authToken = opts.authToken;
     this.log = opts.log;
