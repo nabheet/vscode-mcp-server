@@ -193,7 +193,7 @@ jobs:
           node-version: 24
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       - run: npm run compile
 
@@ -394,7 +394,7 @@ jobs:
           node-version: 24
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
         if: steps.changes.outputs.changed == 'true'
         timeout-minutes: 2
 
