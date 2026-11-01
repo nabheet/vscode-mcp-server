@@ -352,6 +352,18 @@ jobs:
           # still cuts a release when bumped. jq -S normalises key order; on any
           # error (e.g. file absent) treat it as shipping.
           INERT_DEVDEPS='["@types/node","@types/vscode","vitest","@biomejs/biome","markdownlint-cli2","@vscode/test-electron"]'
+
+          # The literal above is the list this commit publishes under. The guard
+          # compares against the copy on the base revision instead, so a PR that
+          # adds a dependency to the list cannot skip that dependency's own
+          # release — the entry has to land through review first. No literal on
+          # the base (guard newly added) means everything ships, the
+          # fail-closed direction.
+          INERT_DEVDEPS="$(git show "${BEFORE}:.github/workflows/ci.yml" 2>/dev/null \
+            | sed -n "s/^[[:space:]]*INERT_DEVDEPS='\(.*\)'[[:space:]]*$/\1/p" \
+            | head -n1 || true)"
+          [ -n "$INERT_DEVDEPS" ] || INERT_DEVDEPS='[]'
+
           pkg_shipping_changed() {
             local before after
             local normalise='del(.version)
