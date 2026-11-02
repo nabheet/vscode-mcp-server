@@ -101,7 +101,7 @@
     "check:shipped-imports": "node scripts/check-shipped-imports.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.6.3",
+    "@biomejs/biome": "^2.6.4",
     "@types/node": "^24.19.2",
     "@types/vscode": "^1.140.0",
     "@vscode/test-electron": "^3.1.0",
